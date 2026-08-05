@@ -1,0 +1,101 @@
+/* ── design tokens ───────────────────────────────────────────────────
+   One source of truth. OKLCH throughout so every tint/shade stays
+   perceptually even; @property makes the accent hue animatable.
+   ------------------------------------------------------------------ */
+
+@property --accent-h { syntax: "<number>"; inherits: true; initial-value: 205; }
+@property --glow     { syntax: "<number>"; inherits: true; initial-value: 0; }
+@property --sweep    { syntax: "<percentage>"; inherits: false; initial-value: 0%; }
+
+:root {
+  color-scheme: dark;
+
+  /* ── palette ─────────────────────────────────────────────── */
+  --accent-h: 205;
+  --accent:        oklch(78% 0.14 var(--accent-h));
+  --accent-bright: oklch(90% 0.16 var(--accent-h));
+  --accent-dim:    oklch(58% 0.11 var(--accent-h));
+  --accent-ghost:  oklch(78% 0.14 var(--accent-h) / 0.14);
+  --magenta:       oklch(72% 0.20 350);
+
+  --bg-0: oklch(12% 0.012 260);   /* page   */
+  --bg-1: oklch(16% 0.014 260);   /* surface */
+  --bg-2: oklch(20% 0.016 260);   /* raised  */
+  --bg-3: oklch(26% 0.018 260);   /* hover   */
+
+  --fg-0: oklch(97% 0.006 260);   /* primary text */
+  --fg-1: oklch(80% 0.010 260);   /* secondary    */
+  --fg-2: oklch(63% 0.012 260);   /* tertiary     */
+  --fg-3: oklch(48% 0.012 260);   /* disabled     */
+
+  --line:        oklch(100% 0 0 / 0.09);
+  --line-strong: oklch(100% 0 0 / 0.16);
+  --line-bright: oklch(100% 0 0 / 0.28);
+  --focus: var(--accent-bright);
+
+  /* Glass surfaces sit on top of a live GPU canvas: they must be
+     translucent, but never so translucent that text loses contrast. */
+  --glass:        oklch(14% 0.012 260 / 0.72);
+  --glass-strong: oklch(12% 0.012 260 / 0.88);
+  --blur: 20px;
+
+  /* ── type ────────────────────────────────────────────────── */
+  --font-ui: "Segoe UI Variable Display", "Segoe UI", -apple-system,
+             BlinkMacSystemFont, "Helvetica Neue", "Noto Sans TC",
+             "Microsoft JhengHei UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "SF Mono", "JetBrains Mono",
+               Consolas, "Roboto Mono", monospace;
+
+  --t-xs:  0.6875rem;  /* 11px — hud, kbd     */
+  --t-sm:  0.8125rem;  /* 13px — labels       */
+  --t-md:  0.9375rem;  /* 15px — body         */
+  --t-lg:  1.125rem;
+  --t-xl:  clamp(1.5rem, 1.1rem + 1.6vw, 2.25rem);
+  --t-hero: clamp(2.75rem, 0.9rem + 7.6vw, 8.5rem);
+
+  /* ── space / shape ───────────────────────────────────────── */
+  --s-1: 4px;  --s-2: 8px;  --s-3: 12px; --s-4: 16px;
+  --s-5: 24px; --s-6: 32px; --s-7: 48px; --s-8: 72px;
+
+  --r-sm: 6px; --r-md: 10px; --r-lg: 16px; --r-xl: 24px; --r-pill: 999px;
+
+  --shadow-1: 0 1px 2px oklch(0% 0 0 / 0.4);
+  --shadow-2: 0 8px 24px -6px oklch(0% 0 0 / 0.55);
+  --shadow-3: 0 24px 64px -12px oklch(0% 0 0 / 0.7);
+  --shadow-glow: 0 0 0 1px var(--accent-ghost), 0 8px 32px -8px oklch(78% 0.14 var(--accent-h) / 0.35);
+
+  /* ── motion ──────────────────────────────────────────────── */
+  --ease-out:  cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --d-fast: 140ms;
+  --d-mid:  260ms;
+  --d-slow: 520ms;
+
+  --z-canvas: 0;
+  --z-caption: 10;
+  --z-panel: 20;
+  --z-topbar: 30;
+  --z-intro: 40;
+  --z-overlay: 50;
+  --z-boot: 60;
+}
+
+/* Each scene owns a hue; changing one custom property re-tints the
+   entire chrome, and @property makes that transition animate. */
+:root[data-scene="flow"]     { --accent-h: 205; }
+:root[data-scene="fluid"]    { --accent-h: 285; }
+:root[data-scene="march"]    { --accent-h:  62; }
+:root[data-scene="reaction"] { --accent-h: 155; }
+
+html { transition: --accent-h var(--d-slow) var(--ease-in-out); }
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--t-md);
+  line-height: 1.55;
+  color: var(--fg-0);
+  background: var(--bg-0);
+}
+
+code, kbd, samp, pre { font-family: var(--font-mono); font-size: 0.92em; }

@@ -1,0 +1,10 @@
+# Acceptance screenshots — regenerate with `node tools/verify.mjs`
+tools/shots/
+
+# Personal permission overrides
+.claude/settings.local.json
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-Hant" data-boot="pending">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="AETHER — 一座以純 WebGL2 打造的即時運算視覺實驗室。零依賴、零建置。">
+<title>AETHER — 即時運算視覺實驗室</title>
+
+<link rel="stylesheet" href="./styles/reset.css">
+<link rel="stylesheet" href="./styles/tokens.css">
+<link rel="stylesheet" href="./styles/shell.css">
+<link rel="stylesheet" href="./styles/ui.css">
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%237de3ff' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%23ff7de3'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ─────────────────────────  GPU STAGE  ───────────────────────── -->
+<canvas id="stage" aria-label="即時運算視覺畫布"></canvas>
+<div id="gl-fallback" class="fallback" hidden>
+  <h1>需要 WebGL2</h1>
+  <p>這個實驗室完全跑在 GPU 上。請改用支援 WebGL2 的瀏覽器，或在瀏覽器設定中開啟硬體加速。</p>
+</div>
+
+<!-- ─────────────────────────  BOOT SPLASH  ───────────────────────── -->
+<div id="boot" class="boot">
+  <div class="boot__mark" aria-hidden="true">
+    <svg viewBox="0 0 100 100"><circle class="ring" cx="50" cy="50" r="40"/><circle class="ring ring--2" cx="50" cy="50" r="26"/><circle class="dot" cx="50" cy="50" r="6"/></svg>
+  </div>
+  <div class="boot__log" id="boot-log" role="status" aria-live="polite"></div>
+</div>
+
+<!-- ─────────────────────────  INTRO  ───────────────────────── -->
+<section id="intro" class="intro" aria-labelledby="intro-title">
+  <div class="intro__inner">
+    <p class="intro__eyebrow"><span>WebGL2</span><span>零依賴</span><span>零建置</span><span>即時運算</span></p>
+    <h1 id="intro-title" class="intro__title">
+      <span class="line"><span class="w">AE</span><span class="w accent">THER</span></span>
+      <span class="line sub">即時運算視覺實驗室</span>
+    </h1>
+    <p class="intro__body">
+      四座完全跑在 GPU 上的場景：百萬粒子的旋度噪聲流場、Navier–Stokes 流體、
+      SDF 光線行進、Gray–Scott 反應擴散。沒有框架、沒有函式庫、沒有打包器 ——
+      只有 <code>&lt;canvas&gt;</code>、ES modules 與手寫 GLSL。
+    </p>
+    <button id="intro-enter" class="btn btn--primary btn--lg" type="button">
+      進入實驗室
+      <kbd>↵</kbd>
+    </button>
+    <p class="intro__hint">拖曳畫布互動 · <kbd>Ctrl</kbd>+<kbd>K</kbd> 開啟指令面板 · <kbd>?</kbd> 查看快捷鍵</p>
+  </div>
+  <div class="intro__scrim" aria-hidden="true"></div>
+</section>
+
+<!-- ─────────────────────────  APP CHROME  ───────────────────────── -->
+<header class="topbar" id="topbar">
+  <a class="brand" href="#/flow" aria-label="AETHER 首頁">
+    <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13"/><circle cx="16" cy="16" r="4" class="fill"/></svg>
+    <span class="brand__text">AETHER</span>
+  </a>
+
+  <nav class="tabs" id="tabs" aria-label="場景切換">
+    <span class="tabs__ink" id="tabs-ink" aria-hidden="true"></span>
+    <!-- populated by src/ui/tabs.js -->
+  </nav>
+
+  <div class="topbar__right">
+    <div class="hud" id="hud" title="即時效能">
+      <canvas class="hud__graph" id="hud-graph" width="120" height="28" aria-hidden="true"></canvas>
+      <div class="hud__nums">
+        <span class="hud__fps"><b id="hud-fps">—</b><i>fps</i></span>
+        <span class="hud__gpu"><b id="hud-gpu">—</b><i>ms gpu</i></span>
+      </div>
+    </div>
+    <button class="icon-btn" id="btn-palette" type="button" title="指令面板 (Ctrl+K)" aria-label="開啟指令面板">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+    </button>
+    <button class="icon-btn" id="btn-panel" type="button" title="參數面板 (P)" aria-label="切換參數面板" aria-expanded="true">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2.2" class="knob"/><circle cx="15" cy="12" r="2.2" class="knob"/><circle cx="7" cy="18" r="2.2" class="knob"/></svg>
+    </button>
+  </div>
+</header>
+
+<!-- ─────────────────────────  CONTROL PANEL  ───────────────────────── -->
+<aside class="panel" id="panel" aria-label="場景參數">
+  <div class="panel__head">
+    <div>
+      <h2 class="panel__title" id="panel-title">—</h2>
+      <p class="panel__desc" id="panel-desc"></p>
+    </div>
+    <button class="icon-btn icon-btn--sm" id="panel-close" type="button" aria-label="收合面板">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+    </button>
+  </div>
+  <div class="panel__body" id="panel-body"><!-- schema-driven --></div>
+  <div class="panel__foot">
+    <button class="btn" id="act-reset" type="button">重設 <kbd>R</kbd></button>
+    <button class="btn" id="act-pause" type="button" aria-pressed="false">暫停 <kbd>Space</kbd></button>
+    <button class="btn" id="act-shot" type="button">截圖 <kbd>S</kbd></button>
+  </div>
+</aside>
+
+<!-- ─────────────────────────  SCENE CAPTION  ───────────────────────── -->
+<footer class="caption" id="caption">
+  <div class="caption__index" id="caption-index">01</div>
+  <div class="caption__text">
+    <h3 id="caption-title">—</h3>
+    <p id="caption-tech"></p>
+  </div>
+</footer>
+
+<!-- ─────────────────────────  COMMAND PALETTE  ───────────────────────── -->
+<dialog class="cmdk" id="cmdk" aria-label="指令面板">
+  <form method="dialog" class="cmdk__form">
+    <div class="cmdk__inputwrap">
+      <svg class="cmdk__icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M16.5 16.5 21 21"/></svg>
+      <input class="cmdk__input" id="cmdk-input" type="text" placeholder="跳到場景、切換設定、執行動作…" autocomplete="off" spellcheck="false" aria-controls="cmdk-list" aria-expanded="true" role="combobox">
+      <kbd class="cmdk__esc">Esc</kbd>
+    </div>
+    <ul class="cmdk__list" id="cmdk-list" role="listbox" aria-label="可用指令"></ul>
+    <p class="cmdk__empty" id="cmdk-empty" hidden>沒有符合的指令</p>
+  </form>
+</dialog>
+
+<!-- ─────────────────────────  SHORTCUTS  ───────────────────────── -->
+<dialog class="sheet" id="help" aria-labelledby="help-title">
+  <form method="dialog">
+    <h2 id="help-title">快捷鍵</h2>
+    <dl class="keys" id="help-keys"></dl>
+    <button class="btn btn--primary" type="submit">知道了</button>
+  </form>
+</dialog>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<noscript>
+  <div class="fallback"><h1>需要 JavaScript</h1><p>這個網站的每一個像素都是即時運算出來的。</p></div>
+</noscript>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,64 @@
+/* ── reset ───────────────────────────────────────────────────────────
+   Minimal, opinionated. No normalize.css, no dependency.
+   ------------------------------------------------------------------ */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overscroll-behavior: none;
+}
+
+h1, h2, h3, h4, p, figure, blockquote, dl, dd { margin: 0; }
+ul[role="list"], ol[role="list"], .cmdk__list { list-style: none; margin: 0; padding: 0; }
+
+img, picture, svg, canvas, video { display: block; max-width: 100%; }
+
+input, button, textarea, select { font: inherit; color: inherit; }
+button { background: none; border: 0; padding: 0; cursor: pointer; }
+
+a { color: inherit; text-decoration: none; }
+
+/* The UA rule for [hidden] is `display: none` at author-agent priority,
+   so any component rule that sets `display` silently defeats it. This
+   one line makes the attribute mean what everyone assumes it means. */
+[hidden] { display: none !important; }
+
+:where(dialog) { border: 0; padding: 0; background: none; color: inherit; max-width: none; max-height: none; }
+dialog::backdrop { background: none; }
+
+/* Consistent, visible, keyboard-only focus. */
+:focus { outline: none; }
+:focus-visible {
+  outline: 2px solid var(--focus, #7de3ff);
+  outline-offset: 2px;
+  border-radius: var(--r-sm, 6px);
+}
+
+::selection { background: color-mix(in oklch, var(--accent) 45%, transparent); color: #fff; }
+
+/* Scrollbars — thin, themed, non-intrusive. */
+* { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 99px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--line-bright); background-clip: content-box; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
