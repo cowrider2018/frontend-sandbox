@@ -47,8 +47,8 @@ const SHOTS_PLAN = [
   // travelled far enough across the surface to be visible in a still.
   { name: '04-burst',  hash: '#/march?spin=0&scale=1&power=2.6&burst=16&rippleAmp=0.05&rippleFreq=13',
     settle: 5000, click: true, after: 260 },
-  { name: '05-ripple', hash: '#/march?spin=0&scale=1&rippleAmp=0.052&rippleFreq=11&rippleSpeed=0.7&burst=4&power=0.6',
-    settle: 5000, click: true, after: 480 },
+  { name: '05-crown',  hash: '#/march?spin=0&scale=1&rippleAmp=0.052&rippleFreq=12&rippleSpeed=0.95&burst=28&power=1.9&jet=4',
+    settle: 5000, click: true, after: 700 },
   { name: '06-lit',    hash: '#/march?light=0.18,0.62&tint=rose&ao=1&shadow=1', settle: 8000 },
 ];
 

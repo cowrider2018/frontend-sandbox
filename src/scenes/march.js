@@ -495,10 +495,11 @@ export default {
     { id: 'displace', type: 'slider', label: '表面擾動', min: 0, max: 1, step: 0.01, value: 0.14 },
 
     { group: '爆炸' },
-    { id: 'burst', type: 'slider', label: '水花數', min: 2, max: 16, step: 1, value: 12 },
-    { id: 'power', type: 'slider', label: '噴發力道', min: 0.2, max: 4, step: 0.01, value: 1.5 },
-    { id: 'dropLife', type: 'slider', label: '水花壽命', min: 0.3, max: 4, step: 0.05, value: 1.5, unit: 's' },
-    { id: 'gravity', type: 'slider', label: '重力', min: 0, max: 6, step: 0.05, value: 1.9 },
+    { id: 'burst', type: 'slider', label: '水花量', min: 2, max: 30, step: 1, value: 16 },
+    { id: 'power', type: 'slider', label: '噴發力道', min: 0.2, max: 4, step: 0.01, value: 1.35 },
+    { id: 'jet', type: 'slider', label: '中央柱', min: 0, max: 8, step: 1, value: 3 },
+    { id: 'dropLife', type: 'slider', label: '水花壽命', min: 0.3, max: 4, step: 0.05, value: 1.7, unit: 's' },
+    { id: 'drag', type: 'slider', label: '阻力', min: 0, max: 3, step: 0.01, value: 0.35 },
     // Capped: past about 0.06 the added term overwhelms the field's
     // Lipschitz bound and the tracer cuts through surfaces instead of
     // rippling them.
@@ -579,8 +580,12 @@ class MarchScene {
     this._rippleHost = new Int32Array(RIPPLE_N).fill(-2);  // ball index, -1 = ring
     this._rippleLocal = new Float32Array(RIPPLE_N * 3);    // unit dir, or ring-local point
     this._rippleAge = new Float32Array(RIPPLE_N);
+    this._rippleEnergy = new Float32Array(RIPPLE_N);   // strength at impact
+    this._rippleEmit = new Float32Array(RIPPLE_N);     // fractional droplet budget
     this._rippleNext = 0;
     this.rippleLife = 1.9;
+    /** the crown only sheds over the first part of the ripple's life */
+    this.crownWindow = 0.42;
 
     /* ── spray ── */
     this.splash = new Float32Array(SPLASH_N * 4);
@@ -835,6 +840,49 @@ class MarchScene {
     return this._hit;
   }
 
+  /** Gradient of the CPU field — the surface normal at any point. */
+  _normalAt(x, y, z, out) {
+    const h = 0.004;
+    let nx = this._mapCPU(x + h, y, z) - this._mapCPU(x - h, y, z);
+    let ny = this._mapCPU(x, y + h, z) - this._mapCPU(x, y - h, z);
+    let nz = this._mapCPU(x, y, z + h) - this._mapCPU(x, y, z - h);
+    const l = Math.hypot(nx, ny, nz) || 1;
+    out[0] = nx / l; out[1] = ny / l; out[2] = nz / l;
+    return out;
+  }
+
+  /**
+   * Walk a point onto the surface along the field's own gradient. Four
+   * Newton steps: the distance function *is* the error, so each step
+   * removes almost all of what is left.
+   */
+  _projectToSurface(out) {
+    const n = this._tmpN ??= new Float32Array(3);
+    for (let k = 0; k < 4; k++) {
+      const d = this._mapCPU(out[0], out[1], out[2]);
+      if (Math.abs(d) < 1e-4) break;
+      this._normalAt(out[0], out[1], out[2], n);
+      out[0] -= n[0] * d;
+      out[1] -= n[1] * d;
+      out[2] -= n[2] * d;
+    }
+    return out;
+  }
+
+  /** Any unit vector perpendicular to n, plus its partner. */
+  _tangentBasis(nx, ny, nz, u, v) {
+    const ax = Math.abs(nx) < 0.9 ? 1 : 0;
+    const ay = Math.abs(nx) < 0.9 ? 0 : 1;
+    let ux = ny * 0 - nz * ay;
+    let uy = nz * ax - nx * 0;
+    let uz = nx * ay - ny * ax;
+    const ul = Math.hypot(ux, uy, uz) || 1;
+    u[0] = ux / ul; u[1] = uy / ul; u[2] = uz / ul;
+    v[0] = ny * u[2] - nz * u[1];
+    v[1] = nz * u[0] - nx * u[2];
+    v[2] = nx * u[1] - ny * u[0];
+  }
+
   /* ── bursts ───────────────────────────────────────────────────── */
 
   /**
@@ -861,6 +909,8 @@ class MarchScene {
     this._rippleNext = (this._rippleNext + 1) % RIPPLE_N;
     this._rippleHost[i] = host;
     this._rippleAge[i] = 1e-4;
+    this._rippleEnergy[i] = 1;
+    this._rippleEmit[i] = 0;
 
     const l = i * 3;
     if (host >= 0) {
@@ -880,50 +930,129 @@ class MarchScene {
     }
   }
 
-  /** Throw a cone of droplets off the surface, along its normal. */
-  _spray(state, px, py, pz, nx, ny, nz) {
-    const count = Math.round(state.burst);
+  /** Put one droplet into the pool. Position and velocity are given. */
+  _emit(px, py, pz, vx, vy, vz, size) {
+    const i = this._splashNext;
+    this._splashNext = (this._splashNext + 1) % SPLASH_N;
+    const o = i * 3;
+    const g = i * 4;
+    this.splash[g + 0] = px;
+    this.splash[g + 1] = py;
+    this.splash[g + 2] = pz;
+    this._splashVel[o + 0] = vx;
+    this._splashVel[o + 1] = vy;
+    this._splashVel[o + 2] = vz;
+    this._splashSize[i] = size;
+    this._splashLife[i] = 1;
+  }
 
-    // An orthonormal basis around the normal, so the cone is a cone and
-    // not an ellipse that happens to point the right way.
-    let ax = Math.abs(nx) < 0.9 ? 1 : 0;
-    let ay = Math.abs(nx) < 0.9 ? 0 : 1;
-    let ux = ny * 0 - nz * ay, uy = nz * ax - nx * 0, uz = nx * ay - ny * ax;
-    const ul = Math.hypot(ux, uy, uz) || 1;
-    ux /= ul; uy /= ul; uz /= ul;
-    const vx = ny * uz - nz * uy;
-    const vy = nz * ux - nx * uz;
-    const vz = nx * uy - ny * ux;
-
+  /**
+   * The central jet: the column that goes straight back up out of the
+   * cavity at the instant of impact, before the crown has formed.
+   */
+  _jet(state, px, py, pz, nx, ny, nz) {
+    const count = Math.round(state.jet);
     for (let k = 0; k < count; k++) {
-      const i = this._splashNext;
-      this._splashNext = (this._splashNext + 1) % SPLASH_N;
-
+      const spread = 0.16 * Math.random();
       const spin = Math.random() * Math.PI * 2;
-      // Wider than a jet, narrower than a hemisphere: the shape a struck
-      // liquid surface actually throws.
-      const cone = Math.tan(0.18 + Math.random() * 0.85);
-      let dx = nx + (Math.cos(spin) * ux + Math.sin(spin) * vx) * cone;
-      let dy = ny + (Math.cos(spin) * uy + Math.sin(spin) * vy) * cone;
-      let dz = nz + (Math.cos(spin) * uz + Math.sin(spin) * vz) * cone;
+      const u = this._tmpU ??= new Float32Array(3);
+      const v = this._tmpV ??= new Float32Array(3);
+      this._tangentBasis(nx, ny, nz, u, v);
+
+      let dx = nx + (Math.cos(spin) * u[0] + Math.sin(spin) * v[0]) * spread;
+      let dy = ny + (Math.cos(spin) * u[1] + Math.sin(spin) * v[1]) * spread;
+      let dz = nz + (Math.cos(spin) * u[2] + Math.sin(spin) * v[2]) * spread;
       const dl = Math.hypot(dx, dy, dz) || 1;
       dx /= dl; dy /= dl; dz /= dl;
 
-      const speed = state.power * (0.55 + Math.random() * 0.9);
-      const o = i * 3;
-      const g = i * 4;
+      const speed = state.power * (1.1 + Math.random() * 0.7);
+      this._emit(
+        px + nx * 0.03, py + ny * 0.03, pz + nz * 0.03,
+        dx * speed, dy * speed, dz * speed,
+        0.030 + Math.random() * 0.05,
+      );
+    }
+  }
 
-      // Start just clear of the surface, or the first frame shows the
-      // droplet buried in the thing it came off.
-      this.splash[g + 0] = px + nx * 0.03;
-      this.splash[g + 1] = py + ny * 0.03;
-      this.splash[g + 2] = pz + nz * 0.03;
-      this._splashVel[o + 0] = dx * speed;
-      this._splashVel[o + 1] = dy * speed;
-      this._splashVel[o + 2] = dz * speed;
+  /**
+   * Droplets shed by the crown.
+   *
+   * A struck liquid surface does not throw its spray from the point that
+   * was hit — the cavity collapses, a crown rises around it, and the
+   * droplets tear off the crown's rim as it travels outward. So emission
+   * is spread over the ripple's early life, seeded *on the wavefront*
+   * rather than at the impact point, and each droplet leaves along the
+   * surface normal where it detached. That is the one direction the
+   * surface can throw anything.
+   *
+   * Finding a point on the front: step out along a random tangent by the
+   * wave's current radius, then let the distance field pull the point
+   * back onto the surface. On a lumpy metaball cluster that lands
+   * correctly on whatever the wave has actually reached, including a
+   * neighbouring lobe it has crawled onto.
+   */
+  _shedCrown(state, i, age, dt) {
+    if (age >= this.crownWindow) return;
 
-      this._splashSize[i] = 0.030 + Math.random() * 0.055;
-      this._splashLife[i] = 1;
+    // Crown energy falls to nothing by the end of the window.
+    const strength = 1 - age / this.crownWindow;
+    this._rippleEmit[i] += this._rippleEnergy[i] * strength * state.burst * 2.6 * dt;
+
+    const c = this._tmpP ??= new Float32Array(3);
+    const n = this._tmpQ ??= new Float32Array(3);
+    const u = this._tmpU ??= new Float32Array(3);
+    const v = this._tmpV ??= new Float32Array(3);
+
+    let guard = 4;
+    while (this._rippleEmit[i] >= 1 && guard-- > 0) {
+      this._rippleEmit[i] -= 1;
+
+      const cx = this.ripples[i * 4 + 0];
+      const cy = this.ripples[i * 4 + 1];
+      const cz = this.ripples[i * 4 + 2];
+      this._normalAt(cx, cy, cz, n);
+      this._tangentBasis(n[0], n[1], n[2], u, v);
+
+      const front = age * state.rippleSpeed;
+      const spin = Math.random() * Math.PI * 2;
+      const tx = Math.cos(spin) * u[0] + Math.sin(spin) * v[0];
+      const ty = Math.cos(spin) * u[1] + Math.sin(spin) * v[1];
+      const tz = Math.cos(spin) * u[2] + Math.sin(spin) * v[2];
+
+      c[0] = cx + tx * front;
+      c[1] = cy + ty * front;
+      c[2] = cz + tz * front;
+      this._projectToSurface(c);
+
+      // The projection pulls to the *nearest* surface, which is usually
+      // the lobe the wave has crawled onto — but a tangent step off the
+      // edge of a small sphere can land it somewhere the wave has not
+      // reached at all. Drop those rather than teleport a droplet.
+      const strayed = Math.hypot(c[0] - cx, c[1] - cy, c[2] - cz);
+      if (strayed > front * 1.9 + 0.25) continue;
+
+      this._normalAt(c[0], c[1], c[2], n);
+
+      // Along the normal, with a little of the crown's outward travel
+      // left in it — a rim droplet keeps some of the momentum that
+      // carried the wave there.
+      const speed = state.power * strength * (0.7 + Math.random() * 0.7);
+      const lateral = state.power * strength * 0.3;
+      this._emit(
+        c[0] + n[0] * 0.025, c[1] + n[1] * 0.025, c[2] + n[2] * 0.025,
+        n[0] * speed + tx * lateral,
+        n[1] * speed + ty * lateral,
+        n[2] * speed + tz * lateral,
+        0.020 + Math.random() * 0.042 * strength,
+      );
+    }
+  }
+
+  _emitCrowns(state, dt) {
+    if (dt <= 0) return;
+    for (let i = 0; i < RIPPLE_N; i++) {
+      const age = this._rippleAge[i];
+      if (age > 0) this._shedCrown(state, i, age, dt);
     }
   }
 
@@ -931,7 +1060,7 @@ class MarchScene {
     const p = this._pick(pointer);
     if (!p) return false;
     this._anchorRipple(p[0], p[1], p[2]);
-    this._spray(state, p[0], p[1], p[2], this._normal[0], this._normal[1], this._normal[2]);
+    this._jet(state, p[0], p[1], p[2], this._normal[0], this._normal[1], this._normal[2]);
     this.flash = 1;
     this.bursts++;
     return true;
@@ -973,8 +1102,15 @@ class MarchScene {
     return active;
   }
 
+  /**
+   * Droplets coast. There is no gravity here — the cluster hangs in an
+   * empty sky with no ground plane the eye reads as "down", and pulling
+   * the spray toward the floor grid immediately makes the whole scene
+   * read as an object on a table instead of something in space. All that
+   * acts on a droplet is a little drag and its own lifetime.
+   */
   _updateSplash(state, dt) {
-    const drag = Math.exp(-dt * 0.9);
+    const drag = Math.exp(-dt * state.drag);
     const decay = dt / state.dropLife;
     let live = 0;
     let minX = 1e9, minY = 1e9, minZ = 1e9, maxX = -1e9, maxY = -1e9, maxZ = -1e9, maxR = 0;
@@ -983,7 +1119,6 @@ class MarchScene {
       if (this._splashLife[i] <= 0) { this.splash[i * 4 + 3] = 0; continue; }
       const o = i * 3, g = i * 4;
 
-      this._splashVel[o + 1] -= state.gravity * dt;
       this._splashVel[o] *= drag;
       this._splashVel[o + 1] *= drag;
       this._splashVel[o + 2] *= drag;
@@ -993,8 +1128,7 @@ class MarchScene {
       this.splash[g + 2] += this._splashVel[o + 2] * dt;
 
       this._splashLife[i] -= decay;
-      // A droplet that reaches the floor is spent.
-      if (this._splashLife[i] <= 0 || this.splash[g + 1] < -1.3) {
+      if (this._splashLife[i] <= 0) {
         this._splashLife[i] = 0;
         this.splash[g + 3] = 0;
         continue;
@@ -1080,7 +1214,10 @@ class MarchScene {
       this._burst(state, pointer);
     }
 
+    // Order matters: the ripple centres have to be re-seated on their
+    // moving hosts before the crown can shed anything from them.
     const rippleActive = this._updateRipples(dt);
+    this._emitCrowns(state, dt);
     const splashLive = this._updateSplash(state, dt);
     this.flash *= Math.exp(-dt * 4.5);
     const glowCount = this._packGlow(state);
