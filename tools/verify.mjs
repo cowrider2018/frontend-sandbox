@@ -40,14 +40,12 @@ const VIEWPORT = { width: 1600, height: 900 };
  * mechanism that makes a scene shareable makes it testable.
  */
 const SHOTS_PLAN = [
-  { name: '01-intro',   hash: '#/march',                                settle: 1400, intro: false },
-  { name: '02-stars',   hash: '#/march',                                settle: 8000 },
-  // Few, large targets and a fast orb: the surface is rippling almost
-  // continuously, which is the only way to catch it in a still frame.
-  { name: '03-impact',  hash: '#/march?stars=2&spread=0.6&agentSpeed=2.4&rippleAmp=0.05&rippleFreq=12&scale=1&perch=0', settle: 9000 },
-  { name: '04-perch',   hash: '#/march?agentSpeed=0.5&dwell=6&spin=0',   settle: 11000 },
-  { name: '05-crowd',   hash: '#/march?stars=7&lobes=5&spread=1.6&churn=1.4', settle: 8000 },
-  { name: '06-jade',    hash: '#/march?tint=jade&shed=2&glow=1.3&blend=0.28', settle: 8000 },
+  { name: '01-intro',  hash: '#/march',                                   settle: 1400, intro: false },
+  { name: '02-scene',  hash: '#/march',                                   settle: 8000 },
+  { name: '03-full',   hash: '#/march?scale=1&steps=160&spin=0&taa=0.9',  settle: 9000 },
+  { name: '04-tight',  hash: '#/march?balls=9&blend=0.55&displace=0.5',   settle: 8000 },
+  { name: '05-jade',   hash: '#/march?tint=jade&rough=0.06&reflect=0.9',  settle: 8000 },
+  { name: '06-lit',    hash: '#/march?light=0.18,0.62&tint=rose&ao=1&shadow=1', settle: 8000 },
 ];
 
 /* ═══ static server ═══════════════════════════════════════════════ */
@@ -487,65 +485,33 @@ async function interact(cdp, base, problems) {
   await sleep(600);
   check('intro dismisses', await cdp.eval(`document.body.classList.contains('intro-done')`));
 
-  /* the canvas is actually receiving pointer input */
-  const mid = await drag([700, 450], [900, 400], 10);
-  check('canvas receives pointer events', mid?.down === true, JSON.stringify(mid));
-
-  /* the orb turns toward the pointer.
-     Collisions are switched off for this one: bouncing off a star is the
-     point of the scene and the enemy of this assertion. */
-  await cdp.eval(`__aether.panel.setValues(
-    { agentMode: 'follow', stars: 1, spread: 0.4, perch: false }, { notify: true }); true`);
-  await sleep(400);
-
-  // Alignment, not distance. The pointer maps to a point that can sit
-  // well outside the orb's own bounds, so "did it get closer" has a
-  // floor it can never cross — but "is it on that side" is exactly the
-  // thing a viewer judges.
-  const alignment = () => cdp.eval(`(() => {
-    const a = __aether.agent;
-    const hl = Math.hypot(a.head[0], a.head[1]) || 1;
-    const al = Math.hypot(a._aim[0], a._aim[1]) || 1;
-    return (a.head[0] * a._aim[0] + a.head[1] * a._aim[1]) / (hl * al);
-  })()`);
-
-  const corner = [250, 740];
-  await mouse('mouseMoved', corner[0], corner[1], { buttons: 0 });
-  await sleep(300);
-  const before1 = await alignment();
-  for (let i = 0; i < 18; i++) {
-    await mouse('mouseMoved', corner[0], corner[1], { buttons: 0 });
-    await sleep(130);
-  }
-  const after1 = await alignment();
-  check('orb turns toward the pointer', after1 > 0.55,
-    `alignment ${before1.toFixed(2)} → ${after1.toFixed(2)}`);
-  await shot(cdp, 'i1-orb-follow');
-
-  /* a click launches it; a drag does not */
-  await cdp.eval(`__aether.panel.setValues({ leap: 6 }, { notify: true }); true`);
-  await sleep(200);
-  const leaps0 = await cdp.eval(`__aether.scene.leaps`);
-  await mouse('mouseMoved', 1000, 300, { buttons: 0 });
-  await sleep(120);
-  await mouse('mousePressed', 1000, 300, { buttons: 1 });
-  await sleep(90);
-  await mouse('mouseReleased', 1000, 300, { buttons: 0 });
-  await sleep(250);
-  const leaps1 = await cdp.eval(`__aether.scene.leaps`);
-  const launchSpeed = await cdp.eval(`__aether.agent.speed`);
-  check('a click launches the orb', leaps1 > leaps0,
-    `${leaps0} → ${leaps1} leaps, speed ${launchSpeed.toFixed(2)}`);
-
+  /* the canvas is actually receiving pointer input, and a drag orbits */
   const yaw0 = await cdp.eval(`__aether.scene.yaw`);
-  const leapsBeforeDrag = await cdp.eval(`__aether.scene.leaps`);
   const midOrbit = await drag([700, 450], [980, 380]);
   const yaw1 = await cdp.eval(`__aether.scene.yaw`);
+  check('canvas receives pointer events', midOrbit?.down === true, JSON.stringify(midOrbit));
   check('drag orbits the camera', Math.abs(yaw1 - yaw0) > 0.2,
-    `yaw ${yaw0.toFixed(2)} → ${yaw1.toFixed(2)}, mid ${JSON.stringify(midOrbit)}`);
-  check('a drag does not launch the orb',
-    (await cdp.eval(`__aether.scene.leaps`)) === leapsBeforeDrag,
-    'click and drag stay distinguishable');
+    `yaw ${yaw0.toFixed(2)} → ${yaw1.toFixed(2)}`);
+  await shot(cdp, 'i1-orbited');
+
+  /* the wheel zooms */
+  const dist0 = await cdp.eval(`__aether.scene.targetDist`);
+  await cdp.send('Input.dispatchMouseEvent', {
+    type: 'mouseWheel', x: 700, y: 450, deltaX: 0, deltaY: -400,
+  });
+  await sleep(400);
+  const dist1 = await cdp.eval(`__aether.scene.targetDist`);
+  check('wheel zooms the camera', dist1 < dist0,
+    `${dist0.toFixed(2)} → ${dist1.toFixed(2)}`);
+
+  /* the XY pad drives the light direction */
+  const light0 = await cdp.eval(`[...__aether.scene.lightDir]`);
+  await cdp.eval(`__aether.panel.setValues({ light: [0.15, 0.8] }, { notify: true }); true`);
+  await sleep(400);
+  const light1 = await cdp.eval(`[...__aether.scene.lightDir]`);
+  const swung = Math.hypot(light1[0] - light0[0], light1[1] - light0[1], light1[2] - light0[2]);
+  check('the XY pad steers the light', swung > 0.3,
+    `direction moved ${swung.toFixed(2)}`);
 
   /* command palette: open, fuzzy-filter, run */
   await key('k', { mods: 2 /* Ctrl */, vk: 75 });
@@ -558,48 +524,14 @@ async function interact(cdp, base, problems) {
   await key('Escape', { code: 'Escape', vk: 27 });
   await sleep(300);
 
-  /* the orb strikes the stars, leaves ripples, and sheds droplets */
-  await cdp.eval(`__aether.panel.setValues(
-    { stars: 5, spread: 1.0, agentSpeed: 1.8, perch: false }, { notify: true }); true`);
+  /* the render-scale control actually reallocates the target */
+  const rt0 = await cdp.eval(`__aether.scene.rt.width`);
+  await cdp.eval(`__aether.panel.setValues({ scale: '0.5' }, { notify: true }); true`);
+  await sleep(500);
+  const rt1 = await cdp.eval(`__aether.scene.rt.width`);
+  check('render scale resizes the target', rt1 < rt0, `${rt0}px → ${rt1}px wide`);
+  await cdp.eval(`__aether.panel.setValues({ scale: '0.75' }, { notify: true }); true`);
   await sleep(400);
-  const hits0 = await cdp.eval(`__aether.scene.hits`);
-  // The cluster sits at the centre of the frame; steering the orb into
-  // it is exactly what a player would do.
-  for (let i = 0; i < 26; i++) {
-    await mouse('mouseMoved', 640, 430, { buttons: 0 });
-    await sleep(150);
-  }
-  const hits1 = await cdp.eval(`__aether.scene.hits`);
-  check('orb collides with the stars', hits1 > hits0, `${hits0} → ${hits1} impacts`);
-
-  const ripples = await cdp.eval(
-    `[...__aether.scene.ripples].filter((_, i) => i % 4 === 3).filter((v) => v > 0).length`);
-  const drops = await cdp.eval(`__aether.agent.live - 1`);
-  check('impacts leave ripples on the surface', ripples > 0, `${ripples} active`);
-  check('the orb sheds inertial droplets', drops > 0 && drops <= 10, `${drops} live`);
-  await shot(cdp, 'i3-impact');
-
-  /* it can settle onto a body and ride it */
-  await cdp.eval(`__aether.panel.setValues(
-    { perch: true, agentSpeed: 0.45, dwell: 6, churn: 0.4 }, { notify: true }); true`);
-  await sleep(400);
-  let perched = false;
-  for (let i = 0; i < 60 && !perched; i++) {
-    await mouse('mouseMoved', 640, 430, { buttons: 0 });
-    await sleep(160);
-    perched = (await cdp.eval(`__aether.scene.perchStar`)) >= 0;
-  }
-  check('the orb can perch on a body', perched,
-    perched ? `on star #${await cdp.eval(`__aether.scene.perchStar`)}` : 'never settled');
-  if (perched) {
-    const p0 = await cdp.eval(`[...__aether.agent.head]`);
-    await sleep(700);
-    const p1 = await cdp.eval(`[...__aether.agent.head]`);
-    const rode = Math.hypot(p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]);
-    check('a perched orb rides its body', rode > 0.002 && rode < 0.5,
-      `carried ${rode.toFixed(4)} canonical units`);
-    await shot(cdp, 'i4-perch');
-  }
 
   /* URL is state */
   await cdp.eval(`__aether.panel.setValues({ tint: 'jade' }, { notify: true }); true`);

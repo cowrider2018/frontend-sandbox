@@ -14,7 +14,6 @@ import { Pointer } from './core/pointer.js';
 import { Perf } from './core/perf.js';
 import { Router } from './core/router.js';
 import { signal, effect } from './core/signal.js';
-import { Agent } from './core/agent.js';
 import { Panel } from './ui/panel.js';
 import { Tabs, Hud, Toaster } from './ui/chrome.js';
 import { CommandPalette } from './ui/cmdk.js';
@@ -133,11 +132,6 @@ class App {
     });
     this.toaster = new Toaster($('toasts'));
 
-    // The creature belongs to the app, not to a scene. Switching scenes
-    // hands the same swimmer — same position, same momentum, mid-turn —
-    // to whatever renders next.
-    this.agent = new Agent();
-
     /** The object every scene receives. */
     this.sceneCtx = {
       gl: this.gl,
@@ -146,7 +140,6 @@ class App {
       canvas,
       tri: this.tri,
       empty: this.empty,
-      agent: this.agent,
       setParams: (values) => this.panel.setValues(values),
       toast: (msg) => this.toaster.show(msg),
     };
@@ -359,18 +352,6 @@ class App {
   frame(clock) {
     this.pointer.update(clock.wallDt);
     this.perf.sample(clock.wallDt);
-
-    // Every scene declares `agent` / `agentMode` with the same ids, so
-    // the app can drive the creature without knowing which scene is up.
-    if (this.state.agent !== false) {
-      this.agent.update(clock.dt, {
-        mode: this.pointer.active ? (this.state.agentMode ?? 'wander') : 'wander',
-        speed: this.state.agentSpeed ?? 1.0,
-        // Static per scene, not a user control: whether the scene has a
-        // third dimension to swim in is a property of the scene.
-        flatten: this.sceneDef?.agentFlatten ?? 0,
-      });
-    }
 
     if (this.scene) {
       this.perf.begin();
