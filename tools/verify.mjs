@@ -40,14 +40,14 @@ const VIEWPORT = { width: 1600, height: 900 };
  * mechanism that makes a scene shareable makes it testable.
  */
 const SHOTS_PLAN = [
-  { name: '01-intro',     hash: '#/march',                            settle: 1400, intro: false },
-  { name: '02-march',     hash: '#/march',                            settle: 7000 },
+  { name: '01-intro',   hash: '#/march',                                settle: 1400, intro: false },
+  { name: '02-stars',   hash: '#/march',                                settle: 8000 },
   // Few, large targets and a fast orb: the surface is rippling almost
   // continuously, which is the only way to catch it in a still frame.
-  { name: '03-march-hit', hash: '#/march?balls=3&agentSpeed=2.2&rippleAmp=0.075&rippleFreq=11&scale=1&spin=0', settle: 9000 },
-  { name: '04-fluid',     hash: '#/fluid',                            settle: 5000 },
-  { name: '05-reaction',  hash: '#/reaction',                         settle: 6000 },
-  { name: '06-march-jade', hash: '#/march?tint=jade&shed=2&glow=1.3',  settle: 7000 },
+  { name: '03-impact',  hash: '#/march?stars=2&spread=0.6&agentSpeed=2.4&rippleAmp=0.05&rippleFreq=12&scale=1&perch=0', settle: 9000 },
+  { name: '04-perch',   hash: '#/march?agentSpeed=0.5&dwell=6&spin=0',   settle: 11000 },
+  { name: '05-crowd',   hash: '#/march?stars=7&lobes=5&spread=1.6&churn=1.4', settle: 8000 },
+  { name: '06-jade',    hash: '#/march?tint=jade&shed=2&glow=1.3&blend=0.28', settle: 8000 },
 ];
 
 /* ═══ static server ═══════════════════════════════════════════════ */
@@ -479,7 +479,7 @@ async function interact(cdp, base, problems) {
 
   console.log('▸ interaction');
 
-  await cdp.send('Page.navigate', { url: `${base}#/fluid?agentSpeed=1.4` });
+  await cdp.send('Page.navigate', { url: `${base}#/march` });
   await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 20000);
 
   /* intro */
@@ -487,23 +487,16 @@ async function interact(cdp, base, problems) {
   await sleep(600);
   check('intro dismisses', await cdp.eval(`document.body.classList.contains('intro-done')`));
 
-  /* pointer painting into the fluid */
-  await cdp.eval(`__aether.panel.setValues({ auto: false }, { notify: true }); true`);
-  await sleep(300);
-  const before = await cdp.eval(`__aether.scene.splatCount`);
-  const mid = await drag([420, 700], [1050, 260]);
-  await sleep(400);
-  const after = await cdp.eval(`__aether.scene.splatCount`);
+  /* the canvas is actually receiving pointer input */
+  const mid = await drag([700, 450], [900, 400], 10);
   check('canvas receives pointer events', mid?.down === true, JSON.stringify(mid));
-  // Auto-injection is off, so every splat here came from the drag.
-  check('pointer drag injects dye', after > before + 10, `${before} → ${after} splats`);
-  await cdp.eval(`__aether.panel.setValues({ auto: true }, { notify: true }); true`);
 
-  /* the orb follows the pointer — checked here, in the 2D scene, where
-     nothing can knock it off course. In the raymarcher it bounces off
-     the stars, which is the point of that scene and the enemy of this
-     assertion. */
-  await cdp.eval(`__aether.panel.setValues({ agentMode: 'follow' }, { notify: true }); true`);
+  /* the orb turns toward the pointer.
+     Collisions are switched off for this one: bouncing off a star is the
+     point of the scene and the enemy of this assertion. */
+  await cdp.eval(`__aether.panel.setValues(
+    { agentMode: 'follow', stars: 1, spread: 0.4, perch: false }, { notify: true }); true`);
+  await sleep(400);
 
   // Alignment, not distance. The pointer maps to a point that can sit
   // well outside the orb's own bounds, so "did it get closer" has a
@@ -527,8 +520,32 @@ async function interact(cdp, base, problems) {
   const after1 = await alignment();
   check('orb turns toward the pointer', after1 > 0.55,
     `alignment ${before1.toFixed(2)} → ${after1.toFixed(2)}`);
-  await shot(cdp, 'i6-orb-follow');
-  await shot(cdp, 'i1-fluid-drag');
+  await shot(cdp, 'i1-orb-follow');
+
+  /* a click launches it; a drag does not */
+  await cdp.eval(`__aether.panel.setValues({ leap: 6 }, { notify: true }); true`);
+  await sleep(200);
+  const leaps0 = await cdp.eval(`__aether.scene.leaps`);
+  await mouse('mouseMoved', 1000, 300, { buttons: 0 });
+  await sleep(120);
+  await mouse('mousePressed', 1000, 300, { buttons: 1 });
+  await sleep(90);
+  await mouse('mouseReleased', 1000, 300, { buttons: 0 });
+  await sleep(250);
+  const leaps1 = await cdp.eval(`__aether.scene.leaps`);
+  const launchSpeed = await cdp.eval(`__aether.agent.speed`);
+  check('a click launches the orb', leaps1 > leaps0,
+    `${leaps0} → ${leaps1} leaps, speed ${launchSpeed.toFixed(2)}`);
+
+  const yaw0 = await cdp.eval(`__aether.scene.yaw`);
+  const leapsBeforeDrag = await cdp.eval(`__aether.scene.leaps`);
+  const midOrbit = await drag([700, 450], [980, 380]);
+  const yaw1 = await cdp.eval(`__aether.scene.yaw`);
+  check('drag orbits the camera', Math.abs(yaw1 - yaw0) > 0.2,
+    `yaw ${yaw0.toFixed(2)} → ${yaw1.toFixed(2)}, mid ${JSON.stringify(midOrbit)}`);
+  check('a drag does not launch the orb',
+    (await cdp.eval(`__aether.scene.leaps`)) === leapsBeforeDrag,
+    'click and drag stay distinguishable');
 
   /* command palette: open, fuzzy-filter, run */
   await key('k', { mods: 2 /* Ctrl */, vk: 75 });
@@ -538,13 +555,13 @@ async function interact(cdp, base, problems) {
   const top = await cdp.eval(`document.querySelector('#cmdk-list li .cmdk__label')?.textContent ?? ''`);
   check('fuzzy search filters', matches > 0 && matches < 12, `${matches} hits, top = "${top}"`);
   await shot(cdp, 'i2-cmdk');
+  await key('Escape', { code: 'Escape', vk: 27 });
+  await sleep(300);
 
-  await key('Enter', { code: 'Enter', vk: 13 });
-  await sleep(900);
-  check('palette navigates', await cdp.eval(`__aether.router.current`) === 'march',
-    `now at ${await cdp.eval(`__aether.router.current`)}`);
-
-  /* the orb strikes the stars, and the impact leaves a ripple */
+  /* the orb strikes the stars, leaves ripples, and sheds droplets */
+  await cdp.eval(`__aether.panel.setValues(
+    { stars: 5, spread: 1.0, agentSpeed: 1.8, perch: false }, { notify: true }); true`);
+  await sleep(400);
   const hits0 = await cdp.eval(`__aether.scene.hits`);
   // The cluster sits at the centre of the frame; steering the orb into
   // it is exactly what a player would do.
@@ -560,31 +577,31 @@ async function interact(cdp, base, problems) {
   const drops = await cdp.eval(`__aether.agent.live - 1`);
   check('impacts leave ripples on the surface', ripples > 0, `${ripples} active`);
   check('the orb sheds inertial droplets', drops > 0 && drops <= 10, `${drops} live`);
-  await shot(cdp, 'i7-impact');
+  await shot(cdp, 'i3-impact');
 
-  const before2 = await cdp.eval(`[...__aether.agent.head]`);
-  await cdp.eval(`document.querySelector('.tab[data-id="fluid"]').click(); true`);
-  await sleep(500);
-  const after2 = await cdp.eval(`[...__aether.agent.head]`);
-  const drift = Math.hypot(after2[0] - before2[0], after2[1] - before2[1], after2[2] - before2[2]);
-  check('swimmer persists across scenes', drift < 0.6,
-    `moved ${drift.toFixed(3)} in canonical units while the scene swapped`);
+  /* it can settle onto a body and ride it */
+  await cdp.eval(`__aether.panel.setValues(
+    { perch: true, agentSpeed: 0.45, dwell: 6, churn: 0.4 }, { notify: true }); true`);
+  await sleep(400);
+  let perched = false;
+  for (let i = 0; i < 60 && !perched; i++) {
+    await mouse('mouseMoved', 640, 430, { buttons: 0 });
+    await sleep(160);
+    perched = (await cdp.eval(`__aether.scene.perchStar`)) >= 0;
+  }
+  check('the orb can perch on a body', perched,
+    perched ? `on star #${await cdp.eval(`__aether.scene.perchStar`)}` : 'never settled');
+  if (perched) {
+    const p0 = await cdp.eval(`[...__aether.agent.head]`);
+    await sleep(700);
+    const p1 = await cdp.eval(`[...__aether.agent.head]`);
+    const rode = Math.hypot(p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]);
+    check('a perched orb rides its body', rode > 0.002 && rode < 0.5,
+      `carried ${rode.toFixed(4)} canonical units`);
+    await shot(cdp, 'i4-perch');
+  }
 
-  await cdp.eval(`document.querySelector('.tab[data-id="march"]').click(); true`);
-  await sleep(900);
-
-  /* camera orbit by dragging */
-  const yaw0 = await cdp.eval(`__aether.scene.yaw`);
-  const midOrbit = await drag([700, 450], [980, 380]);
-  const yaw1 = await cdp.eval(`__aether.scene.yaw`);
-  check('drag orbits the camera', Math.abs(yaw1 - yaw0) > 0.2,
-    `yaw ${yaw0.toFixed(2)} → ${yaw1.toFixed(2)}, mid ${JSON.stringify(midOrbit)}`);
-
-  /* keyboard scene switching + URL is state */
-  await key('1', { code: 'Digit1', vk: 49 });
-  await sleep(700);
-  check('number keys switch scene', await cdp.eval(`__aether.router.current`) === 'march');
-
+  /* URL is state */
   await cdp.eval(`__aether.panel.setValues({ tint: 'jade' }, { notify: true }); true`);
   await sleep(300);
   const url = await cdp.eval(`location.hash`);
@@ -604,25 +621,27 @@ async function interact(cdp, base, problems) {
   /* zen mode + help */
   await key('z', { vk: 90 });
   check('zen mode hides chrome', await cdp.eval(`document.body.classList.contains('zen')`));
-  await shot(cdp, 'i3-zen');
+  await shot(cdp, 'i5-zen');
   await key('z', { vk: 90 });
 
   await key('?', { code: 'Slash', vk: 191, mods: 8 });
   check('? opens shortcuts', await cdp.eval(`document.getElementById('help').open`));
-  await shot(cdp, 'i4-help');
+  await shot(cdp, 'i6-help');
   await key('Escape', { code: 'Escape', vk: 27 });
 
-  /* tabs */
-  await cdp.eval(`document.querySelector('.tab[data-id="reaction"]').click(); true`);
-  await sleep(900);
-  check('tab click switches scene', await cdp.eval(`__aether.router.current`) === 'reaction');
-  const inkW = await cdp.eval(`document.getElementById('tabs-ink').style.width`);
-  check('tab indicator tracks selection', parseFloat(inkW) > 20, `ink = ${inkW}`);
+  /* a lab with one scene must not show a tab bar that cannot do anything */
+  check('single-scene lab hides the tab bar',
+    await cdp.eval(`getComputedStyle(document.getElementById('tabs')).display === 'none'`));
 
-  /* every scene has been created and torn down at least once by now */
+  /* the panel restores its own defaults */
+  await cdp.eval(`__aether.__restore(); true`);
+  await sleep(400);
+  check('defaults can be restored', (await cdp.eval(`location.hash`)) === '#/march',
+    await cdp.eval(`location.hash`));
+
   check('no console errors during interaction', problems.length === 0,
     problems.map((p) => p.text.slice(0, 120)).join(' | '));
-  await shot(cdp, 'i5-reaction-after-switching');
+  await shot(cdp, 'i7-final');
 
   const failed = results.filter((r) => !r.pass);
   console.log(failed.length ? `\n▸ ${failed.length}/${results.length} FAILED`

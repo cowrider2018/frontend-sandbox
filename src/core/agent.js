@@ -48,6 +48,8 @@ export class Agent {
     this.time = 0;
     /** rises to 1 on impact, decays back — scenes flash the body with it */
     this.impact = 0;
+    /** set by a scene while it is placing the orb itself (perched) */
+    this.frozen = false;
 
     // Droplet pool. Slots are reused oldest-first; nothing is allocated
     // after construction.
@@ -85,6 +87,7 @@ export class Agent {
     this._budget = 0;
     this.time = 0;
     this.impact = 0;
+    this.frozen = false;
     this._pack();
   }
 
@@ -131,6 +134,24 @@ export class Agent {
     this.head[2] += dz;
   }
 
+  /**
+   * Throw the orb in a direction at a given speed, overriding whatever
+   * it was doing. This is the jump: steering will start pulling it back
+   * on course immediately, but `impact` suppresses that for a moment so
+   * the launch reads as a launch rather than as a nudge.
+   */
+  launch(x, y, z, power) {
+    const l = Math.hypot(x, y, z) || 1;
+    this.vel[0] = (x / l) * power;
+    this.vel[1] = (y / l) * power;
+    this.vel[2] = (z / l) * power;
+    this.speed = power;
+    this.impact = 1;
+    this._budget += 5;   // a burst of spray comes off the launch
+    this.frozen = false;
+    return this;
+  }
+
   /* ── update ───────────────────────────────────────────────────── */
 
   /**
@@ -143,6 +164,14 @@ export class Agent {
     if (dt <= 0) return this;
     this.time += dt;
     this.impact *= Math.exp(-dt * 5.5);
+
+    // Perched: the scene owns the orb's position this frame. Droplets
+    // still evaporate — a body at rest does not keep its spray.
+    if (this.frozen) {
+      this._stepDrops(dt, flatten);
+      this._pack();
+      return this;
+    }
 
     this._prevVel.set(this.vel);
     this._pickTarget(mode);

@@ -1,18 +1,18 @@
 /* ── scenes/index.js ─────────────────────────────────────────────────
    The scene registry. Order here is the order in the tab bar and the
-   1–n keyboard shortcuts.
+   1–n keyboard shortcuts; with a single scene the tab bar hides itself.
 
-   `index` is a catalogue number, not a position: 01 is archived in
-   ./archive/, and the remaining scenes keep the numbers they were
-   built under so that "the 03 scene" keeps meaning what it has always
-   meant. See ./archive/README.md to bring one back.
+   `index` is a catalogue number, not a position. 01 lives in
+   ./archive/ (see its README to bring it back); 02 and 04 were removed
+   and are recoverable from git:
+
+     git show 979cc95:src/scenes/fluid.js    > src/scenes/fluid.js
+     git show 979cc95:src/scenes/reaction.js > src/scenes/reaction.js
    ------------------------------------------------------------------ */
 
-import fluid from './fluid.js';
 import march from './march.js';
-import reaction from './reaction.js';
 
-export const SCENES = [march, fluid, reaction];
+export const SCENES = [march];
 
 export const SCENE_BY_ID = new Map(SCENES.map((s) => [s.id, s]));
 

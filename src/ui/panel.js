@@ -54,7 +54,11 @@ export class Panel {
         continue;
       }
 
-      if (item.id !== undefined) {
+      // Only widgets that can actually hold a value join the state map.
+      // Static blocks (hints, headings) may carry an id for the author's
+      // convenience, and registering them means the first programmatic
+      // setValues() call reaches an element with no set() and throws.
+      if (item.id !== undefined && typeof el.set === 'function') {
         const value = coerce(item, overrides[item.id], item.value);
         el._value = value;
         this.state[item.id] = value;

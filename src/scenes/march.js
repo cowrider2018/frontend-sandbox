@@ -1,5 +1,5 @@
 /* ── scenes/march.js ─────────────────────────────────────────────────
-   03 · Signed distance fields — a whole 3D scene in one fragment shader.
+   03 · Signed distance fields — a whole world in one fragment shader.
 
    There is no geometry here. Not one vertex, not one triangle: the
    entire image is produced by a single fullscreen triangle whose
@@ -8,18 +8,17 @@
    light, ambient occlusion from sampling the field around a point, and
    reflections from marching a second time along the mirror direction.
 
-   The orb that swims through it is real geometry in that same sense —
-   it goes into map(), so it casts real soft shadows, occludes, and is
-   reflected, none of which is drawn or faked. When it strikes one of
-   the bodies, the impact point is recorded and a ring displaces the
-   surface outward from it: the star ripples, because the ripple *is*
-   the surface.
+   The world is a handful of *composite* stars. Each one is several
+   spheres welded with a smooth minimum into a single irregular mass
+   that breathes as its lobes drift — the operator that makes a set of
+   spheres read as one body. Stars are combined with a plain minimum,
+   not a smooth one: they are separate objects you can aim at, and the
+   moment two of them fuse they stop being two places to go.
 
-   The bodies' positions are computed on the CPU and uploaded, rather
-   than derived from uTime in the shader. That costs nine uniforms and
-   buys the one thing the shader cannot give back: the ability to ask,
-   in JavaScript, where everything is — which is what collision, and
-   any game built on top of it, needs.
+   The orb that lives here is real geometry in the same sense. It goes
+   into map(), so it casts soft shadows, occludes, and is reflected. It
+   collides, it bounces, it can settle onto a star and ride it, and a
+   click throws it off toward wherever you are pointing.
    ------------------------------------------------------------------ */
 
 import { Program } from '../core/program.js';
@@ -29,14 +28,15 @@ import { PRECISION, CONSTANTS, HASH, COLOR, ROTATE, SIMPLEX3, VERT_FULLSCREEN } 
 // Every one of these is a term inside map(), which runs ~90 times per
 // pixel for the primary ray alone, plus shadow and AO taps. They are
 // sized to what reads on screen, not to what would be nice to have.
-const BALL_N = 9;      // orbiting bodies
+const STAR_N = 7;      // composite bodies
+const LOBE_N = 5;      // spheres per body
 const BODY_N = 11;     // orb + droplets
 const RIPPLE_N = 4;    // concurrent impacts
 
 /** Canonical agent space → world, plus a lift so it clears the floor. */
-const AGENT_SCALE = 0.82;
-const AGENT_LIFT = 0.28;
-const AGENT_GIRTH = 1.55;
+const AGENT_SCALE = 0.86;
+const AGENT_LIFT = 0.25;
+const AGENT_GIRTH = 1.5;
 
 const FRAG_MARCH = /* glsl */`
 ${PRECISION}
@@ -46,12 +46,13 @@ ${COLOR}
 ${ROTATE}
 ${SIMPLEX3}
 
-#define BALL_N ${BALL_N}
+#define STAR_N ${STAR_N}
+#define LOBE_N ${LOBE_N}
 #define BODY_N ${BODY_N}
 #define RIPPLE_N ${RIPPLE_N}
 
 in vec2 vUv;
-layout(location = 0) out vec4 outColor;
+out vec4 outColor;
 
 uniform vec3  uCamPos, uRight, uUp, uFwd;
 uniform vec2  uResolution;
@@ -61,8 +62,10 @@ uniform float uBlend, uDisplace, uRough, uFloorMix;
 uniform vec3  uLightDir, uTint;
 uniform float uReflect, uFog, uAO, uShadowSoft;
 
-uniform vec4  uBalls[BALL_N];    // xyz = centre, w = radius
-uniform float uBallCount;
+uniform vec4  uLobes[STAR_N * LOBE_N];  // xyz = centre, w = radius (0 = unused)
+uniform vec4  uStarBound[STAR_N];       // xyz = centre, w = bounding radius
+uniform float uStarMass[STAR_N];        // 0..1, drives the colour temperature
+uniform float uStarCount;
 
 uniform vec4  uBody[BODY_N];     // xyz = centre, w = radius (0 = unused)
 uniform float uBodyCount, uBodyBlend, uBodyOn, uImpact;
@@ -72,11 +75,6 @@ uniform vec4  uRipples[RIPPLE_N];  // xyz = impact point, w = normalised age
 uniform float uRippleOn, uRippleAmp, uRippleSpeed, uRippleFreq, uRippleTight;
 
 /* ═══ distance functions ══════════════════════════════════════════ */
-
-float sdTorus(vec3 p, vec2 t) {
-  vec2 q = vec2(length(p.xz) - t.x, p.y);
-  return length(q) - t.y;
-}
 
 /** Polynomial smooth minimum — the operator that makes SDFs feel alive. */
 float smin(float a, float b, float k) {
@@ -108,6 +106,46 @@ float ripples(vec3 p) {
 }
 
 /**
+ * The stars.
+ *
+ * Thirty-five spheres would be unaffordable evaluated blindly, so each
+ * body carries a bounding sphere. For any point comfortably outside it,
+ * the bound's own distance is already a valid conservative step and the
+ * whole lobe loop is skipped — which is almost every sample, because
+ * almost every sample is somewhere else.
+ *
+ * The out-parameter reports which body was nearest, so the shading
+ * pass can colour it without a second search. (No back-ticks in here:
+ * the shader lives inside a JS template literal, and one would end it.)
+ */
+float starField(vec3 p, out int which) {
+  float d = 1e9;
+  which = 0;
+
+  for (int s = 0; s < STAR_N; s++) {
+    if (float(s) >= uStarCount) break;
+
+    vec4 b = uStarBound[s];
+    float bd = length(p - b.xyz) - b.w;
+    if (bd > 0.22) {
+      if (bd < d) { d = bd; which = s; }
+      continue;
+    }
+
+    float sd = 1e9;
+    for (int l = 0; l < LOBE_N; l++) {
+      vec4 lo = uLobes[s * LOBE_N + l];
+      if (lo.w <= 0.0) break;
+      float ld = length(p - lo.xyz) - lo.w;
+      // Lobes weld into one mass; bodies do not weld to each other.
+      sd = (l == 0) ? ld : smin(sd, ld, uBlend);
+    }
+    if (sd < d) { d = sd; which = s; }
+  }
+  return d;
+}
+
+/**
  * The swimmer: one orb plus whatever droplets it has thrown off,
  * welded with a smooth minimum. A droplet shed a moment ago is still
  * within the blend radius and stays connected; as it drifts clear the
@@ -130,25 +168,12 @@ float swimmer(vec3 p) {
 
 // x = distance, y = material id
 vec2 map(vec3 p) {
-  float t = uTime * 0.42;
-
-  float d = 1e9;
-  for (int i = 0; i < BALL_N; i++) {
-    if (float(i) >= uBallCount) break;
-    d = smin(d, length(p - uBalls[i].xyz) - uBalls[i].w, uBlend);
-  }
-
-  // A ring threading the cluster, on its own slow tumble. Kept thin and
-  // barely blended so it reads as a separate object the orb can bounce
-  // off rather than as part of the stars.
-  vec3 q = p;
-  q.yz = rot2(t * 0.31) * q.yz;
-  q.xz = rot2(t * 0.19) * q.xz;
-  d = smin(d, sdTorus(q, vec2(1.28, 0.045)), uBlend * 0.35);
+  int which;
+  float d = starField(p, which);
 
   // Surface displacement: perturb the distance, not the geometry.
   if (uDisplace > 0.0) {
-    d += uDisplace * 0.12 * snoise(p * 3.1 + vec3(0.0, 0.0, uTime * 0.3));
+    d += uDisplace * 0.10 * snoise(p * 3.1 + vec3(0.0, 0.0, uTime * 0.3));
   }
   if (uRippleOn > 0.5) d += ripples(p);
 
@@ -237,7 +262,7 @@ vec3 sky(vec3 rd) {
 
 vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
   if (mat > 2.5) {
-    // The swimmer: wet, near-mirror, lit from inside so it stays legible
+    // The orb: wet, near-mirror, lit from inside so it stays legible
     // against whatever it is passing through, and flashing on impact.
     rough = 0.06;
     metal = 1.0;
@@ -254,32 +279,27 @@ vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
     metal = 0.0;
     return mix(vec3(0.024, 0.026, 0.032), uTint * 0.6, line * fade * 0.5);
   }
-  // A star. Each one takes its hue from its own index rather than from
-  // its position, so a body keeps its identity as it orbits — which is
-  // the whole point once you are meant to aim at a particular one.
-  // Cheap despite the loop: material() runs once per hit, not once per
-  // march step.
-  int nearest = 0;
-  float best = 1e9;
-  for (int i = 0; i < BALL_N; i++) {
-    if (float(i) >= uBallCount) break;
-    float d = length(p - uBalls[i].xyz) - uBalls[i].w;
-    if (d < best) { best = d; nearest = i; }
-  }
 
+  // A star. The iridescence is view-dependent, so a lumpy composite body
+  // shades differently over each lobe and reads as one solid mass rather
+  // than as flat-tinted spheres.
   rough = uRough;
   metal = 1.0;
-  float hue = fract(float(nearest) * 0.6180339887 + 0.06);
   float f = dot(n, normalize(uCamPos - p)) * 0.5 + 0.5;
-  vec3 base = cosPalette(hue,
-    vec3(0.42, 0.40, 0.44), vec3(0.40, 0.38, 0.40),
-    vec3(1.0, 1.0, 1.0), vec3(0.0, 0.33, 0.67));
-  // Pulled a quarter of the way toward its own luminance: enough hue to
-  // tell the bodies apart, not so much that the scene turns into sweets.
-  base = mix(base, vec3(dot(base, vec3(0.299, 0.587, 0.114))), 0.28);
-  // Rim brightening keeps the spheres reading as spheres once they stop
-  // being welded into one blob.
-  return base * (0.55 + 0.75 * f) + uTint * 0.10;
+  vec3 base = cosPalette(f * 0.8 + 0.1,
+    vec3(0.5, 0.5, 0.55), vec3(0.45, 0.42, 0.42),
+    vec3(1.0, 0.98, 0.94), vec3(0.0, 0.22, 0.46));
+  vec3 col = mix(base, uTint, 0.28);
+
+  // Mass → colour temperature, the way it goes for real stars: the
+  // bigger ones run hotter, so they sit slightly bluer and brighter.
+  // Deliberately small — a few percent, not a repaint.
+  int which;
+  starField(p, which);
+  float mass = uStarMass[which];
+  col *= mix(vec3(1.05, 0.98, 0.91), vec3(0.93, 0.98, 1.09), mass);
+  col *= 0.92 + 0.22 * mass;
+  return col;
 }
 
 /**
@@ -320,8 +340,8 @@ vec3 shadeDirect(vec3 ro, vec3 rd, vec2 hit, out vec3 pOut, out vec3 nOut, out f
   col += uTint * spec * sh * 2.0;
   col += sky(reflect(rd, n)) * (0.06 + fresnel * 0.9) * occ;
 
-  // The swimmer carries its own light, so it never vanishes into a
-  // shadowed pocket of the cluster.
+  // The orb carries its own light, so it never vanishes into a shadowed
+  // pocket between the stars.
   if (hit.y > 2.5) col += albedo * 0.45;
 
   // Distance fog toward the sky colour keeps the horizon from ending abruptly.
@@ -488,19 +508,20 @@ const TINTS = {
 export default {
   id: 'march',
   index: '03',
-  title: 'SDF 光線行進',
-  tech: 'sphere tracing · soft shadows · SSAO · impact ripples',
-  desc: '整個 3D 場景沒有任何一個頂點。游者撞上星體時，被推開的是距離場本身。',
+  title: 'SDF 星群',
+  tech: 'sphere tracing · composite bodies · impact ripples · perch & launch',
+  desc: '整個世界沒有任何一個頂點。星體是幾顆球融成的團塊；游者撞上去會彈，也可以停在上面。點一下畫布就把牠彈射出去。',
   glyph: '◈',
   hue: 62,
 
   params: [
-    { group: '星體' },
-    { id: 'balls', type: 'slider', label: '星體數', min: 1, max: 9, step: 1, value: 6 },
-    // Low by default: the stars are targets now, and targets have to be
-    // individually identifiable. Turn it up to weld them into one mass.
-    { id: 'blend', type: 'slider', label: '融合半徑', min: 0.02, max: 0.75, step: 0.005, value: 0.06 },
-    { id: 'displace', type: 'slider', label: '表面擾動', min: 0, max: 1, step: 0.01, value: 0.06 },
+    { group: '星群' },
+    { id: 'stars', type: 'slider', label: '星體數', min: 1, max: 7, step: 1, value: 5 },
+    { id: 'lobes', type: 'slider', label: '每顆的塊數', min: 1, max: 5, step: 1, value: 4 },
+    { id: 'blend', type: 'slider', label: '塊間融合', min: 0.02, max: 0.4, step: 0.005, value: 0.16 },
+    { id: 'spread', type: 'slider', label: '星群範圍', min: 0.4, max: 2.4, step: 0.01, value: 1.45 },
+    { id: 'churn', type: 'slider', label: '團塊蠕動', min: 0, max: 2, step: 0.01, value: 0.7 },
+    { id: 'displace', type: 'slider', label: '表面擾動', min: 0, max: 1, step: 0.01, value: 0.08 },
 
     { group: '游者' },
     { id: 'agent', type: 'switch', label: '放入游者', value: true },
@@ -515,8 +536,11 @@ export default {
     { id: 'cohesion', type: 'slider', label: '黏滯（融合）', min: 0.01, max: 0.35, step: 0.005, value: 0.13 },
     { id: 'glow', type: 'slider', label: '輝光', min: 0, max: 2, step: 0.01, value: 0.7 },
 
-    { group: '碰撞' },
+    { group: '碰撞與跳躍' },
     { id: 'bounce', type: 'slider', label: '彈性', min: 0, max: 1.2, step: 0.01, value: 0.82 },
+    { id: 'perch', type: 'switch', label: '可停棲', value: true },
+    { id: 'dwell', type: 'slider', label: '停留時間', min: 0.3, max: 6, step: 0.1, value: 2.2, unit: 's' },
+    { id: 'leap', type: 'slider', label: '彈射力道', min: 0.5, max: 8, step: 0.05, value: 3.6 },
     // Capped: past about 0.06 the added term overwhelms the field's
     // Lipschitz bound and the tracer starts cutting through surfaces
     // instead of rippling them.
@@ -549,7 +573,7 @@ export default {
     { id: 'taa', type: 'slider', label: '時間累積', min: 0, max: 0.94, step: 0.01, value: 0.62 },
     { id: 'exposure', type: 'slider', label: '曝光', min: 0.2, max: 3, step: 0.01, value: 1.25 },
     { id: 'spin', type: 'switch', label: '自動繞行', value: true },
-    { id: 'hint', type: 'hint', text: '移動指標帶著游者撞向星體；拖曳畫布繞行鏡頭，滾輪縮放。' },
+    { id: 'hint', type: 'hint', text: '移動指標帶著游者跑，點一下畫布把牠彈射出去。拖曳繞行鏡頭，滾輪縮放。' },
   ],
 
   init(ctx) { return new MarchScene(ctx); },
@@ -570,8 +594,8 @@ class MarchScene {
 
     this.yaw = 0.85;
     this.pitch = 0.22;
-    this.dist = 4.6;
-    this.targetDist = 4.6;
+    this.dist = 4.9;
+    this.targetDist = 4.9;
     this.scale = 0;
     this.width = 2;
     this.height = 2;
@@ -585,28 +609,93 @@ class MarchScene {
     };
     this.lightDir = new Float32Array([0.5, 0.6, 0.4]);
 
-    /* ── bodies ── */
-    this.balls = new Float32Array(BALL_N * 4);
-    this.ballCount = 6;
+    /* ── stars ── */
+    this.lobes = new Float32Array(STAR_N * LOBE_N * 4);
+    this.starBound = new Float32Array(STAR_N * 4);
+    this.starMass = new Float32Array(STAR_N);
+    this.starCount = 5;
+    this.lobeCount = 4;
+    /**
+     * Fixed star positions on a golden-angle spiral, so no two bodies
+     * ever end up in the same place and the arrangement is identical
+     * from run to run. They drift around those anchors rather than
+     * orbiting the origin: destinations you can aim at have to stay
+     * where you aimed.
+     *
+     * The spiral is laid out over the full capacity, not over the live
+     * count, so raising the star count adds a body without rearranging
+     * the ones already there.
+     */
+    this.seeds = new Float32Array(STAR_N * 8);
+    for (let i = 0; i < STAR_N; i++) {
+      const gi = i + 0.5;
+      const inc = Math.acos(1 - 2 * gi / STAR_N);
+      const az = Math.PI * (1 + Math.sqrt(5)) * gi;
+      const s = i * 4;
+      const b = STAR_N * 4 + i * 3;
+
+      this.seeds[s + 0] = 0.16 + 0.15 * ((i * 7) % 5) / 4;   // drift rate
+      this.seeds[s + 1] = i * 2.399963;                       // phase
+      this.seeds[s + 2] = 0.52 + 0.48 * ((i * 3) % 5) / 4;    // anchor radius
+      this.seeds[s + 3] = 0.30 + 0.70 * ((i * 5) % 7) / 6;    // size
+
+      // Unit anchor direction, squashed vertically so the group reads as
+      // a field rather than as a ball of bodies.
+      this.seeds[b + 0] = Math.sin(inc) * Math.cos(az);
+      this.seeds[b + 1] = Math.cos(inc) * 0.52;
+      this.seeds[b + 2] = Math.sin(inc) * Math.sin(az);
+    }
+
+    /* ── orb ── */
     this.body = new Float32Array(BODY_N * 4);
     this.bodyCount = 1;
     this.bodyBound = new Float32Array(4);
 
     /* ── impacts ── */
     this.ripples = new Float32Array(RIPPLE_N * 4);   // xyz + normalised age
-    this._rippleBall = new Int32Array(RIPPLE_N).fill(-1);
-    this._rippleNormal = new Float32Array(RIPPLE_N * 3);
+    this._rippleStar = new Int32Array(RIPPLE_N).fill(-1);
+    this._rippleOffset = new Float32Array(RIPPLE_N * 3);
     this._rippleAge = new Float32Array(RIPPLE_N);
     this._rippleNext = 0;
-    this._cooldown = new Float32Array(BALL_N);
+    this._cooldown = new Float32Array(STAR_N);
     this.hits = 0;
+    this.leaps = 0;
     this.rippleLife = 1.9;
+
+    /* ── perch ── */
+    this.perchStar = -1;
+    this.perchOffset = new Float32Array(3);
+    this.perchTime = 0;
+
+    /* ── click vs drag ── */
+    this._pressed = false;
+    this._dragDist = 0;
+    this._pendingLaunch = false;
 
     this._onWheel = (e) => {
       e.preventDefault();
-      this.targetDist = clamp(this.targetDist * Math.exp(e.deltaY * 0.0011), 2.0, 12);
+      this.targetDist = clamp(this.targetDist * Math.exp(e.deltaY * 0.0011), 2.2, 13);
     };
     ctx.canvas.addEventListener('wheel', this._onWheel, { passive: false });
+  }
+
+  /* ── pointer events ───────────────────────────────────────────── */
+
+  /**
+   * Click versus drag: a drag orbits the camera, a click launches the
+   * orb. They are told apart by how far the pointer travelled between
+   * press and release — which is what every canvas app has to do, and
+   * which has to be decided on the *events*, not on whatever the render
+   * loop happened to observe.
+   */
+  onPointerDown() {
+    this._pressed = true;
+    this._dragDist = 0;
+  }
+
+  onPointerUp() {
+    if (this._pressed && this._dragDist < 0.015) this._pendingLaunch = true;
+    this._pressed = false;
   }
 
   resize(width, height) {
@@ -628,12 +717,14 @@ class MarchScene {
   reset() {
     this.yaw = 0.85;
     this.pitch = 0.22;
-    this.targetDist = 4.6;
+    this.targetDist = 4.9;
     this.history.clear(0, 0, 0, 1);
     this._rippleAge.fill(0);
-    this._rippleBall.fill(-1);
+    this._rippleStar.fill(-1);
     this._cooldown.fill(0);
     this.hits = 0;
+    this.leaps = 0;
+    this._unperch();
     this.ctx.agent.reset();
   }
 
@@ -687,103 +778,219 @@ class MarchScene {
 
   /**
    * Un-project the pointer onto the plane through the scene's centre
-   * that faces the camera, then divide out the scene scale to get a
-   * target in the agent's own space. Going through the camera basis
-   * rather than mapping screen x/y directly is what keeps "the orb
-   * follows my cursor" true after the camera has orbited.
+   * that faces the camera. Going through the camera basis rather than
+   * mapping screen x/y directly is what keeps "it follows my cursor"
+   * true after the camera has orbited.
    */
-  _aimAgent(pointer, agent) {
+  _pointerWorld(pointer, out) {
     const focal = 1.5;
     const aspect = this.width / Math.max(this.height, 1);
-    const ndcX = pointer.x * 2 - 1;
-    const ndcY = 1 - pointer.y * 2;
-
-    const sx = (ndcX * aspect / focal) * this.dist;
-    const sy = (ndcY / focal) * this.dist;
+    const sx = ((pointer.x * 2 - 1) * aspect / focal) * this.dist;
+    const sy = ((1 - pointer.y * 2) / focal) * this.dist;
     const { pos, right, up, fwd } = this.basis;
 
-    const wx = pos[0] + fwd[0] * this.dist + right[0] * sx + up[0] * sy;
-    const wy = pos[1] + fwd[1] * this.dist + right[1] * sx + up[1] * sy;
-    const wz = pos[2] + fwd[2] * this.dist + right[2] * sx + up[2] * sy;
-
-    agent.aim(wx / AGENT_SCALE, (wy - AGENT_LIFT) / AGENT_SCALE, wz / AGENT_SCALE);
+    out[0] = pos[0] + fwd[0] * this.dist + right[0] * sx + up[0] * sy;
+    out[1] = pos[1] + fwd[1] * this.dist + right[1] * sx + up[1] * sy;
+    out[2] = pos[2] + fwd[2] * this.dist + right[2] * sx + up[2] * sy;
+    return out;
   }
 
-  /* ── bodies ───────────────────────────────────────────────────── */
+  /* ── stars ───────────────────────────────────────────────────── */
 
   /**
-   * The orbits used to live in the shader. Moving them to the CPU costs
-   * nine uniforms and buys the ability to ask, in JavaScript, where
-   * every body is — which is what collision needs, and what anything
-   * built on top of collision will need.
+   * Build the composite bodies on the CPU.
+   *
+   * This used to live in the shader, derived from uTime. Moving it out
+   * costs a few dozen uniforms and buys the one thing the shader cannot
+   * give back: the ability to ask, in JavaScript, where everything is —
+   * which is what collision, perching, and any game built on them need.
    */
-  _updateBalls(state, time) {
-    const t = time * 0.42;
-    const n = Math.round(state.balls);
-    this.ballCount = n;
+  _updateStars(state, time) {
+    const n = Math.round(state.stars);
+    const k = Math.round(state.lobes);
+    this.starCount = n;
+    this.lobeCount = k;
 
-    for (let i = 0; i < n; i++) {
-      const a = i * 2.399963;                       // golden angle
-      const o = i * 4;
-      this.balls[o + 0] = Math.sin(t * (0.7 + i * 0.11) + a) * (0.62 + 0.1 * Math.sin(i));
-      this.balls[o + 1] = Math.cos(t * (0.5 + i * 0.09) + a * 1.7) * 0.5;
-      this.balls[o + 2] = Math.cos(t * (0.62 + i * 0.13) + a * 0.6) * (0.62 + 0.1 * Math.cos(i));
-      this.balls[o + 3] = 0.30 + 0.10 * Math.sin(t * 0.9 + i * 2.1);
+    const spread = state.spread;
+    const churn = state.churn;
+
+    for (let s = 0; s < n; s++) {
+      const rate = this.seeds[s * 4 + 0];
+      const phase = this.seeds[s * 4 + 1];
+      const anchor = this.seeds[s * 4 + 2] * spread;
+      const size = this.seeds[s * 4 + 3];
+      const a = STAR_N * 4 + s * 3;
+
+      // A fixed anchor plus a small drift, not an orbit: a body that
+      // sweeps across the whole group is impossible to aim at.
+      const t = time * rate;
+      const wobble = spread * 0.14;
+      const cx = this.seeds[a + 0] * anchor + Math.sin(t + phase) * wobble;
+      const cy = this.seeds[a + 1] * anchor + Math.cos(t * 0.83 + phase * 1.7) * wobble * 0.7 + 0.10;
+      const cz = this.seeds[a + 2] * anchor + Math.cos(t * 0.61 + phase * 0.6) * wobble;
+
+      const core = 0.13 + 0.22 * size;
+      let bound = core;
+
+      for (let l = 0; l < k; l++) {
+        const o = (s * LOBE_N + l) * 4;
+        if (l === 0) {
+          this.lobes[o + 0] = cx;
+          this.lobes[o + 1] = cy;
+          this.lobes[o + 2] = cz;
+          this.lobes[o + 3] = core;
+          continue;
+        }
+        // Lobes drift around their own body on unrelated periods, so the
+        // mass churns without any lobe ever escaping it.
+        const a = phase + l * 2.399963;
+        const w = time * churn * (0.45 + 0.17 * l) + a;
+        const arm = core * (0.62 + 0.16 * ((l * 3) % 4));
+        const lx = cx + Math.cos(w) * arm;
+        const ly = cy + Math.sin(w * 1.31 + a) * arm * 0.8;
+        const lz = cz + Math.sin(w * 0.79 + a * 1.4) * arm;
+        const lr = core * (0.50 + 0.22 * ((l * 5) % 3));
+
+        this.lobes[o + 0] = lx;
+        this.lobes[o + 1] = ly;
+        this.lobes[o + 2] = lz;
+        this.lobes[o + 3] = lr;
+
+        bound = Math.max(bound, Math.hypot(lx - cx, ly - cy, lz - cz) + lr);
+      }
+      for (let l = k; l < LOBE_N; l++) this.lobes[(s * LOBE_N + l) * 4 + 3] = 0;
+
+      const b = s * 4;
+      this.starBound[b + 0] = cx;
+      this.starBound[b + 1] = cy;
+      this.starBound[b + 2] = cz;
+      // A little slack, because the smooth minimum bulges the surface
+      // slightly outside the union of the raw spheres.
+      this.starBound[b + 3] = bound + state.blend * 0.9;
+
+      // Normalised mass drives the colour temperature. Using the seeded
+      // size rather than the live bound keeps a body's identity steady
+      // while its lobes churn.
+      this.starMass[s] = clamp((size - 0.30) / 0.70, 0, 1);
     }
-    for (let i = n; i < BALL_N; i++) this.balls[i * 4 + 3] = 0;
+    for (let s = n; s < STAR_N; s++) this.starBound[s * 4 + 3] = 0;
+  }
+
+  /* ── collision, perch, launch ─────────────────────────────────── */
+
+  _worldOrb(agent, out) {
+    out[0] = agent.head[0] * AGENT_SCALE;
+    out[1] = agent.head[1] * AGENT_SCALE + AGENT_LIFT;
+    out[2] = agent.head[2] * AGENT_SCALE;
+    return out;
+  }
+
+  _unperch() {
+    this.perchStar = -1;
+    this.perchTime = 0;
+    this.ctx.agent.frozen = false;
   }
 
   /**
-   * Orb versus bodies. Positions are resolved before the impulse so the
+   * Orb versus stars. Positions are resolved before the impulse so the
    * orb can never end a frame inside a body — otherwise it re-collides
    * on the next frame, and a single touch turns into a buzz.
+   *
+   * An arrival slow enough to settle becomes a perch instead of a
+   * bounce: the orb rides the body it landed on until it is thrown off.
    */
   _collide(state, agent, dt) {
     const R = agent.radius * AGENT_SCALE * AGENT_GIRTH;
-    const px = agent.head[0] * AGENT_SCALE;
-    const py = agent.head[1] * AGENT_SCALE + AGENT_LIFT;
-    const pz = agent.head[2] * AGENT_SCALE;
+    const p = this._worldOrb(agent, this._tmp ??= new Float32Array(3));
 
-    for (let i = 0; i < this.ballCount; i++) {
-      this._cooldown[i] = Math.max(0, this._cooldown[i] - dt);
+    for (let s = 0; s < this.starCount; s++) {
+      this._cooldown[s] = Math.max(0, this._cooldown[s] - dt);
 
-      const o = i * 4;
-      const r = this.balls[o + 3];
-      let nx = px - this.balls[o];
-      let ny = py - this.balls[o + 1];
-      let nz = pz - this.balls[o + 2];
-      const d = Math.hypot(nx, ny, nz);
-      const reach = R + r;
-      if (d >= reach || d < 1e-5) continue;
+      for (let l = 0; l < this.lobeCount; l++) {
+        const o = (s * LOBE_N + l) * 4;
+        const r = this.lobes[o + 3];
+        if (r <= 0) continue;
 
-      nx /= d; ny /= d; nz /= d;
+        let nx = p[0] - this.lobes[o];
+        let ny = p[1] - this.lobes[o + 1];
+        let nz = p[2] - this.lobes[o + 2];
+        const d = Math.hypot(nx, ny, nz);
+        const reach = R + r;
+        if (d >= reach || d < 1e-5) continue;
 
-      // Push clear of the surface, in canonical units.
-      const overlap = (reach - d) / AGENT_SCALE;
-      agent.displace(nx * overlap, ny * overlap, nz * overlap);
+        nx /= d; ny /= d; nz /= d;
 
-      const bounced = agent.reflect(nx, ny, nz, state.bounce);
-      if (bounced && this._cooldown[i] <= 0) {
-        this._cooldown[i] = 0.22;
-        this._spawnRipple(i, nx, ny, nz);
-        this.hits++;
+        // Push clear of the surface, in canonical units.
+        const overlap = (reach - d) / AGENT_SCALE;
+        agent.displace(nx * overlap, ny * overlap, nz * overlap);
+        this._worldOrb(agent, p);
+
+        const closing = -(agent.vel[0] * nx + agent.vel[1] * ny + agent.vel[2] * nz);
+
+        if (state.perch && this.perchStar < 0 && closing > 0 && closing < 0.5) {
+          this._perchOn(s, agent);
+        } else if (agent.reflect(nx, ny, nz, state.bounce) && this._cooldown[s] <= 0) {
+          this._cooldown[s] = 0.2;
+          this._spawnRipple(s, p[0], p[1], p[2]);
+          this.hits++;
+        }
       }
     }
   }
 
-  _spawnRipple(ball, nx, ny, nz) {
+  _perchOn(star, agent) {
+    const p = this._worldOrb(agent, this._tmp);
+    const b = star * 4;
+    this.perchStar = star;
+    this.perchOffset[0] = p[0] - this.starBound[b + 0];
+    this.perchOffset[1] = p[1] - this.starBound[b + 1];
+    this.perchOffset[2] = p[2] - this.starBound[b + 2];
+    this.perchTime = 0;
+    agent.vel.fill(0);
+    agent.frozen = true;
+    this.hits++;
+    this._spawnRipple(star, p[0], p[1], p[2]);
+  }
+
+  /** Ride the body. The offset is fixed; the body's centre is not. */
+  _ridePerch(agent, dt) {
+    const b = this.perchStar * 4;
+    const wx = this.starBound[b + 0] + this.perchOffset[0];
+    const wy = this.starBound[b + 1] + this.perchOffset[1];
+    const wz = this.starBound[b + 2] + this.perchOffset[2];
+    agent.head[0] = wx / AGENT_SCALE;
+    agent.head[1] = (wy - AGENT_LIFT) / AGENT_SCALE;
+    agent.head[2] = wz / AGENT_SCALE;
+    agent.frozen = true;
+    this.perchTime += dt;
+  }
+
+  /** Throw the orb toward a world point. This is the jump. */
+  _launchToward(agent, target, power) {
+    const p = this._worldOrb(agent, this._tmp ??= new Float32Array(3));
+    let dx = target[0] - p[0];
+    let dy = target[1] - p[1];
+    let dz = target[2] - p[2];
+    if (Math.hypot(dx, dy, dz) < 1e-4) { dx = 0; dy = 1; dz = 0; }
+    this._unperch();
+    agent.launch(dx, dy, dz, power);
+    this.leaps++;
+  }
+
+  _spawnRipple(star, wx, wy, wz) {
     const i = this._rippleNext;
     this._rippleNext = (this._rippleNext + 1) % RIPPLE_N;
-    this._rippleBall[i] = ball;
-    this._rippleNormal[i * 3 + 0] = nx;
-    this._rippleNormal[i * 3 + 1] = ny;
-    this._rippleNormal[i * 3 + 2] = nz;
+    const b = star * 4;
+    this._rippleStar[i] = star;
+    this._rippleOffset[i * 3 + 0] = wx - this.starBound[b + 0];
+    this._rippleOffset[i * 3 + 1] = wy - this.starBound[b + 1];
+    this._rippleOffset[i * 3 + 2] = wz - this.starBound[b + 2];
     this._rippleAge[i] = 1e-4;
   }
 
   /**
    * Ripple centres are recomputed from their host body every frame, not
-   * baked at impact: the bodies are orbiting, and a centre frozen in
+   * baked at impact: the bodies are moving, and a centre frozen in
    * world space would slide off the surface it is supposed to be on.
    */
   _updateRipples(dt) {
@@ -793,20 +1000,19 @@ class MarchScene {
       if (age <= 0) { this.ripples[i * 4 + 3] = 0; continue; }
 
       const next = age + dt / this.rippleLife;
-      if (next >= 1) {
+      const star = this._rippleStar[i];
+      if (next >= 1 || star < 0 || star >= this.starCount) {
         this._rippleAge[i] = 0;
-        this._rippleBall[i] = -1;
+        this._rippleStar[i] = -1;
         this.ripples[i * 4 + 3] = 0;
         continue;
       }
       this._rippleAge[i] = next;
 
-      const b = this._rippleBall[i];
-      const o = b * 4;
-      const r = this.balls[o + 3];
-      this.ripples[i * 4 + 0] = this.balls[o + 0] + this._rippleNormal[i * 3 + 0] * r;
-      this.ripples[i * 4 + 1] = this.balls[o + 1] + this._rippleNormal[i * 3 + 1] * r;
-      this.ripples[i * 4 + 2] = this.balls[o + 2] + this._rippleNormal[i * 3 + 2] * r;
+      const b = star * 4;
+      this.ripples[i * 4 + 0] = this.starBound[b + 0] + this._rippleOffset[i * 3 + 0];
+      this.ripples[i * 4 + 1] = this.starBound[b + 1] + this._rippleOffset[i * 3 + 1];
+      this.ripples[i * 4 + 2] = this.starBound[b + 2] + this._rippleOffset[i * 3 + 2];
       this.ripples[i * 4 + 3] = next;
       active++;
     }
@@ -832,19 +1038,46 @@ class MarchScene {
     const bodyOn = state.agent !== false;
     const dt = Math.min(clock.dt, 1 / 30);
 
-    this._updateBalls(state, clock.time);
+    this._updateStars(state, clock.time);
+
+    const aim = this._aimWorld ??= new Float32Array(3);
+    if (pointer.active) {
+      this._pointerWorld(pointer, aim);
+      agent.aim(aim[0] / AGENT_SCALE, (aim[1] - AGENT_LIFT) / AGENT_SCALE, aim[2] / AGENT_SCALE);
+    }
+
+    if (pointer.down) {
+      this._dragDist += Math.abs(pointer.dx) + Math.abs(pointer.dy);
+    }
+
+    if (bodyOn && dt > 0) {
+      if (this._pendingLaunch) {
+        this._pendingLaunch = false;
+        if (pointer.active) this._launchToward(agent, aim, state.leap);
+      }
+
+      if (this.perchStar >= 0) {
+        this._ridePerch(agent, dt);
+        // A perch is a pause, not a parking space: after its dwell it
+        // pushes off on its own so the scene never goes still.
+        if (this.perchTime > state.dwell) {
+          this._launchToward(agent, aim, state.leap * 0.55);
+        }
+      } else {
+        this._collide(state, agent, dt);
+      }
+      this.moving = 1;
+    }
 
     if (bodyOn) {
-      if (pointer.active) this._aimAgent(pointer, agent);
-      if (dt > 0) this._collide(state, agent, dt);
       this.bodyCount = agent.bodies(this.body, BODY_N, AGENT_SCALE, AGENT_LIFT, AGENT_GIRTH);
       agent.boundingSphere(this.bodyBound, AGENT_SCALE, AGENT_LIFT, AGENT_GIRTH);
       this.bodyBound[3] += agent.radius * AGENT_SCALE * AGENT_GIRTH * 0.5;
-      // A moving body invalidates the accumulated history everywhere it
-      // has been, so the temporal filter has to be told to let go.
-      this.moving = 1;
+    } else if (agent.frozen) {
+      this._unperch();
     }
-    const rippleActive = dt > 0 ? this._updateRipples(dt) : this._updateRipples(0);
+
+    const rippleActive = this._updateRipples(dt);
 
     BLEND.none(gl);
     this.rt.bind();
@@ -868,8 +1101,10 @@ class MarchScene {
       uAO: state.ao,
       uShadowSoft: state.shadow,
 
-      uBalls: this.balls,
-      uBallCount: this.ballCount,
+      uLobes: this.lobes,
+      uStarBound: this.starBound,
+      uStarMass: this.starMass,
+      uStarCount: this.starCount,
 
       uBody: this.body,
       uBodyCount: bodyOn ? this.bodyCount : 0,
@@ -930,15 +1165,16 @@ class MarchScene {
     return {
       '渲染尺寸': `${this.rt.width}×${this.rt.height}`,
       '幾何': '0 頂點 · 0 三角形',
-      '星體': String(this.ballCount),
-      '游者球體': `1 + ${Math.max(0, this.bodyCount - 1)} 滴`,
-      '撞擊次數': String(this.hits),
-      '鏡頭距離': this.dist.toFixed(2),
+      '星群': `${this.starCount} 顆 × ${this.lobeCount} 塊`,
+      '游者': `1 + ${Math.max(0, this.bodyCount - 1)} 滴`,
+      '狀態': this.perchStar >= 0 ? `停棲於 #${this.perchStar + 1}` : '飛行中',
+      '撞擊 / 彈射': `${this.hits} / ${this.leaps}`,
     };
   }
 
   dispose() {
     this.ctx.canvas.removeEventListener('wheel', this._onWheel);
+    this.ctx.agent.frozen = false;
     this.march.dispose();
     this.accum.dispose();
     this.resolve.dispose();

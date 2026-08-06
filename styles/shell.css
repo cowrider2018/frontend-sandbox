@@ -271,6 +271,7 @@ body.zen .caption { opacity: 0; pointer-events: none; }
   transition: color var(--d-fast);
 }
 .tab[aria-selected="true"] .tab__num { color: var(--accent-bright); }
+body.single-scene .tabs { display: none; }
 @media (max-width: 720px) { .tab__label { display: none; } .tab { padding: 6px 11px; } }
 
 /* ── hud ── */

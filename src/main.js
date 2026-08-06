@@ -68,6 +68,7 @@ async function boot() {
   // makes the headless harness in tools/ able to inspect real GPU state
   // instead of guessing from pixels.
   globalThis.__aether = app;
+  globalThis.__aether.__restore = () => app._restoreDefaults();
 
   document.documentElement.dataset.boot = 'ready';
 }
@@ -122,7 +123,14 @@ class App {
     this.empty = createEmptyVAO(this.gl);
     this.perf = new Perf(this.gl, this.ext.timer);
     this.clock = new Clock((c) => this.frame(c));
-    this.pointer = new Pointer(canvas);
+    // Press and release are forwarded as events rather than sampled from
+    // `pointer.down` in the render loop: a quick click on a scene running
+    // at 25 fps can begin and end between two frames, and a click that
+    // does nothing because the frame rate was low is not acceptable.
+    this.pointer = new Pointer(canvas, {
+      onDown: (p) => this.scene?.onPointerDown?.(p),
+      onUp: (p) => this.scene?.onPointerUp?.(p),
+    });
     this.toaster = new Toaster($('toasts'));
 
     // The creature belongs to the app, not to a scene. Switching scenes
@@ -173,6 +181,8 @@ class App {
 
   _buildChrome() {
     this.tabs = new Tabs($('tabs'), $('tabs-ink'), SCENES, (id) => this.router.go(id));
+    // A one-tab tab bar is a control that cannot do anything.
+    document.body.classList.toggle('single-scene', SCENES.length < 2);
 
     this.hud = new Hud({
       canvas: $('hud-graph'),
