@@ -4,17 +4,23 @@
    There is no geometry here. Not one vertex, not one triangle: the
    entire image is produced by a single fullscreen triangle whose
    fragment shader walks a ray forward through an implicit surface
-   defined by distance functions. Shadows come from marching toward the
-   light, ambient occlusion from sampling the field around a point, and
-   reflections from marching a second time along the mirror direction.
+   defined by distance functions.
 
-   Clicking dents the surface where you touched it and sends a ring
-   travelling outward across it. That needs one thing the shader cannot
-   provide: an answer, in JavaScript, to "what is under the cursor". So
-   the ray is marched a second time on the CPU, against the same
-   primitives, and the sphere positions are computed in JS and uploaded
-   rather than derived from uTime in the shader — one source of truth
-   for a scene that now has two readers.
+   Two structural decisions carry most of the performance:
+
+   1. THE FLOOR IS NOT MARCHED. It is a plane, so it is intersected in
+      closed form and compared against the cluster's hit. A grazing ray
+      used to walk the entire march budget along it for nothing.
+
+   2. THE CLUSTER HAS A BOUNDING SPHERE, computed in JS every frame from
+      the same numbers that place the spheres. Every distance the shader
+      needs — where to start marching, where to give up, how far a
+      shadow ray can matter — is derived from it. There is not one
+      hard-coded extent left in the shader, so changing the scene's size
+      does not mean re-tuning six constants.
+
+   The field itself comes in three layers, so each consumer pays only
+   for the detail it can actually show. See `clusterFull`.
    ------------------------------------------------------------------ */
 
 import { Program } from '../core/program.js';
@@ -26,6 +32,13 @@ const RIPPLE_N = 4;    // concurrent surface rings
 
 const RING_MAJOR = 1.28;
 const RING_MINOR = 0.075;
+const FLOOR_Y = -1.35;
+
+/** Peak displacement per unit of the `displace` slider. */
+const DISPLACE_AMP = 0.12;
+
+/** AO weight sum for the reference 5-tap schedule; see ambientOcclusion. */
+const AO_REFERENCE = 0.1959;
 
 const FRAG_MARCH = /* glsl */`
 ${PRECISION}
@@ -37,6 +50,9 @@ ${SIMPLEX3}
 
 #define BALL_N ${BALL_N}
 #define RIPPLE_N ${RIPPLE_N}
+#define FLOOR_Y ${FLOOR_Y.toFixed(4)}
+#define DISPLACE_AMP ${DISPLACE_AMP.toFixed(4)}
+#define AO_REFERENCE ${AO_REFERENCE.toFixed(6)}
 
 in vec2 vUv;
 out vec4 outColor;
@@ -44,18 +60,23 @@ out vec4 outColor;
 uniform vec3  uCamPos, uRight, uUp, uFwd;
 uniform vec2  uResolution;
 uniform float uFocal, uTime;
-uniform int   uSteps;
 uniform float uBlend, uDisplace, uRough, uFloorMix;
 uniform vec3  uLightDir, uTint;
 uniform float uReflect, uFog, uAO, uShadowSoft;
 
 uniform vec4  uBallPos[BALL_N];   // xyz = centre, w = radius
 uniform float uBalls;
+/** xyz = centre, w = radius. Everything the cluster can reach. */
+uniform vec4  uBound;
 
 uniform vec4  uRipples[RIPPLE_N]; // xyz = impact point, w = normalised age
 uniform float uRippleOn, uRippleAmp, uRippleSpeed, uRippleFreq, uRippleTight, uRippleGlow;
 
-/* ═══ distance functions ══════════════════════════════════════════ */
+// quality
+uniform int   uSteps, uShadowSteps, uAoTaps, uReflectSteps;
+uniform float uShadowNoise, uReflectLit;
+
+/* ═══ primitives ══════════════════════════════════════════════════ */
 
 float sdSphere(vec3 p, float r) { return length(p) - r; }
 
@@ -68,6 +89,51 @@ float sdTorus(vec3 p, vec2 t) {
 float smin(float a, float b, float k) {
   float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
   return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+/**
+ * Entry and exit distance along a ray for a sphere, or (1, -1) if it
+ * misses. The direction must be unit length, which makes the
+ * quadratic's leading coefficient 1 and the whole thing three dot
+ * products. (No back-ticks in here: the shader lives inside a JS
+ * template literal and one would end it.)
+ */
+vec2 sphereSpan(vec3 ro, vec3 rd, vec3 c, float r) {
+  vec3 oc = ro - c;
+  float b = dot(oc, rd);
+  float k = dot(oc, oc) - r * r;
+  float h = b * b - k;
+  if (h < 0.0) return vec2(1.0, -1.0);
+  h = sqrt(h);
+  return vec2(-b - h, -b + h);
+}
+
+/* ═══ the field, in three layers ══════════════════════════════════
+   Each consumer pays only for the detail it can show:
+
+     clusterBase   spheres and ring          — the shape
+     clusterShape  + impact ripples          — shadows and AO
+     clusterFull   + surface displacement    — primary rays and normals
+
+   The ripples are in the shadow layer deliberately: they displace the
+   surface several times further than the noise does, in one coherent
+   ring, and their shadow and self-occlusion are plainly visible. The
+   noise is a fifth of that, incoherent, and drifting — whether it needs
+   to be in there is a judgement call, so it is a switch.            */
+
+float clusterBase(vec3 p) {
+  float d = 1e9;
+  for (int i = 0; i < BALL_N; i++) {
+    if (float(i) >= uBalls) break;
+    d = smin(d, sdSphere(p - uBallPos[i].xyz, uBallPos[i].w), uBlend);
+  }
+
+  // A ring threading the cluster, on its own slow tumble.
+  float t = uTime * 0.42;
+  vec3 q = p;
+  q.yz = rot2(t * 0.31) * q.yz;
+  q.xz = rot2(t * 0.19) * q.xz;
+  return smin(d, sdTorus(q, vec2(${RING_MAJOR}, ${RING_MINOR})), uBlend * 0.6);
 }
 
 /**
@@ -93,94 +159,128 @@ float ripples(vec3 p) {
   return sum * uRippleAmp;
 }
 
-/* ═══ the scene ═══════════════════════════════════════════════════ */
-
-// x = distance, y = material id
-vec2 map(vec3 p) {
-  float t = uTime * 0.42;
-
-  // A cluster of orbiting spheres, welded together by smin. Each one
-  // takes a different, mutually irrational orbit so the cluster never
-  // repeats a pose. Positions arrive as uniforms so the CPU and the GPU
-  // agree on where they are, exactly.
-  float d = 1e9;
-  for (int i = 0; i < BALL_N; i++) {
-    if (float(i) >= uBalls) break;
-    d = smin(d, sdSphere(p - uBallPos[i].xyz, uBallPos[i].w), uBlend);
-  }
-
-  // A ring threading the cluster, on its own slow tumble.
-  vec3 q = p;
-  q.yz = rot2(t * 0.31) * q.yz;
-  q.xz = rot2(t * 0.19) * q.xz;
-  d = smin(d, sdTorus(q, vec2(${RING_MAJOR}, ${RING_MINOR})), uBlend * 0.6);
-
-  // Surface displacement: perturb the distance, not the geometry.
-  if (uDisplace > 0.0) {
-    d += uDisplace * 0.12 * snoise(p * 3.1 + vec3(0.0, 0.0, uTime * 0.3));
-  }
+float clusterShape(vec3 p) {
+  float d = clusterBase(p);
   if (uRippleOn > 0.5) d += ripples(p);
-
-  vec2 res = vec2(d, 1.0);
-
-  float floorD = p.y + 1.35;
-  if (floorD < res.x) res = vec2(floorD, 2.0);
-
-  return res;
+  return d;
 }
+
+/**
+ * The full field. The noise is the single most expensive thing in this
+ * shader and it was being evaluated at every march step, every shadow
+ * tap and every AO tap — including at samples nowhere near a surface,
+ * where a displacement of a couple of centimetres cannot possibly
+ * change the answer.
+ *
+ * Outside a band a few amplitudes wide, subtracting the peak amplitude
+ * is a valid lower bound on the true distance: the tracer stays
+ * conservative, never overshoots, and skips the noise entirely.
+ */
+float clusterFull(vec3 p) {
+  float d = clusterShape(p);
+  if (uDisplace <= 0.0) return d;
+
+  float amp = uDisplace * DISPLACE_AMP;
+  if (d > amp * 4.0 + 0.02) return d - amp;
+
+  return d + amp * snoise(p * 3.1 + vec3(0.0, 0.0, uTime * 0.3));
+}
+
+/** The field shadows and ambient occlusion march. */
+float clusterLit(vec3 p) {
+  return uShadowNoise > 0.5 ? clusterFull(p) : clusterShape(p);
+}
+
+/* ═══ tracing ═════════════════════════════════════════════════════ */
 
 vec3 calcNormal(vec3 p) {
   // Tetrahedral sampling: four taps instead of six, and no bias.
   const vec2 k = vec2(1.0, -1.0);
   const float h = 0.0012;
   return normalize(
-    k.xyy * map(p + k.xyy * h).x +
-    k.yyx * map(p + k.yyx * h).x +
-    k.yxy * map(p + k.yxy * h).x +
-    k.xxx * map(p + k.xxx * h).x
+    k.xyy * clusterFull(p + k.xyy * h) +
+    k.yyx * clusterFull(p + k.yyx * h) +
+    k.yxy * clusterFull(p + k.yxy * h) +
+    k.xxx * clusterFull(p + k.xxx * h)
   );
 }
 
-vec2 march(vec3 ro, vec3 rd, int steps, float maxDist) {
-  float t = 0.04;
-  float mat = 0.0;
+/**
+ * March the cluster only, and only across the span where its bounding
+ * sphere says it can exist. A ray that misses the bound returns
+ * immediately; a ray that hits starts at the entry point instead of
+ * creeping through the empty space in front of it.
+ */
+float traceCluster(vec3 ro, vec3 rd, int steps, float tMin) {
+  vec2 span = sphereSpan(ro, rd, uBound.xyz, uBound.w);
+  if (span.y <= tMin) return -1.0;
+
+  float t = max(span.x, tMin);
+  float tEnd = span.y;
+
+  // A perturbed field is not a true distance function, so the step has
+  // to be under-relaxed. An unperturbed one does not, and gets the
+  // speed back.
+  float relax = (uDisplace > 0.0 || uRippleOn > 0.5) ? 0.88 : 0.97;
+
   for (int i = 0; i < 256; i++) {
     if (i >= steps) break;
-    vec3 p = ro + rd * t;
-    vec2 h = map(p);
+    float h = clusterFull(ro + rd * t);
     // Relax the hit threshold with distance: far pixels are subpixel
     // anyway, and it buys back a lot of steps.
-    if (h.x < 0.0008 * t + 0.0006) { mat = h.y; break; }
-    // Under-relaxed: the ripple term perturbs the field, and a full step
-    // would overshoot through a rippling surface.
-    t += h.x * 0.88;
-    if (t > maxDist) { mat = 0.0; break; }
+    if (h < 0.0008 * t + 0.0006) return t;
+    t += h * relax;
+    if (t > tEnd) break;
   }
-  return vec2(t, mat);
+  return -1.0;
 }
 
-/** IQ's soft shadow: the closest approach along the ray *is* the penumbra. */
+/** Analytic floor plane. Negative when the ray never reaches it. */
+float traceFloor(vec3 ro, vec3 rd) {
+  if (rd.y >= -1e-5) return -1.0;
+  return (FLOOR_Y - ro.y) / rd.y;
+}
+
+/**
+ * IQ's soft shadow: the closest approach along the ray *is* the
+ * penumbra. Only the cluster can cast — the floor is beneath
+ * everything — so the ray stops the moment it leaves the cluster's
+ * bounding sphere, which is what makes shadows on the open floor
+ * almost free.
+ */
 float softShadow(vec3 ro, vec3 rd, float k) {
+  vec2 span = sphereSpan(ro, rd, uBound.xyz, uBound.w);
+  if (span.y <= 0.02) return 1.0;
+
   float res = 1.0;
-  float t = 0.06;
-  for (int i = 0; i < 48; i++) {
-    float h = map(ro + rd * t).x;
+  float t = max(span.x, 0.06);
+  for (int i = 0; i < 64; i++) {
+    if (i >= uShadowSteps) break;
+    float h = clusterLit(ro + rd * t);
     res = min(res, k * h / t);
     t += clamp(h, 0.02, 0.35);
-    if (res < 0.004 || t > 8.0) break;
+    if (res < 0.004 || t > span.y) break;
   }
   return clamp(res, 0.0, 1.0);
 }
 
+/**
+ * Five-tap occlusion, generalised to any tap count. The accumulated
+ * weight is normalised against the reference schedule so that changing
+ * the tap count changes the cost and not the look.
+ */
 float ambientOcclusion(vec3 p, vec3 n) {
-  float occ = 0.0, sca = 1.0;
-  for (int i = 0; i < 5; i++) {
-    float h = 0.02 + 0.14 * float(i) / 4.0;
+  float occ = 0.0, sca = 1.0, wsum = 0.0;
+  float span = 1.0 / max(float(uAoTaps) - 1.0, 1.0);
+  for (int i = 0; i < 8; i++) {
+    if (i >= uAoTaps) break;
+    float h = 0.02 + 0.14 * float(i) * span;
     // If the field is closer than h, something is nearby: that is occlusion.
-    occ += (h - map(p + n * h).x) * sca;
+    occ += (h - clusterLit(p + n * h)) * sca;
+    wsum += h * sca;
     sca *= 0.72;
   }
-  return clamp(1.0 - 2.2 * occ, 0.0, 1.0);
+  return clamp(1.0 - 2.2 * occ * AO_REFERENCE / max(wsum, 1e-4), 0.0, 1.0);
 }
 
 /* ═══ shading ═════════════════════════════════════════════════════ */
@@ -243,19 +343,27 @@ vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
  * ray therefore sees a correctly lit but non-reflective world. One
  * bounce is all the eye asks for, and it costs a fixed budget instead
  * of an unbounded one.
+ *
+ * The lit flag switches off the shadow and occlusion queries, which is
+ * what the reflection bounce does by default: it is a blurred secondary
+ * weighted at a fraction, and its own 50-odd extra field evaluations
+ * buy almost nothing.
  */
-vec3 shadeDirect(vec3 ro, vec3 rd, vec2 hit, out vec3 pOut, out vec3 nOut, out float roughOut) {
-  pOut = ro + rd * hit.x;
+vec3 shadeDirect(vec3 ro, vec3 rd, float t, float mat, bool lit,
+                 out vec3 pOut, out vec3 nOut, out float roughOut) {
+  pOut = ro + rd * max(t, 0.0);
   nOut = vec3(0.0, 1.0, 0.0);
   roughOut = 1.0;
-  if (hit.y < 0.5) return sky(rd);
+  if (mat < 0.5) return sky(rd);
 
   vec3 p = pOut;
-  vec3 n = calcNormal(p);
+  // The floor's normal is known in closed form; only the cluster needs
+  // four more field evaluations to find one.
+  vec3 n = mat > 1.5 ? vec3(0.0, 1.0, 0.0) : calcNormal(p);
   nOut = n;
 
   float rough, metal;
-  vec3 albedo = material(p, n, hit.y, rough, metal);
+  vec3 albedo = material(p, n, mat, rough, metal);
   roughOut = rough;
 
   vec3 l = uLightDir;
@@ -263,12 +371,19 @@ vec3 shadeDirect(vec3 ro, vec3 rd, vec2 hit, out vec3 pOut, out vec3 nOut, out f
   vec3 h = normalize(l + v);
 
   float ndl = max(dot(n, l), 0.0);
-  float sh = uShadowSoft > 0.0 ? softShadow(p + n * 0.004, l, mix(6.0, 26.0, uShadowSoft)) : 1.0;
-  float occ = mix(1.0, ambientOcclusion(p, n), uAO);
+
+  // A surface facing away from the light is unlit whatever the shadow
+  // ray finds, so do not fire one.
+  float sh = 1.0;
+  if (lit && uShadowSoft > 0.0 && ndl > 0.0) {
+    sh = softShadow(p + n * 0.004, l, mix(6.0, 26.0, uShadowSoft));
+  }
+  float occ = (lit && uAO > 0.0) ? mix(1.0, ambientOcclusion(p, n), uAO) : 1.0;
 
   // Blinn-Phong with a roughness-derived exponent: not physically based,
   // but stable, cheap, and it reads correctly next to the SDF shadows.
   float spec = pow(max(dot(n, h), 0.0), mix(400.0, 9.0, rough)) * mix(0.35, 1.6, metal);
+  spec *= step(0.0001, ndl);
   float fresnel = pow(1.0 - max(dot(n, v), 0.0), 5.0);
 
   vec3 col = albedo * (uTint * 2.3 * ndl * sh + vec3(0.10, 0.12, 0.16) * occ);
@@ -276,28 +391,21 @@ vec3 shadeDirect(vec3 ro, vec3 rd, vec2 hit, out vec3 pOut, out vec3 nOut, out f
   col += sky(reflect(rd, n)) * (0.06 + fresnel * 0.9) * occ;
 
   // Distance fog toward the sky colour keeps the horizon from ending abruptly.
-  float fog = 1.0 - exp(-hit.x * uFog * 0.045);
+  float fog = 1.0 - exp(-max(t, 0.0) * uFog * 0.045);
   return mix(col, sky(rd), fog);
 }
 
-vec3 shade(vec3 ro, vec3 rd, vec2 hit, int steps) {
-  vec3 p, n; float rough;
-  vec3 col = shadeDirect(ro, rd, hit, p, n, rough);
-  if (hit.y < 0.5 || uReflect <= 0.0) return col;
-
-  vec3 rd2 = reflect(rd, n);
-  vec3 ro2 = p + n * 0.02;
-  vec2 hit2 = march(ro2, rd2, steps / 2, 26.0);
-
-  vec3 p2, n2; float rough2;
-  vec3 refl = shadeDirect(ro2, rd2, hit2, p2, n2, rough2);
-
-  float fresnel = pow(1.0 - max(dot(n, -rd), 0.0), 5.0);
-  float amount = uReflect * mix(0.12, 0.72, 1.0 - rough) * (0.25 + fresnel * 0.75);
-  return mix(col, refl, clamp(amount, 0.0, 0.9));
-}
-
 /* ═══ entry ═══════════════════════════════════════════════════════ */
+
+/** Nearest of the marched cluster and the analytic floor. */
+void trace(vec3 ro, vec3 rd, int steps, out float t, out float mat) {
+  float tc = traceCluster(ro, rd, steps, 0.02);
+  float tf = traceFloor(ro, rd);
+
+  if (tc > 0.0 && (tf <= 0.0 || tc < tf)) { t = tc; mat = 1.0; return; }
+  if (tf > 0.0) { t = tf; mat = 2.0; return; }
+  t = 0.0; mat = 0.0;
+}
 
 void main() {
   vec2 ndc = vUv * 2.0 - 1.0;
@@ -309,12 +417,35 @@ void main() {
   ndc += jitter * 2.0;
 
   vec3 rd = normalize(uFwd + uRight * ndc.x * aspect / uFocal + uUp * ndc.y / uFocal);
-  vec2 hit = march(uCamPos, rd, uSteps, 34.0);
-  vec3 col = shade(uCamPos, rd, hit, uSteps);
+
+  float t, mat;
+  trace(uCamPos, rd, uSteps, t, mat);
+
+  vec3 p, n; float rough;
+  vec3 col = shadeDirect(uCamPos, rd, t, mat, true, p, n, rough);
+
+  if (mat > 0.5 && uReflect > 0.0) {
+    float fresnel = pow(1.0 - max(dot(n, -rd), 0.0), 5.0);
+    float amount = uReflect * mix(0.12, 0.72, 1.0 - rough) * (0.25 + fresnel * 0.75);
+    // Below this the bounce cannot move an 8-bit channel; skip the
+    // entire second trace.
+    if (amount > 0.02) {
+      vec3 rd2 = reflect(rd, n);
+      vec3 ro2 = p + n * 0.02;
+      // Deliberately not named mat2 — that is a built-in type name, and
+      // shadowing it is a syntax error rather than a warning.
+      float tHit, matHit;
+      trace(ro2, rd2, uReflectSteps, tHit, matHit);
+
+      vec3 p2, n2; float rough2;
+      vec3 refl = shadeDirect(ro2, rd2, tHit, matHit, uReflectLit > 0.5, p2, n2, rough2);
+      col = mix(col, refl, min(amount, 0.9));
+    }
+  }
 
   // Alpha carries scene depth, so the additive flare pass can hide
   // itself behind geometry without a depth buffer ever existing.
-  outColor = vec4(col, hit.y > 0.5 ? hit.x : 1e4);
+  outColor = vec4(col, mat > 0.5 ? t : 1e4);
 }
 `;
 
@@ -434,11 +565,41 @@ const TINTS = {
   rose:   [1.0, 0.55, 0.72],
 };
 
+const SCALES = ['0.5', '0.75', '1'];
+
+/**
+ * The master quality control. Moving it writes every one of these into
+ * its own slider — it is an action, not a binding, so the individual
+ * controls stay yours afterwards and the master simply goes stale.
+ */
+function qualityPreset(q) {
+  const lerp = (a, b) => a + (b - a) * q;
+  // The ranges are placed so that the midpoint lands on each budget's
+  // measured knee — the point past which `verify.mjs --diff` reports a
+  // maximum channel difference of zero. Above the midpoint you are
+  // buying margin for camera angles and blend settings that were not in
+  // the measurement; below it you are trading something visible.
+  return {
+    scale: SCALES[q < 0.34 ? 0 : q < 0.78 ? 1 : 2],
+    steps: Math.round(lerp(40, 160)),          // knee ≈ 70
+    shadowSteps: Math.round(lerp(8, 56)),      // knee ≈ 32
+    aoTaps: Math.round(lerp(2, 8)),            // knee ≈ 5
+    reflectSteps: Math.round(lerp(16, 96)),    // still moving at 48
+    // Both of these are visible, if only across a fraction of a percent
+    // of the frame, and both now cost about a millisecond. They come on
+    // well before the midpoint so the default matches what the scene
+    // looked like before any of this — the speed is the change, not the
+    // picture.
+    shadowNoise: q >= 0.35,
+    reflectLit: q >= 0.45,
+  };
+}
+
 export default {
   id: 'march',
   index: '03',
   title: 'SDF 光線行進',
-  tech: 'sphere tracing · soft shadows · SSAO · impact ripples',
+  tech: 'sphere tracing · analytic floor · bounded field · impact ripples',
   desc: '整個 3D 場景沒有任何一個頂點：一道 fragment shader 沿著射線走進隱式曲面。點擊星體或星環，被碰到的那一點會盪出漣漪。',
   glyph: '◈',
   hue: 62,
@@ -474,13 +635,23 @@ export default {
     { id: 'rough', type: 'slider', label: '粗糙度', min: 0.02, max: 1, step: 0.01, value: 0.22 },
 
     { group: '品質' },
-    { id: 'steps', type: 'slider', label: '行進步數', min: 32, max: 220, step: 1, value: 100 },
+    { id: 'quality', type: 'slider', label: '總體品質', min: 0, max: 1, step: 0.01, value: 0.5 },
+    { id: 'hintQ', type: 'hint',
+      text: '動「總體品質」會一次寫入下面七項；之後仍可單獨微調任何一項。' },
     { id: 'scale', type: 'select', label: '渲染縮放', value: '0.75',
       options: [
         { value: '0.5', label: '50%' },
         { value: '0.75', label: '75%' },
         { value: '1', label: '100%' },
       ] },
+    { id: 'steps', type: 'slider', label: '行進步數', min: 24, max: 220, step: 1, value: 100 },
+    { id: 'shadowSteps', type: 'slider', label: '陰影步數', min: 4, max: 64, step: 1, value: 32 },
+    { id: 'aoTaps', type: 'slider', label: '遮蔽取樣', min: 2, max: 8, step: 1, value: 5 },
+    { id: 'reflectSteps', type: 'slider', label: '反射步數', min: 6, max: 110, step: 1, value: 56 },
+    { id: 'shadowNoise', type: 'switch', label: '陰影含表面擾動', value: true },
+    { id: 'reflectLit', type: 'switch', label: '反射含陰影遮蔽', value: true },
+
+    { group: '呈現' },
     { id: 'taa', type: 'slider', label: '時間累積', min: 0, max: 0.94, step: 0.01, value: 0.78 },
     { id: 'exposure', type: 'slider', label: '曝光', min: 0.2, max: 3, step: 0.01, value: 1.25 },
     { id: 'spin', type: 'switch', label: '自動繞行', value: true },
@@ -525,6 +696,8 @@ class MarchScene {
     this.ballPos = new Float32Array(BALL_N * 4);
     this.ballCount = 6;
     this.blend = 0.32;
+    /** xyz = centre, w = radius. The one number every distance derives from. */
+    this.bound = new Float32Array([0, 0, 0, 2]);
 
     /* ── impacts ── */
     this.ripples = new Float32Array(RIPPLE_N * 4);         // world xyz + age
@@ -537,6 +710,9 @@ class MarchScene {
     this.flareAmt = new Float32Array(RIPPLE_N);
     this.flash = 0;
     this.bursts = 0;
+
+    /** The master is an action; this remembers where it last fired. */
+    this._lastQuality = null;
 
     /* ── click vs drag ── */
     this._pressed = false;
@@ -669,6 +845,11 @@ class MarchScene {
    * computed here now and uploaded, because picking needs the CPU to
    * agree with the GPU about where every sphere is — and two copies of
    * the same formula is exactly the kind of thing that silently drifts.
+   *
+   * The bounding sphere falls out of the same loop, and every distance
+   * limit in the shader is derived from it: where to start marching,
+   * where to give up, how far a shadow ray can still matter. Change the
+   * scene's scale and nothing needs re-tuning.
    */
   _updateBalls(state, time) {
     const t = time * 0.42;
@@ -677,15 +858,35 @@ class MarchScene {
     this.blend = state.blend;
     this.time = time;
 
+    // The ring is fixed in extent; the spheres are not.
+    let reach = RING_MAJOR + RING_MINOR;
+
     for (let i = 0; i < n; i++) {
       const a = i * 2.399963;                       // golden angle
       const o = i * 4;
-      this.ballPos[o + 0] = Math.sin(t * (0.7 + i * 0.11) + a) * (0.62 + 0.1 * Math.sin(i));
-      this.ballPos[o + 1] = Math.cos(t * (0.5 + i * 0.09) + a * 1.7) * 0.5;
-      this.ballPos[o + 2] = Math.cos(t * (0.62 + i * 0.13) + a * 0.6) * (0.62 + 0.1 * Math.cos(i));
-      this.ballPos[o + 3] = 0.30 + 0.10 * Math.sin(t * 0.9 + i * 2.1);
+      const x = Math.sin(t * (0.7 + i * 0.11) + a) * (0.62 + 0.1 * Math.sin(i));
+      const y = Math.cos(t * (0.5 + i * 0.09) + a * 1.7) * 0.5;
+      const z = Math.cos(t * (0.62 + i * 0.13) + a * 0.6) * (0.62 + 0.1 * Math.cos(i));
+      const r = 0.30 + 0.10 * Math.sin(t * 0.9 + i * 2.1);
+      this.ballPos[o + 0] = x;
+      this.ballPos[o + 1] = y;
+      this.ballPos[o + 2] = z;
+      this.ballPos[o + 3] = r;
+      reach = Math.max(reach, Math.hypot(x, y, z) + r);
     }
     for (let i = n; i < BALL_N; i++) this.ballPos[i * 4 + 3] = 0;
+
+    // Slack for everything that pushes the surface outward past the raw
+    // union: the smooth minimum's bulge, the displacement noise, and any
+    // ripple currently travelling.
+    this.bound[0] = 0;
+    this.bound[1] = 0;
+    this.bound[2] = 0;
+    this.bound[3] = reach
+      + state.blend
+      + state.displace * DISPLACE_AMP
+      + state.rippleAmp
+      + 0.02;
   }
 
   /* The ring tumbles; these move a point in and out of its frame.
@@ -866,10 +1067,31 @@ class MarchScene {
     return active;
   }
 
+  /* ── quality ──────────────────────────────────────────────────── */
+
+  /**
+   * The master is a one-shot action, not a binding. It fires only when
+   * its own value changes, and never on the first frame — so a URL that
+   * carries both a quality value and an individual override keeps the
+   * override instead of having it stamped over at load.
+   *
+   * `notify: false` keeps the drag from writing history sixty times a
+   * second; the master's own commit, on release, syncs the URL once —
+   * and by then the derived values are already in the panel's state, so
+   * they land in the URL with it.
+   */
+  _applyQuality(state) {
+    if (this._lastQuality === null) { this._lastQuality = state.quality; return; }
+    if (state.quality === this._lastQuality) return;
+    this._lastQuality = state.quality;
+    this.ctx.setParams(qualityPreset(state.quality));
+  }
+
   /* ── frame ────────────────────────────────────────────────────── */
 
   frame({ state, clock, pointer }) {
     const { gl, tri, empty } = this.ctx;
+    this._applyQuality(state);
     this._applyScale(Number(state.scale));
     this._updateCamera(state, clock, pointer);
 
@@ -910,7 +1132,6 @@ class MarchScene {
       uResolution: [this.rt.width, this.rt.height],
       uFocal: 1.5,
       uTime: clock.time,
-      uSteps: Math.round(state.steps),
       uBlend: state.blend,
       uDisplace: state.displace,
       uRough: state.rough,
@@ -924,6 +1145,7 @@ class MarchScene {
 
       uBallPos: this.ballPos,
       uBalls: this.ballCount,
+      uBound: this.bound,
 
       uRipples: this.ripples,
       uRippleOn: rippleActive > 0 ? 1 : 0,
@@ -932,6 +1154,13 @@ class MarchScene {
       uRippleFreq: state.rippleFreq,
       uRippleTight: 5.0,
       uRippleGlow: state.flash,
+
+      uSteps: Math.round(state.steps),
+      uShadowSteps: Math.round(state.shadowSteps),
+      uAoTaps: Math.round(state.aoTaps),
+      uReflectSteps: Math.round(state.reflectSteps),
+      uShadowNoise: state.shadowNoise ? 1 : 0,
+      uReflectLit: state.reflectLit ? 1 : 0,
     });
     tri.draw();
 
@@ -978,6 +1207,7 @@ class MarchScene {
     return {
       '渲染尺寸': `${this.rt.width}×${this.rt.height}`,
       '幾何': '0 頂點 · 0 三角形',
+      '場景半徑': this.bound[3].toFixed(2),
       '進行中的漣漪': String(this._rippleAge.reduce((n, a) => n + (a > 0 ? 1 : 0), 0)),
       '撞擊次數': String(this.bursts),
       '鏡頭距離': this.dist.toFixed(2),

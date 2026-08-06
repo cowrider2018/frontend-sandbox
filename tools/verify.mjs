@@ -17,7 +17,7 @@
 
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rm, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,6 +43,10 @@ const SHOTS_PLAN = [
   { name: '01-intro',  hash: '#/march',                                   settle: 1400, intro: false },
   { name: '02-scene',  hash: '#/march',                                   settle: 8000 },
   { name: '03-full',   hash: '#/march?scale=1&steps=160&spin=0&taa=0.9',  settle: 9000 },
+  // Deterministic reference: frozen clock, and every quality knob pinned
+  // to what the pre-optimisation build had hard-coded. Two builds
+  // rendering this must agree pixel for pixel.
+  { name: '00-ref',    hash: '#/march?scale=1&spin=0&taa=0.9', settle: 4000, freeze: 8.0 },
   // `click` fires a burst at a sphere's centre and waits, so the ring has
   // travelled far enough across the surface to be visible in a still.
   { name: '04-impact', hash: '#/march?spin=0&scale=1&rippleAmp=0.05&rippleFreq=13',
@@ -245,7 +249,53 @@ class CDP {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Shaders live inside JS template literals, so a back-tick anywhere in
+ * GLSL — including in a comment — silently ends the literal and turns
+ * the rest of the shader into JavaScript. The failure surfaces as a
+ * parse error on some unrelated identifier fifty lines later, which is
+ * a genuinely bad way to spend ten minutes. This catches it in a
+ * millisecond, before a browser is even launched.
+ */
+async function lintShaders() {
+  const files = [];
+  const walk = async (dir) => {
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) await walk(p);
+      else if (e.name.endsWith('.js')) files.push(p);
+    }
+  };
+  await walk(join(ROOT, 'src'));
+
+  const bad = [];
+  for (const file of files) {
+    const src = await readFile(file, 'utf8');
+    const lines = src.split('\n');
+    let inGlsl = false;
+    lines.forEach((line, i) => {
+      if (!inGlsl) {
+        if (/\/\* glsl \*\/`/.test(line)) inGlsl = true;
+        return;
+      }
+      // The closing line is a lone back-tick; anything else carrying one
+      // is inside the shader and will end the literal early.
+      if (/^\s*`\s*;?\s*$/.test(line)) { inGlsl = false; return; }
+      if (line.includes('`')) {
+        bad.push(`${file.slice(ROOT.length + 1)}:${i + 1}  ${line.trim()}`);
+      }
+    });
+  }
+
+  if (bad.length) {
+    console.error('✗ back-tick inside a GLSL template literal:');
+    for (const b of bad) console.error(`    ${b}`);
+    throw new Error('shader lint failed');
+  }
+}
+
 async function main() {
+  await lintShaders();
   const { server, port } = await serve();
   const base = `http://127.0.0.1:${port}/index.html`;
   console.log(`▸ serving ${ROOT}\n  ${base}`);
@@ -306,6 +356,13 @@ async function main() {
     await sleep(Number(value('settle', 3000)));
     console.dir(await cdp.eval(`(() => { ${probe} })()`), { depth: 8 });
     for (const p of problems) console.log(`  ${p.kind}: ${truncate(p.text, 600)}`);
+    cdp.close(); chrome.child.kill(); server.close();
+    await sleep(200);
+    process.exit(0);
+  }
+
+  if (flag('diff')) {
+    await pixelDiff(cdp);
     cdp.close(); chrome.child.kill(); server.close();
     await sleep(200);
     process.exit(0);
@@ -392,7 +449,22 @@ async function main() {
     if (shot.intro !== false) {
       await cdp.eval(`document.getElementById('intro-enter').click(); true`);
     }
-    await sleep(shot.settle);
+    // Freeze simulation time at a fixed value and let the temporal
+    // filter converge. Rendering keeps going while the clock is paused,
+    // so this produces a deterministic image that two builds can be
+    // compared pixel for pixel — a settle-time-only shot drifts by a few
+    // frames of animation and makes any comparison guesswork.
+    if (shot.freeze !== undefined) {
+      await cdp.eval(`(() => {
+        const c = __aether.clock;
+        c.paused = true;
+        c.time = ${shot.freeze};
+        return true;
+      })()`);
+      await sleep(1600);
+    } else {
+      await sleep(shot.settle);
+    }
 
     if (shot.click) {
       const at = await cdp.eval(BALL_ON_SCREEN);
@@ -470,6 +542,104 @@ async function main() {
   process.exit(failed.length ? 1 : 0);
 }
 
+/* ═══ pixel diff ══════════════════════════════════════════════════
+   "You will not see the difference" is an opinion until someone
+   measures it. This freezes simulation time, renders the same frame
+   with one setting flipped, and reports what actually changed.        */
+
+const DIFF_CASES = [
+  {
+    name: 'shadowNoise',
+    label: '陰影含表面擾動',
+    base: { shadowNoise: false },
+    alt: { shadowNoise: true },
+  },
+  {
+    name: 'reflectLit',
+    label: '反射含陰影遮蔽',
+    base: { reflectLit: false },
+    alt: { reflectLit: true },
+  },
+  // Where does each budget stop buying anything? Every case is measured
+  // against a reference well past the point of diminishing returns.
+  { name: 'shadow-12', label: '陰影步數 12 對 48', base: { shadowSteps: 12 }, alt: { shadowSteps: 48 } },
+  { name: 'shadow-20', label: '陰影步數 20 對 48', base: { shadowSteps: 20 }, alt: { shadowSteps: 48 } },
+  { name: 'shadow-32', label: '陰影步數 32 對 48', base: { shadowSteps: 32 }, alt: { shadowSteps: 48 } },
+  { name: 'ao-3',      label: '遮蔽取樣 3 對 8',   base: { aoTaps: 3 },       alt: { aoTaps: 8 } },
+  { name: 'ao-5',      label: '遮蔽取樣 5 對 8',   base: { aoTaps: 5 },       alt: { aoTaps: 8 } },
+  { name: 'reflect-24', label: '反射步數 24 對 90', base: { reflectSteps: 24 }, alt: { reflectSteps: 90 } },
+  { name: 'reflect-48', label: '反射步數 48 對 90', base: { reflectSteps: 48 }, alt: { reflectSteps: 90 } },
+  { name: 'steps-70',  label: '行進步數 70 對 190', base: { steps: 70 },      alt: { steps: 190 } },
+  { name: 'steps-100', label: '行進步數 100 對 190', base: { steps: 100 },    alt: { steps: 190 } },
+];
+
+/**
+ * Read the canvas back at a reduced size. Sampling the real drawing
+ * buffer rather than a PNG keeps this dependency-free and avoids
+ * decoding anything.
+ */
+const GRAB = `(() => {
+  const c = document.getElementById('stage');
+  const s = document.createElement('canvas');
+  s.width = 320; s.height = 180;
+  const x = s.getContext('2d');
+  x.drawImage(c, 0, 0, 320, 180);
+  return [...x.getImageData(0, 0, 320, 180).data];
+})()`;
+
+async function pixelDiff(cdp) {
+  const base = `http://127.0.0.1:${cdp.__port}/index.html`;
+  const url = `${base}#/march?scale=1&steps=140&spin=0&taa=0.9`;
+
+  console.log('▸ pixel diff  (frozen clock, 320×180 sample, 8-bit channels)');
+
+  await cdp.send('Page.navigate', { url });
+  await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 20000);
+  await cdp.eval(`document.getElementById('intro-enter').click(); true`);
+  await sleep(2500);
+
+  // Freeze: rendering continues, animation does not, so two settings
+  // differ by the setting alone.
+  await cdp.eval(`(() => { const c = __aether.clock; c.paused = true; c.time = 8.0; return true; })()`);
+  await sleep(1500);
+
+  const capture = async (values) => {
+    await cdp.eval(`__aether.panel.setValues(${JSON.stringify(values)}); true`);
+    await sleep(1400);   // let the temporal filter re-converge
+    return cdp.eval(GRAB);
+  };
+
+  for (const c of DIFF_CASES) {
+    const a = await capture(c.base);
+    const b = await capture(c.alt);
+
+    let maxD = 0, sum = 0, n = 0, over2 = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      const d = Math.max(
+        Math.abs(a[i] - b[i]),
+        Math.abs(a[i + 1] - b[i + 1]),
+        Math.abs(a[i + 2] - b[i + 2]));
+      maxD = Math.max(maxD, d);
+      sum += d;
+      if (d > 2) over2++;
+      n++;
+    }
+    const mean = sum / n;
+    const pct = (over2 / n) * 100;
+
+    // A max of 1–2 on an 8-bit channel is dithering noise; anything that
+    // moves more than a couple of levels across a visible share of the
+    // frame is a real difference.
+    const verdict = maxD <= 3 ? '看不出來'
+      : pct < 0.5 ? '極小區域有差'
+      : '看得出來';
+    console.log(
+      `  ${c.name.padEnd(13)} ${c.label.padEnd(16)} ` +
+      `max ${String(maxD).padStart(3)}   mean ${mean.toFixed(2).padStart(5)}   ` +
+      `>2 的像素 ${pct.toFixed(2).padStart(5)}%   → ${verdict}`);
+  }
+}
+
 /* ═══ benchmark ═══════════════════════════════════════════════════
    A fixed workload, measured the same way every time, so "is the other
    GPU faster?" has a number attached instead of an impression.        */
@@ -480,12 +650,16 @@ async function main() {
  * a stated render scale and step count. The name says what it isolates.
  */
 const BENCH_CASES = [
-  { name: 'baseline',    hash: '#/march?spin=0&taa=0&scale=0.75&steps=100' },
-  { name: 'full-res',    hash: '#/march?spin=0&taa=0&scale=1&steps=100' },
-  { name: 'no-noise',    hash: '#/march?spin=0&taa=0&scale=1&steps=100&displace=0' },
-  { name: 'no-reflect',  hash: '#/march?spin=0&taa=0&scale=1&steps=100&reflect=0' },
-  { name: 'no-shadow',   hash: '#/march?spin=0&taa=0&scale=1&steps=100&shadow=0' },
-  { name: 'bare',        hash: '#/march?spin=0&taa=0&scale=1&steps=100&displace=0&reflect=0&shadow=0&ao=0' },
+  { name: 'baseline',    hash: '#/march?spin=0&taa=0&scale=0.75' },
+  { name: 'full-res',    hash: '#/march?spin=0&taa=0&scale=1' },
+  // Both switches are on by default now, so the informative cases turn
+  // them off.
+  { name: '−shadowNoise',hash: '#/march?spin=0&taa=0&scale=1&shadowNoise=0' },
+  { name: '−reflectLit', hash: '#/march?spin=0&taa=0&scale=1&reflectLit=0' },
+  { name: 'both off',    hash: '#/march?spin=0&taa=0&scale=1&shadowNoise=0&reflectLit=0' },
+  { name: 'no-noise',    hash: '#/march?spin=0&taa=0&scale=1&displace=0' },
+  { name: 'no-reflect',  hash: '#/march?spin=0&taa=0&scale=1&reflect=0' },
+  { name: 'bare',        hash: '#/march?spin=0&taa=0&scale=1&displace=0&reflect=0&shadow=0&ao=0' },
 ];
 
 async function bench(cdp) {
@@ -539,15 +713,18 @@ async function bench(cdp) {
 
   console.log(`\n▸ renderer: ${renderer}`);
 
-  // Relative cost of each feature, taken against the full-res case that
-  // shares its settings.
+  // Compared on GPU time, not frame time. Once the shader is fast
+  // enough, frame time pins itself to the compositor's cadence and every
+  // case reads the same — which says nothing about the shader.
   const fullRes = rows.find((r) => r.name === 'full-res');
   if (fullRes) {
-    console.log('▸ cost of each term, measured at full res:');
+    console.log('▸ GPU time against the full-res case:');
     for (const r of rows) {
       if (r.name === 'full-res' || r.name === 'baseline') continue;
-      const saved = (1 - r.median / fullRes.median) * 100;
-      console.log(`    ${r.name.padEnd(11)} ${saved >= 0 ? '−' : '+'}${Math.abs(saved).toFixed(0)}% frame time`);
+      const d = r.gpuMs - fullRes.gpuMs;
+      const pct = (d / fullRes.gpuMs) * 100;
+      console.log(`    ${r.name.padEnd(13)} ${d >= 0 ? '+' : '−'}${Math.abs(d).toFixed(1)} ms` +
+        `  (${d >= 0 ? '+' : '−'}${Math.abs(pct).toFixed(0)}%)`);
     }
   }
   return rows;
@@ -707,6 +884,36 @@ async function interact(cdp, base, problems) {
   await shot(cdp, 'i2-cmdk');
   await key('Escape', { code: 'Escape', vk: 27 });
   await sleep(300);
+
+  /* the master quality control drives the seven below it, and they
+     remain individually editable afterwards */
+  const q = () => cdp.eval(`(() => {
+    const s = __aether.state;
+    return { steps: s.steps, shadowSteps: s.shadowSteps, aoTaps: s.aoTaps,
+             reflectSteps: s.reflectSteps, scale: s.scale,
+             shadowNoise: s.shadowNoise, reflectLit: s.reflectLit };
+  })()`);
+
+  const qHigh = await q();
+  await cdp.eval(`__aether.panel.setValues({ quality: 0.02 }, { notify: true }); true`);
+  await sleep(500);
+  const qLow = await q();
+  check('the master quality slider moves all seven',
+    qLow.steps < qHigh.steps && qLow.shadowSteps < qHigh.shadowSteps
+    && qLow.aoTaps < qHigh.aoTaps && qLow.reflectSteps < qHigh.reflectSteps
+    && qLow.scale !== qHigh.scale
+    && qLow.shadowNoise === false && qLow.reflectLit === false,
+    `steps ${qHigh.steps}→${qLow.steps}, shadow ${qHigh.shadowSteps}→${qLow.shadowSteps}, ` +
+    `ao ${qHigh.aoTaps}→${qLow.aoTaps}, scale ${qHigh.scale}→${qLow.scale}`);
+
+  await cdp.eval(`__aether.panel.setValues({ steps: 150 }, { notify: true }); true`);
+  await sleep(400);
+  check('an individual slider still overrides the master',
+    (await cdp.eval(`__aether.state.steps`)) === 150,
+    'the master is an action, not a binding');
+
+  await cdp.eval(`__aether.panel.setValues({ quality: 0.5 }, { notify: true }); true`);
+  await sleep(400);
 
   /* the render-scale control actually reallocates the target */
   const rt0 = await cdp.eval(`__aether.scene.rt.width`);
