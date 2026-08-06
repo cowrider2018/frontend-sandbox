@@ -32,6 +32,11 @@ uniform float uBlend, uBalls, uDisplace, uRough, uFloorMix;
 uniform vec3  uLightDir, uTint;
 uniform float uReflect, uFog, uAO, uShadowSoft;
 
+#define CRE_N 12
+uniform vec4  uCre[CRE_N];   // xyz = spine node, w = radius
+uniform vec4  uCreBound;     // xyz = centre, w = radius
+uniform float uCreOn;
+
 /* ═══ distance functions ══════════════════════════════════════════ */
 
 float sdSphere(vec3 p, float r) { return length(p) - r; }
@@ -50,6 +55,34 @@ float sdBox(vec3 p, vec3 b) {
 float smin(float a, float b, float k) {
   float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
   return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+/** Round cone: a capsule whose radius tapers from a to b. */
+float sdCone(vec3 p, vec3 a, vec3 b, float ra, float rb) {
+  vec3 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+  return length(pa - ba * h) - mix(ra, rb, h);
+}
+
+/**
+ * The swimmer, as eleven tapered capsules along its spine.
+ *
+ * map() is evaluated well over a hundred times per pixel — plus shadow
+ * and AO taps — so eleven extra distance functions is not something you
+ * add casually. The bounding sphere is what makes it affordable: for
+ * any point comfortably outside the body, the sphere's own distance is
+ * already a valid conservative step, so the ray skips the whole loop
+ * and pays for one length() instead of eleven.
+ */
+float creature(vec3 p) {
+  float bound = length(p - uCreBound.xyz) - uCreBound.w;
+  if (bound > 0.22) return bound;
+
+  float d = 1e9;
+  for (int i = 0; i < CRE_N - 1; i++) {
+    d = min(d, sdCone(p, uCre[i].xyz, uCre[i + 1].xyz, uCre[i].w, uCre[i + 1].w));
+  }
+  return d;
 }
 
 /* ═══ the scene ═══════════════════════════════════════════════════ */
@@ -90,6 +123,11 @@ vec2 map(vec3 p) {
 
   float floorD = p.y + 1.35;
   if (floorD < res.x) res = vec2(floorD, 2.0);
+
+  if (uCreOn > 0.5) {
+    float c = creature(p);
+    if (c < res.x) res = vec2(c, 3.0);
+  }
 
   return res;
 }
@@ -163,6 +201,14 @@ vec3 sky(vec3 rd) {
 }
 
 vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
+  if (mat > 2.5) {
+    // The swimmer: wet, near-mirror, and lit from inside so it stays
+    // legible against the cluster it swims through.
+    rough = 0.06;
+    metal = 1.0;
+    float along = clamp(length(p - uCre[0].xyz) * 0.55, 0.0, 1.0);
+    return mix(vec3(1.30, 1.18, 0.92), vec3(0.16, 0.42, 0.95), along);
+  }
   if (mat > 1.5) {
     // floor: a faint grid that fades out with distance
     vec2 g = abs(fract(p.xz * 0.5) - 0.5);
@@ -219,6 +265,10 @@ vec3 shadeDirect(vec3 ro, vec3 rd, vec2 hit, out vec3 pOut, out vec3 nOut, out f
   vec3 col = albedo * (uTint * 2.3 * ndl * sh + vec3(0.10, 0.12, 0.16) * occ);
   col += uTint * spec * sh * 2.0;
   col += sky(reflect(rd, n)) * (0.06 + fresnel * 0.9) * occ;
+
+  // The swimmer carries its own light, so it never vanishes into a
+  // shadowed pocket of the cluster.
+  if (hit.y > 2.5) col += albedo * 0.42;
 
   // Distance fog toward the sky colour keeps the horizon from ending abruptly.
   float fog = 1.0 - exp(-hit.x * uFog * 0.045);
@@ -306,6 +356,11 @@ const TINTS = {
   rose:   [1.0, 0.55, 0.72],
 };
 
+/** Canonical agent space → world, plus a lift so it clears the floor. */
+const AGENT_SCALE = 0.82;
+const AGENT_LIFT = 0.28;
+const CRE_NODES = 12;
+
 export default {
   id: 'march',
   index: '03',
@@ -320,6 +375,16 @@ export default {
     { id: 'balls', type: 'slider', label: '球體數', min: 1, max: 9, step: 1, value: 6 },
     { id: 'blend', type: 'slider', label: '融合半徑', min: 0.02, max: 0.75, step: 0.005, value: 0.32 },
     { id: 'displace', type: 'slider', label: '表面擾動', min: 0, max: 1, step: 0.01, value: 0.14 },
+
+    { group: '游者' },
+    { id: 'agent', type: 'switch', label: '放入游者', value: true },
+    { id: 'agentMode', type: 'select', label: '行為', value: 'follow',
+      options: [
+        { value: 'wander', label: '漫遊' },
+        { value: 'follow', label: '跟隨' },
+        { value: 'flee', label: '迴避' },
+      ] },
+    { id: 'agentSpeed', type: 'slider', label: '泳速', min: 0.2, max: 3, step: 0.01, value: 0.85 },
 
     { group: '光線' },
     { id: 'light', type: 'xy', label: '光源方向', value: [0.68, 0.24] },
@@ -380,6 +445,8 @@ class MarchScene {
       fwd: new Float32Array(3),
     };
     this.lightDir = new Float32Array([0.5, 0.6, 0.4]);
+    this.creature = new Float32Array(CRE_NODES * 4);
+    this.creBound = new Float32Array(4);
 
     this._onWheel = (e) => {
       e.preventDefault();
@@ -442,8 +509,11 @@ class MarchScene {
     fx /= fl; fy /= fl; fz /= fl;
     fwd[0] = fx; fwd[1] = fy; fwd[2] = fz;
 
-    // right = normalize(cross(fwd, worldUp))
-    let rx = fz, ry = 0, rz = -fx;
+    // right = normalize(cross(fwd, worldUp)). Note the signs: the
+    // opposite order gives cross(worldUp, fwd), which negates `right`,
+    // which flips `up` through the cross product below — and renders
+    // the whole scene upside down with the floor grid in the sky.
+    let rx = -fz, ry = 0, rz = fx;
     const rl = Math.hypot(rx, ry, rz) || 1;
     rx /= rl; rz /= rl;
     right[0] = rx; right[1] = ry; right[2] = rz;
@@ -452,6 +522,30 @@ class MarchScene {
     up[0] = ry * fz - rz * fy;
     up[1] = rz * fx - rx * fz;
     up[2] = rx * fy - ry * fx;
+  }
+
+  /**
+   * Un-project the pointer onto the plane through the scene's centre
+   * that faces the camera, then divide out the scene scale to get a
+   * target in the agent's own space. Going through the camera basis
+   * rather than mapping screen x/y directly is what keeps "the creature
+   * follows my cursor" true after the camera has orbited.
+   */
+  _aimAgent(pointer, agent) {
+    const focal = 1.5;
+    const aspect = this.width / Math.max(this.height, 1);
+    const ndcX = pointer.x * 2 - 1;
+    const ndcY = 1 - pointer.y * 2;
+
+    const sx = (ndcX * aspect / focal) * this.dist;
+    const sy = (ndcY / focal) * this.dist;
+    const { pos, right, up, fwd } = this.basis;
+
+    const wx = pos[0] + fwd[0] * this.dist + right[0] * sx + up[0] * sy;
+    const wy = pos[1] + fwd[1] * this.dist + right[1] * sx + up[1] * sy;
+    const wz = pos[2] + fwd[2] * this.dist + right[2] * sx + up[2] * sy;
+
+    agent.aim(wx / AGENT_SCALE, (wy - AGENT_LIFT) / AGENT_SCALE, wz / AGENT_SCALE);
   }
 
   frame({ state, clock, pointer }) {
@@ -467,6 +561,18 @@ class MarchScene {
     this.lightDir[2] = Math.cos(el) * Math.cos(az);
 
     const tint = TINTS[state.tint] || TINTS.amber;
+
+    const agent = this.ctx.agent;
+    const creOn = state.agent !== false;
+    if (creOn) {
+      if (pointer.active) this._aimAgent(pointer, agent);
+      agent.resample(CRE_NODES, this.creature, AGENT_SCALE, AGENT_LIFT, 2.1);
+      agent.boundingSphere(this.creBound, AGENT_SCALE, AGENT_LIFT);
+      this.creBound[3] *= 1.35;   // cover the fattened body
+      // A moving body invalidates the accumulated history everywhere it
+      // has been, so the temporal filter has to be told to let go.
+      this.moving = 1;
+    }
 
     BLEND.none(gl);
     this.rt.bind();
@@ -490,6 +596,9 @@ class MarchScene {
       uFog: 1.0,
       uAO: state.ao,
       uShadowSoft: state.shadow,
+      uCre: this.creature,
+      uCreBound: this.creBound,
+      uCreOn: creOn ? 1 : 0,
     });
     tri.draw();
 
@@ -515,8 +624,9 @@ class MarchScene {
     return {
       '渲染尺寸': `${this.rt.width}×${this.rt.height}`,
       '幾何': '0 頂點 · 0 三角形',
+      '游者膠囊': `${CRE_NODES - 1}`,
+      '游者泳速': this.ctx.agent.speed.toFixed(2),
       '鏡頭距離': this.dist.toFixed(2),
-      '鏡頭狀態': this.moving ? '移動中' : '收斂中',
     };
   }
 

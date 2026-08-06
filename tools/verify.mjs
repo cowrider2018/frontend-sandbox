@@ -512,6 +512,44 @@ async function interact(cdp, base, problems) {
   check('palette navigates', await cdp.eval(`__aether.router.current`) === 'march',
     `now at ${await cdp.eval(`__aether.router.current`)}`);
 
+  /* the swimmer follows the pointer, and survives a scene change */
+  await cdp.eval(`__aether.panel.setValues({ agentMode: 'follow' }, { notify: true }); true`);
+
+  // Alignment, not distance. The pointer un-projects to a point that can
+  // sit well outside the creature's own bounds, so "did it get closer"
+  // has a floor it can never cross — but "is it on that side" is exactly
+  // the thing a viewer judges.
+  const alignment = () => cdp.eval(`(() => {
+    const a = __aether.agent;
+    const hl = Math.hypot(a.nodes[0], a.nodes[1]) || 1;
+    const al = Math.hypot(a._aim[0], a._aim[1]) || 1;
+    return (a.nodes[0] * a._aim[0] + a.nodes[1] * a._aim[1]) / (hl * al);
+  })()`);
+
+  const corner = [250, 740];
+  await mouse('mouseMoved', corner[0], corner[1], { buttons: 0 });
+  await sleep(300);
+  const before1 = await alignment();
+  for (let i = 0; i < 16; i++) {
+    await mouse('mouseMoved', corner[0], corner[1], { buttons: 0 });
+    await sleep(130);
+  }
+  const after1 = await alignment();
+  check('swimmer turns toward the pointer', after1 > 0.55,
+    `alignment ${before1.toFixed(2)} → ${after1.toFixed(2)}`);
+  await shot(cdp, 'i6-swimmer-follow');
+
+  const before2 = await cdp.eval(`[...__aether.agent.nodes.slice(0, 3)]`);
+  await cdp.eval(`document.querySelector('.tab[data-id="flow"]').click(); true`);
+  await sleep(500);
+  const after2 = await cdp.eval(`[...__aether.agent.nodes.slice(0, 3)]`);
+  const drift = Math.hypot(after2[0] - before2[0], after2[1] - before2[1], after2[2] - before2[2]);
+  check('swimmer persists across scenes', drift < 0.6,
+    `moved ${drift.toFixed(3)} in canonical units while the scene swapped`);
+
+  await cdp.eval(`document.querySelector('.tab[data-id="march"]').click(); true`);
+  await sleep(900);
+
   /* camera orbit by dragging */
   const yaw0 = await cdp.eval(`__aether.scene.yaw`);
   const midOrbit = await drag([700, 450], [980, 380]);

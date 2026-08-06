@@ -70,9 +70,21 @@ out vec4 outColor;
 uniform vec2 uPoint;
 uniform float uRadius, uAspect, uAmount;
 uniform sampler2D uState;
-uniform int uMode;   // 0 = paint, 1 = full reseed
+uniform int uMode;   // 0 = seed, 1 = full reseed, 2 = carve
 
 void main() {
+  if (uMode == 2) {
+    // Carve: push the field back to clean substrate. Gray–Scott then
+    // regrows into the gap from its edges, so a body moving through the
+    // pattern leaves a channel that visibly heals behind it.
+    vec2 d = vUv - uPoint;
+    d.x *= uAspect;
+    float amt = exp(-dot(d, d) / uRadius) * uAmount;
+    vec2 s = texture(uState, vUv).xy;
+    outColor = vec4(mix(s.x, 1.0, amt), mix(s.y, 0.0, amt), 0.0, 1.0);
+    return;
+  }
+
   if (uMode == 1) {
     // Clean substrate plus scattered inoculation points.
     vec2 g = floor(vUv * 22.0);
@@ -168,9 +180,14 @@ const PALETTES = {
   ink:   [[0.010, 0.010, 0.013], [0.130, 0.140, 0.165], [0.560, 0.590, 0.640], [1.350, 1.370, 1.400]],
 };
 
+/** Canonical agent space → this scene's UV. */
+const AGENT_U = 0.24;
+const AGENT_V = 0.36;
+
 export default {
   id: 'reaction',
   index: '04',
+  agentFlatten: 1,
   title: 'Gray–Scott 反應擴散',
   tech: '9-point laplacian · 16 sub-steps/frame · toroidal domain',
   desc: '兩行方程式長出珊瑚、迷宮、細胞分裂與孤立子；差別只在小數點後第三位。',
@@ -218,7 +235,18 @@ export default {
 
     { group: '筆刷' },
     { id: 'brush', type: 'slider', label: '半徑', min: 0.02, max: 0.4, step: 0.005, value: 0.09 },
-    { id: 'hint', type: 'hint', text: '在畫布上拖曳即可播種；不同的 F/k 會長出完全不同的東西。' },
+
+    { group: '游者' },
+    { id: 'agent', type: 'switch', label: '放入游者', value: true },
+    { id: 'agentMode', type: 'select', label: '行為', value: 'follow',
+      options: [
+        { value: 'wander', label: '漫遊' },
+        { value: 'follow', label: '跟隨' },
+        { value: 'flee', label: '迴避' },
+      ] },
+    { id: 'agentSpeed', type: 'slider', label: '泳速', min: 0.2, max: 3, step: 0.01, value: 0.75 },
+    { id: 'seed', type: 'slider', label: '播種量', min: 0, max: 1, step: 0.01, value: 0.5 },
+    { id: 'hint', type: 'hint', text: '游者游過的地方會長出圖樣；移動指標帶著牠跑，或直接在畫布上拖曳播種。' },
   ],
 
   init(ctx) { return new ReactionScene(ctx); },
@@ -273,12 +301,12 @@ class ReactionScene {
     this.elapsedSteps = 0;
   }
 
-  _paint(x, y, radius, amount) {
+  _paint(x, y, radius, amount, mode = 0) {
     const { gl, tri } = this.ctx;
     BLEND.none(gl);
     this.state.write.bind();
     this.seedProg.use({
-      uMode: 0,
+      uMode: mode,
       uState: this.state.read.texture,
       uPoint: [x, 1 - y],
       uRadius: radius * radius * 0.04,
@@ -302,6 +330,30 @@ class ReactionScene {
     }
 
     if (pointer.down) this._paint(pointer.x, pointer.y, state.brush, 0.85);
+
+    // The swimmer inoculates as it goes. Gray–Scott turns a dot of v
+    // into a growing colony, so its path is not drawn on the field —
+    // it is where the field starts growing from.
+    if (state.agent !== false && clock.dt > 0 && state.seed > 0) {
+      const agent = this.ctx.agent;
+      if (pointer.active) {
+        agent.aim((pointer.x - 0.5) / AGENT_U, (0.5 - pointer.y) / AGENT_V, 0);
+      }
+      const at = (i) => [
+        0.5 + agent.nodes[i * 3] * AGENT_U,
+        1 - (0.5 + agent.nodes[i * 3 + 1] * AGENT_V),
+      ];
+
+      // Head carves a clean channel. Clean substrate (u=1, v=0) is a
+      // *stable* state of the model, so the channel does not heal on its
+      // own — it stays open until something reseeds it.
+      const [hx, hy] = at(0);
+      this._paint(hx, hy, state.brush * 1.9, Math.min(state.seed * 1.8, 0.98), 2);
+      // …which is what the mid-body does, dropping colonies into the
+      // channel the head just opened. The wake blooms behind the animal.
+      const [mx, my] = at(12);
+      this._paint(mx, my, state.brush * 0.34, state.seed * 0.85, 0);
+    }
 
     if (clock.dt > 0) {
       BLEND.none(gl);

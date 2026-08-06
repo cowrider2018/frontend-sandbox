@@ -216,9 +216,19 @@ void main() {
 
 /* ═══ scene ═══════════════════════════════════════════════════════ */
 
+/**
+ * Canonical agent space → this scene's UV. Asymmetric on purpose: the
+ * agent's wander volume is wider than it is tall, and the canvas is
+ * wider than it is tall by a different ratio, so one factor per axis
+ * is what makes the creature use the whole frame.
+ */
+const AGENT_U = 0.24;
+const AGENT_V = 0.36;
+
 export default {
   id: 'fluid',
   index: '02',
+  agentFlatten: 1,
   title: 'Navier–Stokes 流體',
   tech: 'semi-Lagrangian advection · Jacobi pressure projection',
   desc: '每幀 8–40 道 pass：對流、渦度強化、求解壓力泊松方程、投影成無散度場。',
@@ -243,12 +253,23 @@ export default {
     { id: 'iterations', type: 'slider', label: '壓力迭代', min: 4, max: 40, step: 1, value: 22 },
     { id: 'curl', type: 'slider', label: '渦度強化', min: 0, max: 50, step: 0.5, value: 26 },
     { id: 'velDiss', type: 'slider', label: '速度衰減', min: 0, max: 4, step: 0.01, value: 0.20 },
-    { id: 'dyeDiss', type: 'slider', label: '染料衰減', min: 0, max: 4, step: 0.01, value: 0.42 },
+    { id: 'dyeDiss', type: 'slider', label: '染料衰減', min: 0, max: 4, step: 0.01, value: 0.28 },
 
     { group: '注入' },
     { id: 'radius', type: 'slider', label: '筆刷半徑', min: 0.05, max: 1.2, step: 0.01, value: 0.32 },
     { id: 'force', type: 'slider', label: '力道', min: 500, max: 12000, step: 50, value: 5200 },
-    { id: 'auto', type: 'switch', label: '自動注入', value: true },
+    { id: 'auto', type: 'switch', label: '無人時自動攪動', value: true },
+
+    { group: '游者' },
+    { id: 'agent', type: 'switch', label: '放入游者', value: true },
+    { id: 'agentMode', type: 'select', label: '行為', value: 'follow',
+      options: [
+        { value: 'wander', label: '漫遊' },
+        { value: 'follow', label: '跟隨' },
+        { value: 'flee', label: '迴避' },
+      ] },
+    { id: 'agentSpeed', type: 'slider', label: '泳速', min: 0.2, max: 3, step: 0.01, value: 1.15 },
+    { id: 'wake', type: 'slider', label: '尾流強度', min: 0, max: 3, step: 0.01, value: 1.0 },
 
     { group: '渲染' },
     { id: 'shading', type: 'switch', label: '體積打光', value: true },
@@ -428,6 +449,36 @@ class FluidScene {
     );
   }
 
+  /**
+   * The swimmer as a stirring body. Injecting only at the head gives a
+   * thin thread; injecting along the first third of the spine as well,
+   * at falling strength, produces the broad shed wake a real body
+   * leaves — and the vorticity term then curls it into eddies.
+   */
+  _swim(state, dt) {
+    const agent = this.ctx.agent;
+    const sp = Math.max(agent.speed, 1e-3);
+    const mag = state.wake * 760 * (sp / 1.15);
+
+    // Body-space velocity → UV-space velocity, then into force units.
+    const dx = (agent.vel[0] / sp) * mag * AGENT_U * 2.6;
+    const dy = -(agent.vel[1] / sp) * mag * AGENT_V * 2.6;
+
+    const taps = [0, 3, 7, 12];
+    for (let k = 0; k < taps.length; k++) {
+      const i = taps[k] * 3;
+      const u = 0.5 + agent.nodes[i] * AGENT_U;
+      const v = 0.5 + agent.nodes[i + 1] * AGENT_V;
+      const falloff = 1 - k / taps.length;
+      this._splat(
+        u, 1 - v,
+        dx * falloff, dy * falloff,
+        this._streamColor(0.16 * falloff + 0.04, dt),
+        state.radius * (0.55 + 0.2 * falloff),
+      );
+    }
+  }
+
   /* ── frame ────────────────────────────────────────────────────── */
 
   frame({ state, clock, pointer }) {
@@ -448,9 +499,25 @@ class FluidScene {
       );
     }
 
+    // The pointer aims the swimmer; the swimmer stirs the fluid. The
+    // user never touches the fluid directly in this mode — they lead an
+    // animal around and the wake is the drawing.
+    if (state.agent !== false && dt > 0) {
+      if (pointer.active) {
+        this.ctx.agent.aim(
+          (pointer.x - 0.5) / AGENT_U,
+          (0.5 - pointer.y) / AGENT_V,
+          0,
+        );
+      }
+      this._swim(state, dt);
+    }
+
     // Idle attractors: two lissajous stirrers on mutually irrational
-    // periods, so the scene is never static and never repeats a frame.
-    if (state.auto && clock.wall - this.lastUserInput > 1.6 && dt > 0) {
+    // periods, so an unattended canvas is never static. Redundant once
+    // the swimmer is in, hence the extra guard.
+    if (state.auto && state.agent === false
+        && clock.wall - this.lastUserInput > 1.6 && dt > 0) {
       this.autoPhase += dt;
       this._stir(this.autoPhase, 0.0, state, dt);
       this._stir(this.autoPhase * 0.71 + 17.3, 2.4, state, dt);
@@ -560,6 +627,7 @@ class FluidScene {
       '速度網格': `${this.velocity.width}×${this.velocity.height}`,
       '染料網格': `${this.dye.width}×${this.dye.height}`,
       '每幀 pass': `${8 + Math.round(state.iterations)}`,
+      '游者泳速': this.ctx.agent.speed.toFixed(2),
       '累計注入': this.splatCount.toLocaleString('en-US'),
     };
   }

@@ -18,6 +18,11 @@ const PRELUDE = PRECISION + CONSTANTS + HASH;
 /* ═══ palettes ════════════════════════════════════════════════════
    IQ cosine palettes: (a, b, c, d) → a + b·cos(2π(c·t + d))        */
 
+/** Canonical agent space → this scene's world units. */
+const AGENT_SCALE = 1.18;
+const SWIM_HEAD = [1.0, 0.92, 0.78];
+const SWIM_TAIL = [0.16, 0.55, 1.0];
+
 const PALETTES = {
   ice:    [[0.5, 0.55, 0.62], [0.42, 0.38, 0.35], [1.0, 1.0, 1.0], [0.62, 0.52, 0.35]],
   ember:  [[0.52, 0.32, 0.22], [0.48, 0.34, 0.24], [1.0, 0.95, 0.9], [0.02, 0.16, 0.32]],
@@ -41,6 +46,8 @@ uniform float uNoiseScale, uSpeed, uEvolve, uInertia, uDrag;
 uniform float uContain, uSoftRadius;
 uniform vec3  uAttract;
 uniform float uAttractStrength;
+uniform vec3  uSwimmer, uSwimmerVel;
+uniform float uWake, uWakeRadius;
 
 void main() {
   vec3 pos = texture(uPos, vUv).xyz;
@@ -63,6 +70,21 @@ void main() {
   // the swarm on screen without flattening the motion inside it.
   float r = length(pos);
   vel -= pos * (max(r - uSoftRadius, 0.0) * uContain / max(r, 1e-3)) * uDt;
+
+  // The swimmer's wake. A body moving through a fluid does two things
+  // to it: shoulders the medium aside along its heading, and sheds a
+  // vortex ring around that heading. The cross product is the second
+  // one, and it is what makes the disturbance read as a wake rather
+  // than as a bulldozer.
+  if (uWake > 0.0) {
+    vec3 rel = pos - uSwimmer;
+    float g = exp(-dot(rel, rel) / (uWakeRadius * uWakeRadius));
+    float sp = length(uSwimmerVel);
+    if (sp > 1e-4) {
+      vec3 heading = uSwimmerVel / sp;
+      vel += (heading * 1.1 + cross(heading, rel) * 3.4) * g * uWake * sp * uDt;
+    }
+  }
 
   vel *= exp(-uDt * uDrag);
 
@@ -190,6 +212,68 @@ void main() {
 }
 `;
 
+/**
+ * The swimmer, drawn as a chain of overlapping glowing sprites.
+ *
+ * The spine arrives as a uniform array and the vertex shader samples
+ * *between* nodes — `SWIM_SUB` points per segment — so the body is a
+ * continuous ribbon rather than a string of beads, without uploading a
+ * single byte of geometry. It draws additively into the same buffer as
+ * the particles, which means the bloom pass gets it for free.
+ */
+const VERT_SWIMMER = /* glsl */`
+${PRECISION}
+${CONSTANTS}
+#define SWIM_MAX 40
+
+uniform vec3  uNodes[SWIM_MAX];
+uniform float uRadii[SWIM_MAX];
+uniform float uSub, uCount, uScale, uSize;
+uniform vec3  uCamPos, uRight, uUp, uFwd;
+uniform float uFocal, uAspect, uViewportH;
+
+out float vU;
+
+void main() {
+  int sub = int(uSub);
+  int i = gl_VertexID / sub;
+  float f = float(gl_VertexID % sub) / uSub;
+
+  vec3 p = mix(uNodes[i], uNodes[i + 1], f) * uScale;
+  float r = mix(uRadii[i], uRadii[i + 1], f) * uScale;
+  vU = (float(i) + f) / (uCount - 1.0);
+
+  vec3 rel = p - uCamPos;
+  vec3 view = vec3(dot(rel, uRight), dot(rel, uUp), dot(rel, uFwd));
+
+  gl_Position = vec4(view.x * uFocal / uAspect, view.y * uFocal, 0.0, view.z);
+  gl_PointSize = clamp(r * uSize * uViewportH / max(view.z, 0.05), 2.0, 260.0);
+}
+`;
+
+const FRAG_SWIMMER = /* glsl */`
+${PRECISION}
+${CONSTANTS}
+in float vU;
+out vec4 outColor;
+uniform vec3 uHead, uTail;
+uniform float uIntensity;
+
+void main() {
+  vec2 c = gl_PointCoord * 2.0 - 1.0;
+  float d2 = dot(c, c);
+  if (d2 > 1.0) discard;
+
+  float body = exp(-d2 * 2.4) * (1.0 - d2);
+  vec3 col = mix(uHead, uTail, pow(vU, 0.7));
+  // White-hot core, strongest at the head — the eye reads this as the
+  // front of the animal without any explicit anatomy.
+  col += vec3(1.0) * pow(body, 5.0) * (1.0 - vU) * 2.2;
+
+  outColor = vec4(col * body * (1.0 - vU * 0.55) * uIntensity, 1.0);
+}
+`;
+
 const FRAG_FADE = /* glsl */`
 ${PRECISION}
 in vec2 vUv;
@@ -313,10 +397,23 @@ export default {
     { id: 'bloom', type: 'slider', label: '輝光', min: 0, max: 2.5, step: 0.01, value: 0.85 },
     { id: 'exposure', type: 'slider', label: '曝光', min: 0.1, max: 4, step: 0.01, value: 1.4 },
 
+    { group: '游者' },
+    { id: 'agent', type: 'switch', label: '顯示游者', value: true },
+    { id: 'agentMode', type: 'select', label: '行為', value: 'follow',
+      options: [
+        { value: 'wander', label: '漫遊' },
+        { value: 'follow', label: '跟隨' },
+        { value: 'flee', label: '迴避' },
+      ] },
+    { id: 'agentSpeed', type: 'slider', label: '泳速', min: 0.2, max: 3, step: 0.01, value: 1.05 },
+    { id: 'wake', type: 'slider', label: '尾流強度', min: 0, max: 3, step: 0.01, value: 1.15 },
+    { id: 'swimSize', type: 'slider', label: '體型', min: 0.3, max: 3, step: 0.01, value: 1.35 },
+    { id: 'swimGlow', type: 'slider', label: '發光', min: 0, max: 2, step: 0.01, value: 0.55 },
+
     { group: '鏡頭' },
     { id: 'spin', type: 'switch', label: '自動繞行', value: true },
-    { id: 'attract', type: 'switch', label: '指標吸引', value: true },
-    { id: 'hint', type: 'hint', text: '拖曳畫布可繞行鏡頭；滾輪縮放。' },
+    { id: 'attract', type: 'switch', label: '指標吸引', value: false },
+    { id: 'hint', type: 'hint', text: '移動指標帶著游者跑；拖曳畫布繞行鏡頭；滾輪縮放。' },
   ],
 
   init(ctx) { return new FlowScene(ctx); },
@@ -331,6 +428,7 @@ class FlowScene {
     this.posProg  = new Program(gl, VERT_FULLSCREEN, FRAG_POSITION,  { name: 'flow/position' });
     this.drawProg = new Program(gl, VERT_POINTS,     FRAG_POINTS,    { name: 'flow/points' });
     this.fadeProg = new Program(gl, VERT_FULLSCREEN, FRAG_FADE,      { name: 'flow/fade' });
+    this.swimProg = new Program(gl, VERT_SWIMMER,    FRAG_SWIMMER,   { name: 'flow/swimmer' });
     this.preProg  = new Program(gl, VERT_FULLSCREEN, FRAG_PREFILTER, { name: 'flow/prefilter' });
     this.blurProg = new Program(gl, VERT_FULLSCREEN, FRAG_BLUR,      { name: 'flow/blur' });
     this.compProg = new Program(gl, VERT_FULLSCREEN, FRAG_COMPOSITE, { name: 'flow/composite' });
@@ -352,6 +450,8 @@ class FlowScene {
     this.targetDist = 6.2;
     this.dragging = false;
     this.attractor = new Float32Array([0, 0, 0]);
+    this.swimPos = new Float32Array(3);
+    this.swimVel = new Float32Array(3);
     this.basis = {
       pos: new Float32Array(3),
       right: new Float32Array(3),
@@ -495,6 +595,23 @@ class FlowScene {
     this._updateCamera(state, clock, pointer);
     const attractStrength = this._updateAttractor(state, pointer);
 
+    // The attractor is already the pointer un-projected onto the plane
+    // through the origin, so dividing by the scene scale hands the agent
+    // a target in its own canonical space — correct under any camera
+    // orbit, which a naive screen-space mapping would not be.
+    const agent = this.ctx.agent;
+    if (pointer.active) {
+      agent.aim(
+        this.attractor[0] / AGENT_SCALE,
+        this.attractor[1] / AGENT_SCALE,
+        this.attractor[2] / AGENT_SCALE,
+      );
+    }
+    for (let i = 0; i < 3; i++) {
+      this.swimPos[i] = agent.nodes[i] * AGENT_SCALE;
+      this.swimVel[i] = agent.vel[i] * AGENT_SCALE;
+    }
+
     const dt = Math.min(clock.dt, 1 / 30);
 
     /* 1 ── velocity integration */
@@ -515,6 +632,10 @@ class FlowScene {
         uSoftRadius: 2.4,
         uAttract: this.attractor,
         uAttractStrength: attractStrength,
+        uSwimmer: this.swimPos,
+        uSwimmerVel: this.swimVel,
+        uWake: state.agent === false ? 0 : state.wake,
+        uWakeRadius: 0.85,
       });
       tri.draw();
       this.vel.swap();
@@ -541,7 +662,7 @@ class FlowScene {
     this.fadeProg.use({ uSrc: this.accum.read.texture, uDecay: decay });
     tri.draw();
 
-    /* 4 ── additive splat of every particle */
+    /* 4 ── additive splat of every particle, then the swimmer */
     BLEND.additive(gl);
     const pal = PALETTES[state.palette] || PALETTES.ice;
     this.drawProg.use({
@@ -563,6 +684,36 @@ class FlowScene {
       uSpeedScale: 0.62 / Math.max(state.speed, 0.05),
     });
     empty.drawPoints(this.count);
+
+    if (state.agent !== false) {
+      const agent = this.ctx.agent;
+      const sub = 9;
+      this.swimProg.use({
+        uNodes: agent.nodes,
+        uRadii: agent.radii,
+        uSub: sub,
+        uCount: agent.count,
+        uScale: AGENT_SCALE,
+        uSize: state.swimSize,
+        uCamPos: this.basis.pos,
+        uRight: this.basis.right,
+        uUp: this.basis.up,
+        uFwd: this.basis.fwd,
+        uFocal: 1 / Math.tan(0.5 * 0.95),
+        uAspect: this.width / Math.max(this.height, 1),
+        uViewportH: this.height,
+        uHead: SWIM_HEAD,
+        uTail: SWIM_TAIL,
+        // Each pixel of the body is covered by ~`sub` overlapping
+        // sprites, so the per-sprite value has to be divided by that or
+        // the body clips to flat white. The trail buffer does *not* add
+        // another factor of 1/(1-decay): the body is moving, so any one
+        // pixel is only under it for a couple of frames.
+        uIntensity: state.swimGlow * 0.30 / sub,
+      });
+      empty.drawPoints((agent.count - 1) * sub);
+    }
+
     this.accum.swap();
 
     /* 5 ── bloom: prefilter → blur H → blur V */
@@ -595,7 +746,8 @@ class FlowScene {
     return {
       '粒子': this.count.toLocaleString('en-US'),
       '狀態貼圖': `${this.side}² RGBA32F`,
-      '每幀 pass': '5',
+      '每幀 pass': '8',
+      '游者泳速': this.ctx.agent.speed.toFixed(2),
       '鏡頭距離': this.dist.toFixed(2),
     };
   }
@@ -607,7 +759,7 @@ class FlowScene {
     this.accum.dispose();
     this.bloomA.dispose();
     this.bloomB.dispose();
-    for (const p of [this.velProg, this.posProg, this.drawProg,
+    for (const p of [this.velProg, this.posProg, this.drawProg, this.swimProg,
                      this.fadeProg, this.preProg, this.blurProg, this.compProg]) p.dispose();
   }
 }
