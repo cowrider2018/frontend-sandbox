@@ -43,10 +43,31 @@ const SHOTS_PLAN = [
   { name: '01-intro',  hash: '#/march',                                   settle: 1400, intro: false },
   { name: '02-scene',  hash: '#/march',                                   settle: 8000 },
   { name: '03-full',   hash: '#/march?scale=1&steps=160&spin=0&taa=0.9',  settle: 9000 },
-  { name: '04-tight',  hash: '#/march?balls=9&blend=0.55&displace=0.5',   settle: 8000 },
-  { name: '05-jade',   hash: '#/march?tint=jade&rough=0.06&reflect=0.9',  settle: 8000 },
+  // `click` fires a burst at a sphere's centre and waits, so the ring has
+  // travelled far enough across the surface to be visible in a still.
+  { name: '04-burst',  hash: '#/march?spin=0&scale=1&power=2.6&burst=16&rippleAmp=0.05&rippleFreq=13',
+    settle: 5000, click: true, after: 260 },
+  { name: '05-ripple', hash: '#/march?spin=0&scale=1&rippleAmp=0.052&rippleFreq=11&rippleSpeed=0.7&burst=4&power=0.6',
+    settle: 5000, click: true, after: 480 },
   { name: '06-lit',    hash: '#/march?light=0.18,0.62&tint=rose&ao=1&shadow=1', settle: 8000 },
 ];
+
+/**
+ * CSS-pixel position of a sphere's centre. Aiming a synthetic click by
+ * eye at "the middle of the screen" lands on empty sky often enough to
+ * make a test lie about the feature it is checking.
+ */
+const BALL_ON_SCREEN = `(() => {
+  const s = __aether.scene, b = s.basis, focal = 1.5;
+  const rel = [s.ballPos[0] - b.pos[0], s.ballPos[1] - b.pos[1], s.ballPos[2] - b.pos[2]];
+  const dot = (v) => rel[0] * v[0] + rel[1] * v[1] + rel[2] * v[2];
+  const vx = dot(b.right), vy = dot(b.up), vz = dot(b.fwd);
+  const aspect = s.width / s.height;
+  return [
+    ((vx * focal / aspect / vz) * 0.5 + 0.5) * innerWidth,
+    (0.5 - (vy * focal / vz) * 0.5) * innerHeight,
+  ];
+})()`;
 
 /* ═══ static server ═══════════════════════════════════════════════ */
 
@@ -357,6 +378,19 @@ async function main() {
     }
     await sleep(shot.settle);
 
+    if (shot.click) {
+      const at = await cdp.eval(BALL_ON_SCREEN);
+      const ev = (type, buttons) => cdp.send('Input.dispatchMouseEvent', {
+        type, x: at[0], y: at[1], button: 'left', clickCount: 1, buttons,
+      });
+      await ev('mouseMoved', 0);
+      await sleep(80);
+      await ev('mousePressed', 1);
+      await sleep(60);
+      await ev('mouseReleased', 0);
+      await sleep(shot.after ?? 600);
+    }
+
     const diag = await cdp.eval(`(() => {
       const c = document.getElementById('stage');
       const gl = c.getContext('webgl2');
@@ -484,6 +518,44 @@ async function interact(cdp, base, problems) {
   await cdp.eval(`document.getElementById('intro-enter').click(); true`);
   await sleep(600);
   check('intro dismisses', await cdp.eval(`document.body.classList.contains('intro-done')`));
+
+  /* clicking the surface bursts it */
+  await cdp.eval(`__aether.panel.setValues({ spin: false }, { notify: true }); true`);
+  await sleep(500);
+  const bursts0 = await cdp.eval(`__aether.scene.bursts`);
+
+  const target = await cdp.eval(BALL_ON_SCREEN);
+  await mouse('mouseMoved', target[0], target[1], { buttons: 0 });
+  await sleep(120);
+  await mouse('mousePressed', target[0], target[1], { buttons: 1 });
+  await sleep(80);
+  await mouse('mouseReleased', target[0], target[1], { buttons: 0 });
+  await sleep(250);
+
+  const burst = await cdp.eval(`({
+    bursts: __aether.scene.bursts,
+    splash: __aether.scene.splashLive,
+    ripples: [...__aether.scene.ripples].filter((_, i) => i % 4 === 3).filter((v) => v > 0).length,
+    flash: +__aether.scene.flash.toFixed(2),
+  })`);
+  check('a click bursts the surface', burst.bursts > bursts0,
+    `${bursts0} → ${burst.bursts} bursts, flash ${burst.flash}`);
+  check('the burst throws a spray', burst.splash > 0 && burst.splash <= 16,
+    `${burst.splash} droplets in flight`);
+  check('the burst leaves a ripple', burst.ripples > 0, `${burst.ripples} active`);
+  await shot(cdp, 'i0-burst');
+
+  /* a click on empty sky must not burst anything */
+  const bursts1 = await cdp.eval(`__aether.scene.bursts`);
+  await mouse('mouseMoved', 180, 140, { buttons: 0 });
+  await sleep(120);
+  await mouse('mousePressed', 180, 140, { buttons: 1 });
+  await sleep(80);
+  await mouse('mouseReleased', 180, 140, { buttons: 0 });
+  await sleep(250);
+  check('a click that misses does nothing',
+    (await cdp.eval(`__aether.scene.bursts`)) === bursts1,
+    'the CPU pick agrees with what is on screen');
 
   /* the canvas is actually receiving pointer input, and a drag orbits */
   const yaw0 = await cdp.eval(`__aether.scene.yaw`);

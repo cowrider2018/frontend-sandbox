@@ -7,11 +7,26 @@
    defined by distance functions. Shadows come from marching toward the
    light, ambient occlusion from sampling the field around a point, and
    reflections from marching a second time along the mirror direction.
+
+   Clicking bursts the surface where you touched it. That needs one
+   thing the shader cannot provide: an answer, in JavaScript, to "what
+   is under the cursor". So the ray is marched a second time on the CPU,
+   against the same primitives, and the sphere positions are computed in
+   JS and uploaded rather than derived from uTime in the shader — one
+   source of truth for a scene that now has two readers.
    ------------------------------------------------------------------ */
 
 import { Program } from '../core/program.js';
 import { Target, DoubleTarget, bindScreen, BLEND } from '../core/gl.js';
 import { PRECISION, CONSTANTS, HASH, COLOR, ROTATE, SIMPLEX3, VERT_FULLSCREEN } from '../shaders/common.js';
+
+const BALL_N = 9;                       // spheres in the cluster
+const RIPPLE_N = 4;                     // concurrent surface rings
+const SPLASH_N = 16;                    // droplets in flight, pooled
+const GLOW_N = RIPPLE_N + SPLASH_N;     // additive highlights
+
+const RING_MAJOR = 1.28;
+const RING_MINOR = 0.075;
 
 const FRAG_MARCH = /* glsl */`
 ${PRECISION}
@@ -21,6 +36,10 @@ ${COLOR}
 ${ROTATE}
 ${SIMPLEX3}
 
+#define BALL_N ${BALL_N}
+#define RIPPLE_N ${RIPPLE_N}
+#define SPLASH_N ${SPLASH_N}
+
 in vec2 vUv;
 out vec4 outColor;
 
@@ -28,9 +47,19 @@ uniform vec3  uCamPos, uRight, uUp, uFwd;
 uniform vec2  uResolution;
 uniform float uFocal, uTime;
 uniform int   uSteps;
-uniform float uBlend, uBalls, uDisplace, uRough, uFloorMix;
+uniform float uBlend, uDisplace, uRough, uFloorMix;
 uniform vec3  uLightDir, uTint;
 uniform float uReflect, uFog, uAO, uShadowSoft;
+
+uniform vec4  uBallPos[BALL_N];   // xyz = centre, w = radius
+uniform float uBalls;
+
+uniform vec4  uRipples[RIPPLE_N]; // xyz = impact point, w = normalised age
+uniform float uRippleOn, uRippleAmp, uRippleSpeed, uRippleFreq, uRippleTight, uRippleGlow;
+
+uniform vec4  uSplash[SPLASH_N];  // xyz = centre, w = radius (0 = unused)
+uniform vec4  uSplashBound;
+uniform float uSplashOn, uSplashCount, uFlash;
 
 /* ═══ distance functions ══════════════════════════════════════════ */
 
@@ -41,15 +70,54 @@ float sdTorus(vec3 p, vec2 t) {
   return length(q) - t.y;
 }
 
-float sdBox(vec3 p, vec3 b) {
-  vec3 q = abs(p) - b;
-  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-}
-
 /** Polynomial smooth minimum — the operator that makes SDFs feel alive. */
 float smin(float a, float b, float k) {
   float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
   return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+/**
+ * Expanding rings from each recorded impact.
+ *
+ * Displacing a distance field is not the same as displacing a mesh:
+ * there is no surface to move, so the ripple is authored as a term
+ * added to the distance itself. Keep the amplitude small — a large one
+ * breaks the field's Lipschitz bound and the sphere tracer starts
+ * overshooting straight through the surface.
+ */
+float ripples(vec3 p) {
+  float sum = 0.0;
+  for (int i = 0; i < RIPPLE_N; i++) {
+    float age = uRipples[i].w;
+    if (age <= 0.0) continue;
+    float d = length(p - uRipples[i].xyz);
+    float front = age * uRippleSpeed;
+    // Tight in space around the travelling front, fading in time.
+    float env = exp(-abs(d - front) * uRippleTight) * (1.0 - age) * (1.0 - age);
+    sum += sin((d - front) * uRippleFreq) * env;
+  }
+  return sum * uRippleAmp;
+}
+
+/**
+ * Droplets thrown off by a burst. Sixteen extra spheres evaluated at
+ * every march step would be unaffordable, so the whole spray carries one
+ * bounding sphere: outside it, the bound's own distance is already a
+ * valid conservative step and the loop is skipped — which is almost
+ * every sample, because almost every sample is somewhere else.
+ */
+float splash(vec3 p) {
+  float bound = length(p - uSplashBound.xyz) - uSplashBound.w;
+  if (bound > 0.18) return bound;
+
+  float d = 1e9;
+  for (int i = 0; i < SPLASH_N; i++) {
+    if (float(i) >= uSplashCount) break;
+    float r = uSplash[i].w;
+    if (r <= 0.0) continue;
+    d = min(d, sdSphere(p - uSplash[i].xyz, r));
+  }
+  return d;
 }
 
 /* ═══ the scene ═══════════════════════════════════════════════════ */
@@ -60,36 +128,35 @@ vec2 map(vec3 p) {
 
   // A cluster of orbiting spheres, welded together by smin. Each one
   // takes a different, mutually irrational orbit so the cluster never
-  // repeats a pose.
+  // repeats a pose. Positions arrive as uniforms so the CPU and the GPU
+  // agree on where they are, exactly.
   float d = 1e9;
-  for (int i = 0; i < 9; i++) {
+  for (int i = 0; i < BALL_N; i++) {
     if (float(i) >= uBalls) break;
-    float fi = float(i);
-    float a = fi * 2.399963;                    // golden angle
-    vec3 c = vec3(
-      sin(t * (0.7 + fi * 0.11) + a) * (0.62 + 0.1 * sin(fi)),
-      cos(t * (0.5 + fi * 0.09) + a * 1.7) * 0.5,
-      cos(t * (0.62 + fi * 0.13) + a * 0.6) * (0.62 + 0.1 * cos(fi))
-    );
-    float r = 0.30 + 0.10 * sin(t * 0.9 + fi * 2.1);
-    d = smin(d, sdSphere(p - c, r), uBlend);
+    d = smin(d, sdSphere(p - uBallPos[i].xyz, uBallPos[i].w), uBlend);
   }
 
   // A ring threading the cluster, on its own slow tumble.
   vec3 q = p;
   q.yz = rot2(t * 0.31) * q.yz;
   q.xz = rot2(t * 0.19) * q.xz;
-  d = smin(d, sdTorus(q, vec2(1.28, 0.075)), uBlend * 0.6);
+  d = smin(d, sdTorus(q, vec2(${RING_MAJOR}, ${RING_MINOR})), uBlend * 0.6);
 
   // Surface displacement: perturb the distance, not the geometry.
   if (uDisplace > 0.0) {
     d += uDisplace * 0.12 * snoise(p * 3.1 + vec3(0.0, 0.0, uTime * 0.3));
   }
+  if (uRippleOn > 0.5) d += ripples(p);
 
   vec2 res = vec2(d, 1.0);
 
   float floorD = p.y + 1.35;
   if (floorD < res.x) res = vec2(floorD, 2.0);
+
+  if (uSplashOn > 0.5) {
+    float s = splash(p);
+    if (s < res.x) res = vec2(s, 3.0);
+  }
 
   return res;
 }
@@ -116,7 +183,9 @@ vec2 march(vec3 ro, vec3 rd, int steps, float maxDist) {
     // Relax the hit threshold with distance: far pixels are subpixel
     // anyway, and it buys back a lot of steps.
     if (h.x < 0.0008 * t + 0.0006) { mat = h.y; break; }
-    t += h.x * 0.92;
+    // Under-relaxed: the ripple term perturbs the field, and a full step
+    // would overshoot through a rippling surface.
+    t += h.x * 0.88;
     if (t > maxDist) { mat = 0.0; break; }
   }
   return vec2(t, mat);
@@ -163,6 +232,12 @@ vec3 sky(vec3 rd) {
 }
 
 vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
+  if (mat > 2.5) {
+    // A droplet: wet, near-mirror, and still glowing from the burst.
+    rough = 0.05;
+    metal = 1.0;
+    return mix(uTint * 1.1, vec3(1.15, 1.22, 1.4), 0.55) * (0.7 + uFlash * 2.4);
+  }
   if (mat > 1.5) {
     // floor: a faint grid that fades out with distance
     vec2 g = abs(fract(p.xz * 0.5) - 0.5);
@@ -179,7 +254,24 @@ vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
   vec3 base = cosPalette(f * 0.8 + 0.1,
     vec3(0.5, 0.5, 0.55), vec3(0.45, 0.42, 0.42),
     vec3(1.0, 0.98, 0.94), vec3(0.0, 0.22, 0.46));
-  return mix(base, uTint, 0.28);
+  vec3 col = mix(base, uTint, 0.28);
+
+  // A hot ring riding the wavefront. The geometric displacement alone is
+  // a couple of centimetres on a smooth cream surface — technically
+  // correct and almost invisible. This is emission, not geometry, so it
+  // costs nothing in field stability and reads instantly.
+  if (uRippleOn > 0.5 && uRippleGlow > 0.0) {
+    float ring = 0.0;
+    for (int i = 0; i < RIPPLE_N; i++) {
+      float age = uRipples[i].w;
+      if (age <= 0.0) continue;
+      float d = length(p - uRipples[i].xyz);
+      float front = age * uRippleSpeed;
+      ring += exp(-abs(d - front) * uRippleTight * 2.4) * (1.0 - age) * (1.0 - age);
+    }
+    col += vec3(1.0, 0.86, 0.62) * ring * uRippleGlow * 1.6;
+  }
+  return col;
 }
 
 /**
@@ -220,6 +312,10 @@ vec3 shadeDirect(vec3 ro, vec3 rd, vec2 hit, out vec3 pOut, out vec3 nOut, out f
   col += uTint * spec * sh * 2.0;
   col += sky(reflect(rd, n)) * (0.06 + fresnel * 0.9) * occ;
 
+  // Droplets carry their own light, so a spray never disappears into the
+  // shadow of the thing it was knocked off.
+  if (hit.y > 2.5) col += albedo * 0.5;
+
   // Distance fog toward the sky colour keeps the horizon from ending abruptly.
   float fog = 1.0 - exp(-hit.x * uFog * 0.045);
   return mix(col, sky(rd), fog);
@@ -245,12 +341,11 @@ vec3 shade(vec3 ro, vec3 rd, vec2 hit, int steps) {
 /* ═══ entry ═══════════════════════════════════════════════════════ */
 
 void main() {
-  vec2 uv = vUv;
-  vec2 ndc = uv * 2.0 - 1.0;
+  vec2 ndc = vUv * 2.0 - 1.0;
   float aspect = uResolution.x / uResolution.y;
 
   // Jittered per-pixel per-frame: with the temporal blend in the
-  // composite pass this becomes free anti-aliasing over ~4 frames.
+  // accumulation pass this becomes free anti-aliasing over ~4 frames.
   vec2 jitter = (hash22(gl_FragCoord.xy + uTime * 60.0) - 0.5) / uResolution;
   ndc += jitter * 2.0;
 
@@ -258,7 +353,9 @@ void main() {
   vec2 hit = march(uCamPos, rd, uSteps, 34.0);
   vec3 col = shade(uCamPos, rd, hit, uSteps);
 
-  outColor = vec4(col, 1.0);
+  // Alpha carries scene depth, so the additive glow pass can hide itself
+  // behind geometry without a depth buffer ever existing.
+  outColor = vec4(col, hit.y > 0.5 ? hit.x : 1e4);
 }
 `;
 
@@ -297,6 +394,82 @@ void main() {
 }
 `;
 
+/**
+ * The burst's light: a flare at each impact point and a halo around each
+ * droplet, added over the resolved image. The droplets themselves are
+ * already in the SDF — this is only the light they give off, which one
+ * reflection bounce cannot express.
+ *
+ * It samples the marched depth out of the render target's alpha and
+ * discards anything behind the surface, so the glow is occluded by the
+ * scene without a depth buffer.
+ */
+const VERT_GLOW = /* glsl */`
+${PRECISION}
+${CONSTANTS}
+#define GLOW_N ${GLOW_N}
+
+uniform vec4  uGlow[GLOW_N];      // xyz = centre, w = screen radius
+uniform float uGlowAmt[GLOW_N];   // 0 = unused
+uniform vec3  uCamPos, uRight, uUp, uFwd;
+uniform float uFocal, uAspect, uViewportH;
+
+out float vAmt;
+out float vFront;
+
+void main() {
+  int i = gl_VertexID;
+  float amt = uGlowAmt[i];
+  if (amt <= 0.0) {
+    // Degenerate slot: park it outside the clip volume.
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    gl_PointSize = 1.0;
+    vAmt = 0.0;
+    vFront = 0.0;
+    return;
+  }
+
+  vec4 g = uGlow[i];
+  vec3 rel = g.xyz - uCamPos;
+  vec3 view = vec3(dot(rel, uRight), dot(rel, uUp), dot(rel, uFwd));
+
+  vAmt = amt;
+  // Compare the *front* of the sphere against the scene, not its centre,
+  // or a droplet hides behind its own surface.
+  vFront = view.z - g.w;
+
+  gl_Position = vec4(view.x * uFocal / uAspect, view.y * uFocal, 0.0, view.z);
+  gl_PointSize = clamp(g.w * uViewportH * 3.0 / max(view.z, 0.05), 2.0, 500.0);
+}
+`;
+
+const FRAG_GLOW = /* glsl */`
+${PRECISION}
+${CONSTANTS}
+in float vAmt;
+in float vFront;
+out vec4 outColor;
+
+uniform sampler2D uScene;
+uniform vec2 uResolution;
+uniform vec3 uColor;
+uniform float uIntensity;
+
+void main() {
+  if (vAmt <= 0.0) discard;
+
+  float sceneDepth = texture(uScene, gl_FragCoord.xy / uResolution).a;
+  if (vFront > sceneDepth + 0.05) discard;
+
+  vec2 c = gl_PointCoord * 2.0 - 1.0;
+  float d2 = dot(c, c);
+  if (d2 > 1.0) discard;
+
+  float halo = exp(-d2 * 3.0) * (1.0 - d2);
+  outColor = vec4(uColor * halo * vAmt * uIntensity, 1.0);
+}
+`;
+
 /* ═══ scene ═══════════════════════════════════════════════════════ */
 
 const TINTS = {
@@ -310,8 +483,8 @@ export default {
   id: 'march',
   index: '03',
   title: 'SDF 光線行進',
-  tech: 'sphere tracing · soft shadows · SSAO · temporal AA',
-  desc: '整個 3D 場景沒有任何一個頂點：一道 fragment shader 沿著射線走進隱式曲面。',
+  tech: 'sphere tracing · soft shadows · SSAO · impact bursts',
+  desc: '整個 3D 場景沒有任何一個頂點：一道 fragment shader 沿著射線走進隱式曲面。點擊星體或星環，被碰到的那一點會爆開。',
   glyph: '◈',
   hue: 62,
 
@@ -320,6 +493,19 @@ export default {
     { id: 'balls', type: 'slider', label: '球體數', min: 1, max: 9, step: 1, value: 6 },
     { id: 'blend', type: 'slider', label: '融合半徑', min: 0.02, max: 0.75, step: 0.005, value: 0.32 },
     { id: 'displace', type: 'slider', label: '表面擾動', min: 0, max: 1, step: 0.01, value: 0.14 },
+
+    { group: '爆炸' },
+    { id: 'burst', type: 'slider', label: '水花數', min: 2, max: 16, step: 1, value: 12 },
+    { id: 'power', type: 'slider', label: '噴發力道', min: 0.2, max: 4, step: 0.01, value: 1.5 },
+    { id: 'dropLife', type: 'slider', label: '水花壽命', min: 0.3, max: 4, step: 0.05, value: 1.5, unit: 's' },
+    { id: 'gravity', type: 'slider', label: '重力', min: 0, max: 6, step: 0.05, value: 1.9 },
+    // Capped: past about 0.06 the added term overwhelms the field's
+    // Lipschitz bound and the tracer cuts through surfaces instead of
+    // rippling them.
+    { id: 'rippleAmp', type: 'slider', label: '漣漪深度', min: 0, max: 0.055, step: 0.001, value: 0.038, digits: 3 },
+    { id: 'rippleSpeed', type: 'slider', label: '傳播速度', min: 0.2, max: 4, step: 0.01, value: 1.1 },
+    { id: 'rippleFreq', type: 'slider', label: '波數', min: 4, max: 60, step: 0.5, value: 18 },
+    { id: 'flash', type: 'slider', label: '閃光', min: 0, max: 3, step: 0.01, value: 1.0 },
 
     { group: '光線' },
     { id: 'light', type: 'xy', label: '光源方向', value: [0.68, 0.24] },
@@ -336,7 +522,7 @@ export default {
     { id: 'rough', type: 'slider', label: '粗糙度', min: 0.02, max: 1, step: 0.01, value: 0.22 },
 
     { group: '品質' },
-    { id: 'steps', type: 'slider', label: '行進步數', min: 32, max: 220, step: 1, value: 110 },
+    { id: 'steps', type: 'slider', label: '行進步數', min: 32, max: 220, step: 1, value: 100 },
     { id: 'scale', type: 'select', label: '渲染縮放', value: '0.75',
       options: [
         { value: '0.5', label: '50%' },
@@ -346,7 +532,7 @@ export default {
     { id: 'taa', type: 'slider', label: '時間累積', min: 0, max: 0.94, step: 0.01, value: 0.78 },
     { id: 'exposure', type: 'slider', label: '曝光', min: 0.2, max: 3, step: 0.01, value: 1.25 },
     { id: 'spin', type: 'switch', label: '自動繞行', value: true },
-    { id: 'hint', type: 'hint', text: '拖曳畫布繞行鏡頭；滾輪縮放；拖曳上方 XY 盤改變光源。' },
+    { id: 'hint', type: 'hint', text: '點擊星體或星環會在該點爆開；拖曳畫布繞行鏡頭，滾輪縮放。' },
   ],
 
   init(ctx) { return new MarchScene(ctx); },
@@ -360,6 +546,7 @@ class MarchScene {
     this.march = new Program(gl, VERT_FULLSCREEN, FRAG_MARCH, { name: 'march/scene' });
     this.accum = new Program(gl, VERT_FULLSCREEN, FRAG_ACCUM, { name: 'march/accum' });
     this.resolve = new Program(gl, VERT_FULLSCREEN, FRAG_RESOLVE, { name: 'march/resolve' });
+    this.glow = new Program(gl, VERT_GLOW, FRAG_GLOW, { name: 'march/glow' });
 
     this.rt = new Target(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR });
     this.history = new DoubleTarget(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR });
@@ -372,6 +559,7 @@ class MarchScene {
     this.width = 2;
     this.height = 2;
     this.moving = 1;
+    this.time = 0;
 
     this.basis = {
       pos: new Float32Array(3),
@@ -381,11 +569,67 @@ class MarchScene {
     };
     this.lightDir = new Float32Array([0.5, 0.6, 0.4]);
 
+    /* ── the cluster, computed here and uploaded ── */
+    this.ballPos = new Float32Array(BALL_N * 4);
+    this.ballCount = 6;
+    this.blend = 0.32;
+
+    /* ── impacts ── */
+    this.ripples = new Float32Array(RIPPLE_N * 4);    // world xyz + age
+    this._rippleHost = new Int32Array(RIPPLE_N).fill(-2);  // ball index, -1 = ring
+    this._rippleLocal = new Float32Array(RIPPLE_N * 3);    // unit dir, or ring-local point
+    this._rippleAge = new Float32Array(RIPPLE_N);
+    this._rippleNext = 0;
+    this.rippleLife = 1.9;
+
+    /* ── spray ── */
+    this.splash = new Float32Array(SPLASH_N * 4);
+    this._splashVel = new Float32Array(SPLASH_N * 3);
+    this._splashLife = new Float32Array(SPLASH_N);
+    this._splashSize = new Float32Array(SPLASH_N);
+    this._splashNext = 0;
+    this.splashBound = new Float32Array(4);
+    this.splashLive = 0;
+
+    this.flash = 0;
+    this.bursts = 0;
+
+    /* ── glow ── */
+    this.glowPts = new Float32Array(GLOW_N * 4);
+    this.glowAmt = new Float32Array(GLOW_N);
+
+    /* ── click vs drag ── */
+    this._pressed = false;
+    this._dragDist = 0;
+    this._pendingBurst = false;
+    this._ray = new Float32Array(3);
+    this._hit = new Float32Array(3);
+    this._normal = new Float32Array(3);
+
     this._onWheel = (e) => {
       e.preventDefault();
       this.targetDist = clamp(this.targetDist * Math.exp(e.deltaY * 0.0011), 2.0, 12);
     };
     ctx.canvas.addEventListener('wheel', this._onWheel, { passive: false });
+  }
+
+  /* ── pointer ──────────────────────────────────────────────────── */
+
+  /**
+   * Click versus drag: a drag orbits the camera, a click bursts the
+   * surface. They are told apart by how far the pointer travelled
+   * between press and release — and that has to be decided on the
+   * *events*, not on whatever the render loop happened to observe: at
+   * 25 fps a quick click can begin and end between two frames.
+   */
+  onPointerDown() {
+    this._pressed = true;
+    this._dragDist = 0;
+  }
+
+  onPointerUp() {
+    if (this._pressed && this._dragDist < 0.015) this._pendingBurst = true;
+    this._pressed = false;
   }
 
   resize(width, height) {
@@ -409,7 +653,15 @@ class MarchScene {
     this.pitch = 0.22;
     this.targetDist = 4.6;
     this.history.clear(0, 0, 0, 1);
+    this._rippleAge.fill(0);
+    this._rippleHost.fill(-2);
+    this._splashLife.fill(0);
+    this._splashSize.fill(0);
+    this.flash = 0;
+    this.bursts = 0;
   }
+
+  /* ── camera ───────────────────────────────────────────────────── */
 
   _updateCamera(state, clock, pointer) {
     let moved = false;
@@ -457,8 +709,354 @@ class MarchScene {
     up[2] = rx * fy - ry * fx;
   }
 
+  /** The ray under the pointer, in world space. Matches the shader. */
+  _pointerRay(pointer, out) {
+    const focal = 1.5;
+    const aspect = this.width / Math.max(this.height, 1);
+    const ndcX = pointer.x * 2 - 1;
+    const ndcY = 1 - pointer.y * 2;
+    const { right, up, fwd } = this.basis;
+
+    let x = fwd[0] + right[0] * ndcX * aspect / focal + up[0] * ndcY / focal;
+    let y = fwd[1] + right[1] * ndcX * aspect / focal + up[1] * ndcY / focal;
+    let z = fwd[2] + right[2] * ndcX * aspect / focal + up[2] * ndcY / focal;
+    const l = Math.hypot(x, y, z) || 1;
+    out[0] = x / l; out[1] = y / l; out[2] = z / l;
+    return out;
+  }
+
+  /* ── the cluster, on the CPU ──────────────────────────────────── */
+
+  /**
+   * The orbits used to be derived from uTime inside the shader. They are
+   * computed here now and uploaded, because picking needs the CPU to
+   * agree with the GPU about where every sphere is — and two copies of
+   * the same formula is exactly the kind of thing that silently drifts.
+   */
+  _updateBalls(state, time) {
+    const t = time * 0.42;
+    const n = Math.round(state.balls);
+    this.ballCount = n;
+    this.blend = state.blend;
+    this.time = time;
+
+    for (let i = 0; i < n; i++) {
+      const a = i * 2.399963;                       // golden angle
+      const o = i * 4;
+      this.ballPos[o + 0] = Math.sin(t * (0.7 + i * 0.11) + a) * (0.62 + 0.1 * Math.sin(i));
+      this.ballPos[o + 1] = Math.cos(t * (0.5 + i * 0.09) + a * 1.7) * 0.5;
+      this.ballPos[o + 2] = Math.cos(t * (0.62 + i * 0.13) + a * 0.6) * (0.62 + 0.1 * Math.cos(i));
+      this.ballPos[o + 3] = 0.30 + 0.10 * Math.sin(t * 0.9 + i * 2.1);
+    }
+    for (let i = n; i < BALL_N; i++) this.ballPos[i * 4 + 3] = 0;
+  }
+
+  /* The ring tumbles; these move a point in and out of its frame.
+     `q.yz = rot2(a) * q.yz` with GLSL's column-major mat2(c,-s,s,c)
+     expands to (c·y + s·z, −s·y + c·z), which is what these mirror. */
+
+  _worldToRing(x, y, z, out) {
+    const t = this.time * 0.42;
+    const ca = Math.cos(t * 0.31), sa = Math.sin(t * 0.31);
+    const y1 = ca * y + sa * z;
+    const z1 = -sa * y + ca * z;
+    const cb = Math.cos(t * 0.19), sb = Math.sin(t * 0.19);
+    out[0] = cb * x + sb * z1;
+    out[1] = y1;
+    out[2] = -sb * x + cb * z1;
+    return out;
+  }
+
+  _ringToWorld(x, y, z, out) {
+    const t = this.time * 0.42;
+    const cb = Math.cos(t * 0.19), sb = Math.sin(t * 0.19);
+    const x1 = cb * x - sb * z;
+    const z1 = sb * x + cb * z;
+    const ca = Math.cos(t * 0.31), sa = Math.sin(t * 0.31);
+    out[0] = x1;
+    out[1] = ca * y - sa * z1;
+    out[2] = sa * y + ca * z1;
+    return out;
+  }
+
+  _ringDistance(x, y, z) {
+    const q = this._worldToRing(x, y, z, this._tmpA ??= new Float32Array(3));
+    const radial = Math.hypot(q[0], q[2]) - RING_MAJOR;
+    return Math.hypot(radial, q[1]) - RING_MINOR;
+  }
+
+  /** The same field the shader marches, minus the terms picking can ignore. */
+  _mapCPU(x, y, z) {
+    let d = 1e9;
+    for (let i = 0; i < this.ballCount; i++) {
+      const o = i * 4;
+      const s = Math.hypot(x - this.ballPos[o], y - this.ballPos[o + 1], z - this.ballPos[o + 2])
+        - this.ballPos[o + 3];
+      d = smin(d, s, this.blend);
+    }
+    return smin(d, this._ringDistance(x, y, z), this.blend * 0.6);
+  }
+
+  /**
+   * March the pointer's ray on the CPU. The surface displacement and the
+   * ripples are left out: they move the surface by at most a couple of
+   * centimetres, which is far below the accuracy a click needs, and
+   * including them would make every pick pay for a noise function.
+   */
+  _pick(pointer) {
+    const ro = this.basis.pos;
+    const rd = this._pointerRay(pointer, this._ray);
+
+    let t = 0.05;
+    let hit = false;
+    for (let i = 0; i < 128; i++) {
+      const d = this._mapCPU(ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t);
+      if (d < 0.0015) { hit = true; break; }
+      t += d * 0.9;
+      if (t > 30) break;
+    }
+    if (!hit) return null;
+
+    const px = ro[0] + rd[0] * t;
+    const py = ro[1] + rd[1] * t;
+    const pz = ro[2] + rd[2] * t;
+
+    // Central differences for the normal — six taps, but this runs once
+    // per click, not once per pixel.
+    const h = 0.002;
+    let nx = this._mapCPU(px + h, py, pz) - this._mapCPU(px - h, py, pz);
+    let ny = this._mapCPU(px, py + h, pz) - this._mapCPU(px, py - h, pz);
+    let nz = this._mapCPU(px, py, pz + h) - this._mapCPU(px, py, pz - h);
+    const nl = Math.hypot(nx, ny, nz) || 1;
+    nx /= nl; ny /= nl; nz /= nl;
+
+    this._hit[0] = px; this._hit[1] = py; this._hit[2] = pz;
+    this._normal[0] = nx; this._normal[1] = ny; this._normal[2] = nz;
+    return this._hit;
+  }
+
+  /* ── bursts ───────────────────────────────────────────────────── */
+
+  /**
+   * A ripple has to be anchored to whatever it landed on, because
+   * everything here is moving. For a sphere that means storing a
+   * *direction* and re-placing the centre on the surface every frame —
+   * the spheres pulse, so a fixed offset would sink into one or float
+   * off another. For the ring it means storing the point in ring-local
+   * coordinates and rotating it back.
+   */
+  _anchorRipple(px, py, pz) {
+    let best = this._ringDistance(px, py, pz);
+    let host = -1;
+
+    for (let i = 0; i < this.ballCount; i++) {
+      const o = i * 4;
+      const d = Math.abs(
+        Math.hypot(px - this.ballPos[o], py - this.ballPos[o + 1], pz - this.ballPos[o + 2])
+        - this.ballPos[o + 3]);
+      if (d < Math.abs(best)) { best = d; host = i; }
+    }
+
+    const i = this._rippleNext;
+    this._rippleNext = (this._rippleNext + 1) % RIPPLE_N;
+    this._rippleHost[i] = host;
+    this._rippleAge[i] = 1e-4;
+
+    const l = i * 3;
+    if (host >= 0) {
+      const o = host * 4;
+      let dx = px - this.ballPos[o];
+      let dy = py - this.ballPos[o + 1];
+      let dz = pz - this.ballPos[o + 2];
+      const dl = Math.hypot(dx, dy, dz) || 1;
+      this._rippleLocal[l + 0] = dx / dl;
+      this._rippleLocal[l + 1] = dy / dl;
+      this._rippleLocal[l + 2] = dz / dl;
+    } else {
+      this._worldToRing(px, py, pz, this._tmpB ??= new Float32Array(3));
+      this._rippleLocal[l + 0] = this._tmpB[0];
+      this._rippleLocal[l + 1] = this._tmpB[1];
+      this._rippleLocal[l + 2] = this._tmpB[2];
+    }
+  }
+
+  /** Throw a cone of droplets off the surface, along its normal. */
+  _spray(state, px, py, pz, nx, ny, nz) {
+    const count = Math.round(state.burst);
+
+    // An orthonormal basis around the normal, so the cone is a cone and
+    // not an ellipse that happens to point the right way.
+    let ax = Math.abs(nx) < 0.9 ? 1 : 0;
+    let ay = Math.abs(nx) < 0.9 ? 0 : 1;
+    let ux = ny * 0 - nz * ay, uy = nz * ax - nx * 0, uz = nx * ay - ny * ax;
+    const ul = Math.hypot(ux, uy, uz) || 1;
+    ux /= ul; uy /= ul; uz /= ul;
+    const vx = ny * uz - nz * uy;
+    const vy = nz * ux - nx * uz;
+    const vz = nx * uy - ny * ux;
+
+    for (let k = 0; k < count; k++) {
+      const i = this._splashNext;
+      this._splashNext = (this._splashNext + 1) % SPLASH_N;
+
+      const spin = Math.random() * Math.PI * 2;
+      // Wider than a jet, narrower than a hemisphere: the shape a struck
+      // liquid surface actually throws.
+      const cone = Math.tan(0.18 + Math.random() * 0.85);
+      let dx = nx + (Math.cos(spin) * ux + Math.sin(spin) * vx) * cone;
+      let dy = ny + (Math.cos(spin) * uy + Math.sin(spin) * vy) * cone;
+      let dz = nz + (Math.cos(spin) * uz + Math.sin(spin) * vz) * cone;
+      const dl = Math.hypot(dx, dy, dz) || 1;
+      dx /= dl; dy /= dl; dz /= dl;
+
+      const speed = state.power * (0.55 + Math.random() * 0.9);
+      const o = i * 3;
+      const g = i * 4;
+
+      // Start just clear of the surface, or the first frame shows the
+      // droplet buried in the thing it came off.
+      this.splash[g + 0] = px + nx * 0.03;
+      this.splash[g + 1] = py + ny * 0.03;
+      this.splash[g + 2] = pz + nz * 0.03;
+      this._splashVel[o + 0] = dx * speed;
+      this._splashVel[o + 1] = dy * speed;
+      this._splashVel[o + 2] = dz * speed;
+
+      this._splashSize[i] = 0.030 + Math.random() * 0.055;
+      this._splashLife[i] = 1;
+    }
+  }
+
+  _burst(state, pointer) {
+    const p = this._pick(pointer);
+    if (!p) return false;
+    this._anchorRipple(p[0], p[1], p[2]);
+    this._spray(state, p[0], p[1], p[2], this._normal[0], this._normal[1], this._normal[2]);
+    this.flash = 1;
+    this.bursts++;
+    return true;
+  }
+
+  _updateRipples(dt) {
+    let active = 0;
+    const out = this._tmpC ??= new Float32Array(3);
+
+    for (let i = 0; i < RIPPLE_N; i++) {
+      const age = this._rippleAge[i];
+      if (age <= 0) { this.ripples[i * 4 + 3] = 0; continue; }
+
+      const next = age + dt / this.rippleLife;
+      const host = this._rippleHost[i];
+      if (next >= 1 || (host >= 0 && host >= this.ballCount)) {
+        this._rippleAge[i] = 0;
+        this.ripples[i * 4 + 3] = 0;
+        continue;
+      }
+      this._rippleAge[i] = next;
+
+      const l = i * 3;
+      if (host >= 0) {
+        const o = host * 4;
+        const r = this.ballPos[o + 3];
+        this.ripples[i * 4 + 0] = this.ballPos[o + 0] + this._rippleLocal[l + 0] * r;
+        this.ripples[i * 4 + 1] = this.ballPos[o + 1] + this._rippleLocal[l + 1] * r;
+        this.ripples[i * 4 + 2] = this.ballPos[o + 2] + this._rippleLocal[l + 2] * r;
+      } else {
+        this._ringToWorld(this._rippleLocal[l], this._rippleLocal[l + 1], this._rippleLocal[l + 2], out);
+        this.ripples[i * 4 + 0] = out[0];
+        this.ripples[i * 4 + 1] = out[1];
+        this.ripples[i * 4 + 2] = out[2];
+      }
+      this.ripples[i * 4 + 3] = next;
+      active++;
+    }
+    return active;
+  }
+
+  _updateSplash(state, dt) {
+    const drag = Math.exp(-dt * 0.9);
+    const decay = dt / state.dropLife;
+    let live = 0;
+    let minX = 1e9, minY = 1e9, minZ = 1e9, maxX = -1e9, maxY = -1e9, maxZ = -1e9, maxR = 0;
+
+    for (let i = 0; i < SPLASH_N; i++) {
+      if (this._splashLife[i] <= 0) { this.splash[i * 4 + 3] = 0; continue; }
+      const o = i * 3, g = i * 4;
+
+      this._splashVel[o + 1] -= state.gravity * dt;
+      this._splashVel[o] *= drag;
+      this._splashVel[o + 1] *= drag;
+      this._splashVel[o + 2] *= drag;
+
+      this.splash[g + 0] += this._splashVel[o] * dt;
+      this.splash[g + 1] += this._splashVel[o + 1] * dt;
+      this.splash[g + 2] += this._splashVel[o + 2] * dt;
+
+      this._splashLife[i] -= decay;
+      // A droplet that reaches the floor is spent.
+      if (this._splashLife[i] <= 0 || this.splash[g + 1] < -1.3) {
+        this._splashLife[i] = 0;
+        this.splash[g + 3] = 0;
+        continue;
+      }
+
+      // Shrink late, not early: holding volume then collapsing reads as
+      // evaporating, while a linear fade reads as a rendering glitch.
+      const r = this._splashSize[i] * Math.pow(this._splashLife[i], 0.4);
+      this.splash[g + 3] = r;
+      live++;
+
+      minX = Math.min(minX, this.splash[g] - r); maxX = Math.max(maxX, this.splash[g] + r);
+      minY = Math.min(minY, this.splash[g + 1] - r); maxY = Math.max(maxY, this.splash[g + 1] + r);
+      minZ = Math.min(minZ, this.splash[g + 2] - r); maxZ = Math.max(maxZ, this.splash[g + 2] + r);
+      maxR = Math.max(maxR, r);
+    }
+
+    this.splashLive = live;
+    if (live === 0) {
+      this.splashBound.set([0, 0, 0, 0]);
+    } else {
+      this.splashBound[0] = (minX + maxX) * 0.5;
+      this.splashBound[1] = (minY + maxY) * 0.5;
+      this.splashBound[2] = (minZ + maxZ) * 0.5;
+      this.splashBound[3] = 0.5 * Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) + maxR;
+    }
+    return live;
+  }
+
+  /** Impact flares plus droplet halos, packed for one additive draw. */
+  _packGlow(state) {
+    let n = 0;
+    for (let i = 0; i < RIPPLE_N; i++) {
+      const age = this._rippleAge[i];
+      const g = n * 4;
+      if (age <= 0) { this.glowAmt[n] = 0; this.glowPts[g + 3] = 0; n++; continue; }
+      this.glowPts[g + 0] = this.ripples[i * 4 + 0];
+      this.glowPts[g + 1] = this.ripples[i * 4 + 1];
+      this.glowPts[g + 2] = this.ripples[i * 4 + 2];
+      // The flare grows briefly, then goes out well before the ripple does.
+      this.glowPts[g + 3] = 0.10 + age * 0.35;
+      this.glowAmt[n] = Math.max(0, 1 - age * 3.2) * state.flash;
+      n++;
+    }
+    for (let i = 0; i < SPLASH_N; i++) {
+      const g = n * 4;
+      const life = this._splashLife[i];
+      if (life <= 0) { this.glowAmt[n] = 0; this.glowPts[g + 3] = 0; n++; continue; }
+      this.glowPts[g + 0] = this.splash[i * 4 + 0];
+      this.glowPts[g + 1] = this.splash[i * 4 + 1];
+      this.glowPts[g + 2] = this.splash[i * 4 + 2];
+      this.glowPts[g + 3] = this.splash[i * 4 + 3] * 2.4;
+      this.glowAmt[n] = life * 0.5 * state.flash;
+      n++;
+    }
+    return n;
+  }
+
+  /* ── frame ────────────────────────────────────────────────────── */
+
   frame({ state, clock, pointer }) {
-    const { gl, tri } = this.ctx;
+    const { gl, tri, empty } = this.ctx;
     this._applyScale(Number(state.scale));
     this._updateCamera(state, clock, pointer);
 
@@ -470,6 +1068,26 @@ class MarchScene {
     this.lightDir[2] = Math.cos(el) * Math.cos(az);
 
     const tint = TINTS[state.tint] || TINTS.amber;
+    const dt = Math.min(clock.dt, 1 / 30);
+
+    this._updateBalls(state, clock.time);
+
+    if (pointer.down) {
+      this._dragDist += Math.abs(pointer.dx) + Math.abs(pointer.dy);
+    }
+    if (this._pendingBurst) {
+      this._pendingBurst = false;
+      this._burst(state, pointer);
+    }
+
+    const rippleActive = this._updateRipples(dt);
+    const splashLive = this._updateSplash(state, dt);
+    this.flash *= Math.exp(-dt * 4.5);
+    const glowCount = this._packGlow(state);
+
+    // Anything in motion invalidates the accumulated history, so the
+    // temporal filter has to be told to let go of it.
+    if (rippleActive || splashLive) this.moving = 1;
 
     BLEND.none(gl);
     this.rt.bind();
@@ -483,7 +1101,6 @@ class MarchScene {
       uTime: clock.time,
       uSteps: Math.round(state.steps),
       uBlend: state.blend,
-      uBalls: state.balls,
       uDisplace: state.displace,
       uRough: state.rough,
       uFloorMix: 0.6,
@@ -493,11 +1110,28 @@ class MarchScene {
       uFog: 1.0,
       uAO: state.ao,
       uShadowSoft: state.shadow,
+
+      uBallPos: this.ballPos,
+      uBalls: this.ballCount,
+
+      uRipples: this.ripples,
+      uRippleOn: rippleActive > 0 ? 1 : 0,
+      uRippleAmp: state.rippleAmp,
+      uRippleSpeed: state.rippleSpeed,
+      uRippleFreq: state.rippleFreq,
+      uRippleTight: 5.0,
+      uRippleGlow: state.flash,
+
+      uSplash: this.splash,
+      uSplashBound: this.splashBound,
+      uSplashOn: splashLive > 0 ? 1 : 0,
+      uSplashCount: SPLASH_N,
+      uFlash: this.flash * state.flash,
     });
     tri.draw();
 
-    // Temporal blend is dialled back while the camera moves, or the
-    // jitter turns into a smear.
+    // Temporal blend is dialled back while anything moves, or the jitter
+    // turns into a smear.
     const blend = this.moving ? Math.min(state.taa, 0.55) : state.taa;
 
     this.history.write.bind();
@@ -512,14 +1146,36 @@ class MarchScene {
     bindScreen(gl, this.width, this.height);
     this.resolve.use({ uSrc: this.history.read.texture, uExposure: state.exposure });
     tri.draw();
+
+    if (state.flash > 0 && (rippleActive || splashLive)) {
+      BLEND.additive(gl);
+      this.glow.use({
+        uGlow: this.glowPts,
+        uGlowAmt: this.glowAmt,
+        uCamPos: this.basis.pos,
+        uRight: this.basis.right,
+        uUp: this.basis.up,
+        uFwd: this.basis.fwd,
+        uFocal: 1.5,
+        uAspect: this.width / Math.max(this.height, 1),
+        uViewportH: this.height,
+        uScene: this.rt.texture,
+        uResolution: [this.width, this.height],
+        uColor: [0.85, 0.92, 1.0],
+        uIntensity: 0.55,
+      });
+      empty.drawPoints(glowCount);
+      BLEND.none(gl);
+    }
   }
 
   readout() {
     return {
       '渲染尺寸': `${this.rt.width}×${this.rt.height}`,
       '幾何': '0 頂點 · 0 三角形',
+      '水花': `${this.splashLive} / ${SPLASH_N}`,
+      '爆炸次數': String(this.bursts),
       '鏡頭距離': this.dist.toFixed(2),
-      '鏡頭狀態': this.moving ? '移動中' : '收斂中',
     };
   }
 
@@ -528,9 +1184,16 @@ class MarchScene {
     this.march.dispose();
     this.accum.dispose();
     this.resolve.dispose();
+    this.glow.dispose();
     this.rt.dispose();
     this.history.dispose();
   }
 }
 
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/** The same polynomial smooth minimum the shader uses. */
+function smin(a, b, k) {
+  const h = Math.min(Math.max(0.5 + 0.5 * (b - a) / k, 0), 1);
+  return b + (a - b) * h - k * h * (1 - h);
+}
