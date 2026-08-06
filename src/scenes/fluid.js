@@ -450,10 +450,10 @@ class FluidScene {
   }
 
   /**
-   * The swimmer as a stirring body. Injecting only at the head gives a
-   * thin thread; injecting along the first third of the spine as well,
-   * at falling strength, produces the broad shed wake a real body
-   * leaves — and the vorticity term then curls it into eddies.
+   * The swimmer as a stirring body. The orb drives the wake; its shed
+   * droplets each stir a little on their own, which is what widens the
+   * disturbance into something the vorticity term can curl into eddies
+   * rather than a single thin thread.
    */
   _swim(state, dt) {
     const agent = this.ctx.agent;
@@ -464,12 +464,14 @@ class FluidScene {
     const dx = (agent.vel[0] / sp) * mag * AGENT_U * 2.6;
     const dy = -(agent.vel[1] / sp) * mag * AGENT_V * 2.6;
 
-    const taps = [0, 3, 7, 12];
-    for (let k = 0; k < taps.length; k++) {
-      const i = taps[k] * 3;
+    // The orb, then at most three droplets — enough to broaden the wake
+    // without spending a full splat pair on every speck.
+    const taps = Math.min(agent.live, 4);
+    for (let k = 0; k < taps; k++) {
+      const i = k * 3;
       const u = 0.5 + agent.nodes[i] * AGENT_U;
       const v = 0.5 + agent.nodes[i + 1] * AGENT_V;
-      const falloff = 1 - k / taps.length;
+      const falloff = k === 0 ? 1 : 0.45 * (1 - (k - 1) / 3);
       this._splat(
         u, 1 - v,
         dx * falloff, dy * falloff,

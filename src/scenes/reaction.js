@@ -344,15 +344,19 @@ class ReactionScene {
         1 - (0.5 + agent.nodes[i * 3 + 1] * AGENT_V),
       ];
 
-      // Head carves a clean channel. Clean substrate (u=1, v=0) is a
+      // The orb carves a clean channel. Clean substrate (u=1, v=0) is a
       // *stable* state of the model, so the channel does not heal on its
       // own — it stays open until something reseeds it.
       const [hx, hy] = at(0);
       this._paint(hx, hy, state.brush * 1.9, Math.min(state.seed * 1.8, 0.98), 2);
-      // …which is what the mid-body does, dropping colonies into the
-      // channel the head just opened. The wake blooms behind the animal.
-      const [mx, my] = at(12);
-      this._paint(mx, my, state.brush * 0.34, state.seed * 0.85, 0);
+
+      // …which is what the shed droplets do, each dropping a colony into
+      // the channel the orb just opened. The wake blooms behind it.
+      const oldest = Math.min(agent.live - 1, 6);
+      if (oldest > 0) {
+        const [mx, my] = at(oldest);
+        this._paint(mx, my, state.brush * 0.34, state.seed * 0.85, 0);
+      }
     }
 
     if (clock.dt > 0) {

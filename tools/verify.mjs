@@ -40,12 +40,14 @@ const VIEWPORT = { width: 1600, height: 900 };
  * mechanism that makes a scene shareable makes it testable.
  */
 const SHOTS_PLAN = [
-  { name: '01-intro',    hash: '#/flow',                        settle: 1200, intro: false },
-  { name: '02-flow',     hash: '#/flow?count=512',              settle: 4500 },
-  { name: '03-fluid',    hash: '#/fluid',                       settle: 5000 },
-  { name: '04-march',    hash: '#/march',                       settle: 4000 },
-  { name: '05-reaction', hash: '#/reaction',                    settle: 6000 },
-  { name: '06-flow-alt', hash: '#/flow?palette=spectra&trail=0.96&count=512', settle: 4500 },
+  { name: '01-intro',     hash: '#/march',                            settle: 1400, intro: false },
+  { name: '02-march',     hash: '#/march',                            settle: 7000 },
+  // Few, large targets and a fast orb: the surface is rippling almost
+  // continuously, which is the only way to catch it in a still frame.
+  { name: '03-march-hit', hash: '#/march?balls=3&agentSpeed=2.2&rippleAmp=0.075&rippleFreq=11&scale=1&spin=0', settle: 9000 },
+  { name: '04-fluid',     hash: '#/fluid',                            settle: 5000 },
+  { name: '05-reaction',  hash: '#/reaction',                         settle: 6000 },
+  { name: '06-march-jade', hash: '#/march?tint=jade&shed=2&glow=1.3',  settle: 7000 },
 ];
 
 /* ═══ static server ═══════════════════════════════════════════════ */
@@ -477,7 +479,7 @@ async function interact(cdp, base, problems) {
 
   console.log('▸ interaction');
 
-  await cdp.send('Page.navigate', { url: `${base}#/fluid` });
+  await cdp.send('Page.navigate', { url: `${base}#/fluid?agentSpeed=1.4` });
   await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 20000);
 
   /* intro */
@@ -496,6 +498,36 @@ async function interact(cdp, base, problems) {
   // Auto-injection is off, so every splat here came from the drag.
   check('pointer drag injects dye', after > before + 10, `${before} → ${after} splats`);
   await cdp.eval(`__aether.panel.setValues({ auto: true }, { notify: true }); true`);
+
+  /* the orb follows the pointer — checked here, in the 2D scene, where
+     nothing can knock it off course. In the raymarcher it bounces off
+     the stars, which is the point of that scene and the enemy of this
+     assertion. */
+  await cdp.eval(`__aether.panel.setValues({ agentMode: 'follow' }, { notify: true }); true`);
+
+  // Alignment, not distance. The pointer maps to a point that can sit
+  // well outside the orb's own bounds, so "did it get closer" has a
+  // floor it can never cross — but "is it on that side" is exactly the
+  // thing a viewer judges.
+  const alignment = () => cdp.eval(`(() => {
+    const a = __aether.agent;
+    const hl = Math.hypot(a.head[0], a.head[1]) || 1;
+    const al = Math.hypot(a._aim[0], a._aim[1]) || 1;
+    return (a.head[0] * a._aim[0] + a.head[1] * a._aim[1]) / (hl * al);
+  })()`);
+
+  const corner = [250, 740];
+  await mouse('mouseMoved', corner[0], corner[1], { buttons: 0 });
+  await sleep(300);
+  const before1 = await alignment();
+  for (let i = 0; i < 18; i++) {
+    await mouse('mouseMoved', corner[0], corner[1], { buttons: 0 });
+    await sleep(130);
+  }
+  const after1 = await alignment();
+  check('orb turns toward the pointer', after1 > 0.55,
+    `alignment ${before1.toFixed(2)} → ${after1.toFixed(2)}`);
+  await shot(cdp, 'i6-orb-follow');
   await shot(cdp, 'i1-fluid-drag');
 
   /* command palette: open, fuzzy-filter, run */
@@ -512,37 +544,28 @@ async function interact(cdp, base, problems) {
   check('palette navigates', await cdp.eval(`__aether.router.current`) === 'march',
     `now at ${await cdp.eval(`__aether.router.current`)}`);
 
-  /* the swimmer follows the pointer, and survives a scene change */
-  await cdp.eval(`__aether.panel.setValues({ agentMode: 'follow' }, { notify: true }); true`);
-
-  // Alignment, not distance. The pointer un-projects to a point that can
-  // sit well outside the creature's own bounds, so "did it get closer"
-  // has a floor it can never cross — but "is it on that side" is exactly
-  // the thing a viewer judges.
-  const alignment = () => cdp.eval(`(() => {
-    const a = __aether.agent;
-    const hl = Math.hypot(a.nodes[0], a.nodes[1]) || 1;
-    const al = Math.hypot(a._aim[0], a._aim[1]) || 1;
-    return (a.nodes[0] * a._aim[0] + a.nodes[1] * a._aim[1]) / (hl * al);
-  })()`);
-
-  const corner = [250, 740];
-  await mouse('mouseMoved', corner[0], corner[1], { buttons: 0 });
-  await sleep(300);
-  const before1 = await alignment();
-  for (let i = 0; i < 16; i++) {
-    await mouse('mouseMoved', corner[0], corner[1], { buttons: 0 });
-    await sleep(130);
+  /* the orb strikes the stars, and the impact leaves a ripple */
+  const hits0 = await cdp.eval(`__aether.scene.hits`);
+  // The cluster sits at the centre of the frame; steering the orb into
+  // it is exactly what a player would do.
+  for (let i = 0; i < 26; i++) {
+    await mouse('mouseMoved', 640, 430, { buttons: 0 });
+    await sleep(150);
   }
-  const after1 = await alignment();
-  check('swimmer turns toward the pointer', after1 > 0.55,
-    `alignment ${before1.toFixed(2)} → ${after1.toFixed(2)}`);
-  await shot(cdp, 'i6-swimmer-follow');
+  const hits1 = await cdp.eval(`__aether.scene.hits`);
+  check('orb collides with the stars', hits1 > hits0, `${hits0} → ${hits1} impacts`);
 
-  const before2 = await cdp.eval(`[...__aether.agent.nodes.slice(0, 3)]`);
-  await cdp.eval(`document.querySelector('.tab[data-id="flow"]').click(); true`);
+  const ripples = await cdp.eval(
+    `[...__aether.scene.ripples].filter((_, i) => i % 4 === 3).filter((v) => v > 0).length`);
+  const drops = await cdp.eval(`__aether.agent.live - 1`);
+  check('impacts leave ripples on the surface', ripples > 0, `${ripples} active`);
+  check('the orb sheds inertial droplets', drops > 0 && drops <= 10, `${drops} live`);
+  await shot(cdp, 'i7-impact');
+
+  const before2 = await cdp.eval(`[...__aether.agent.head]`);
+  await cdp.eval(`document.querySelector('.tab[data-id="fluid"]').click(); true`);
   await sleep(500);
-  const after2 = await cdp.eval(`[...__aether.agent.nodes.slice(0, 3)]`);
+  const after2 = await cdp.eval(`[...__aether.agent.head]`);
   const drift = Math.hypot(after2[0] - before2[0], after2[1] - before2[1], after2[2] - before2[2]);
   check('swimmer persists across scenes', drift < 0.6,
     `moved ${drift.toFixed(3)} in canonical units while the scene swapped`);
@@ -560,12 +583,12 @@ async function interact(cdp, base, problems) {
   /* keyboard scene switching + URL is state */
   await key('1', { code: 'Digit1', vk: 49 });
   await sleep(700);
-  check('number keys switch scene', await cdp.eval(`__aether.router.current`) === 'flow');
+  check('number keys switch scene', await cdp.eval(`__aether.router.current`) === 'march');
 
-  await cdp.eval(`__aether.panel.setValues({ palette: 'ember' }, { notify: true }); true`);
+  await cdp.eval(`__aether.panel.setValues({ tint: 'jade' }, { notify: true }); true`);
   await sleep(300);
   const url = await cdp.eval(`location.hash`);
-  check('params round-trip into the URL', url.includes('palette=ember'), url);
+  check('params round-trip into the URL', url.includes('tint=jade'), url);
 
   /* pause / step */
   await key(' ', { code: 'Space', vk: 32 });
