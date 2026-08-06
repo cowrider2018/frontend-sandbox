@@ -129,7 +129,7 @@ function findChrome() {
   return candidates.find((p) => existsSync(p));
 }
 
-async function launchChrome({ headless }) {
+async function launchChrome({ headless, gpu }) {
   const bin = findChrome();
   if (!bin) throw new Error('No Chrome or Edge found. Set CHROME_PATH.');
 
@@ -150,8 +150,16 @@ async function launchChrome({ headless }) {
     // which cannot run WebGL2 at all unless these are set.
     '--ignore-gpu-blocklist',
     '--enable-unsafe-swiftshader',
-    'about:blank',
   ];
+
+  // On a laptop with two GPUs, Chrome picks one for the whole browser
+  // process. `powerPreference: 'high-performance'` on the context is a
+  // hint the page makes *after* that choice has already been made, so it
+  // cannot move you to the discrete card on its own.
+  if (gpu === 'high') flags.push('--force-high-performance-gpu');
+  if (gpu === 'low') flags.push('--force-low-power-gpu');
+
+  flags.push('about:blank');
   if (headless) flags.unshift('--headless=new', '--hide-scrollbars');
 
   const child = spawn(bin, flags, { stdio: 'ignore', detached: false });
@@ -257,10 +265,11 @@ async function main() {
   }
   await mkdir(SHOTS, { recursive: true });
 
-  const chrome = await launchChrome({ headless: !flag('head') });
+  const chrome = await launchChrome({ headless: !flag('head'), gpu: value('gpu', null) });
   console.log(`▸ chrome ${chrome.bin.split(/[\\/]/).pop()} on :${chrome.port}`);
 
   const cdp = await CDP.attach(chrome.port);
+  cdp.__port = port;          // so bench() can build its own URLs
   const problems = [];
 
   cdp.on('Runtime.consoleAPICalled', ({ type, args }) => {
@@ -297,6 +306,13 @@ async function main() {
     await sleep(Number(value('settle', 3000)));
     console.dir(await cdp.eval(`(() => { ${probe} })()`), { depth: 8 });
     for (const p of problems) console.log(`  ${p.kind}: ${truncate(p.text, 600)}`);
+    cdp.close(); chrome.child.kill(); server.close();
+    await sleep(200);
+    process.exit(0);
+  }
+
+  if (flag('bench')) {
+    await bench(cdp);
     cdp.close(); chrome.child.kill(); server.close();
     await sleep(200);
     process.exit(0);
@@ -452,6 +468,89 @@ async function main() {
   server.close();
   await sleep(300);
   process.exit(failed.length ? 1 : 0);
+}
+
+/* ═══ benchmark ═══════════════════════════════════════════════════
+   A fixed workload, measured the same way every time, so "is the other
+   GPU faster?" has a number attached instead of an impression.        */
+
+/**
+ * Each case pins everything that could drift: no camera spin, no
+ * temporal accumulation (which would hide cost behind a smeared frame),
+ * a stated render scale and step count. The name says what it isolates.
+ */
+const BENCH_CASES = [
+  { name: 'baseline',    hash: '#/march?spin=0&taa=0&scale=0.75&steps=100' },
+  { name: 'full-res',    hash: '#/march?spin=0&taa=0&scale=1&steps=100' },
+  { name: 'no-noise',    hash: '#/march?spin=0&taa=0&scale=1&steps=100&displace=0' },
+  { name: 'no-reflect',  hash: '#/march?spin=0&taa=0&scale=1&steps=100&reflect=0' },
+  { name: 'no-shadow',   hash: '#/march?spin=0&taa=0&scale=1&steps=100&shadow=0' },
+  { name: 'bare',        hash: '#/march?spin=0&taa=0&scale=1&steps=100&displace=0&reflect=0&shadow=0&ao=0' },
+];
+
+async function bench(cdp) {
+  const base = `http://127.0.0.1:${cdp.__port}/index.html`;
+  const seconds = Number(value('seconds', 6));
+
+  console.log(`▸ benchmark  (${seconds}s per case, ${VIEWPORT.width}×${VIEWPORT.height})`);
+
+  let renderer = null;
+  const rows = [];
+
+  for (const c of BENCH_CASES) {
+    await cdp.send('Page.navigate', { url: base + c.hash });
+    await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 20000);
+    await cdp.eval(`document.getElementById('intro-enter').click(); true`);
+
+    // Warm up before measuring: shader compilation, the first few frames
+    // of texture allocation and the driver's own ramp-up are not what we
+    // are trying to time.
+    await sleep(2500);
+    renderer ??= await cdp.eval(`(() => {
+      const gl = document.getElementById('stage').getContext('webgl2');
+      const d = gl.getExtension('WEBGL_debug_renderer_info');
+      return d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    })()`);
+
+    await sleep(seconds * 1000);
+
+    // The ring buffer holds the last 90 frames; percentiles off that are
+    // far more honest than a smoothed fps counter.
+    const r = await cdp.eval(`(() => {
+      const p = __aether.perf;
+      const h = [...p.ordered()].filter((v) => v > 0).sort((a, b) => a - b);
+      const at = (q) => h[Math.min(h.length - 1, Math.floor(h.length * q))];
+      return {
+        n: h.length,
+        median: +at(0.5).toFixed(2),
+        p95: +at(0.95).toFixed(2),
+        gpuMs: +p.gpuMs.toFixed(2),
+        buffer: __aether.scene.rt.width + '×' + __aether.scene.rt.height,
+      };
+    })()`);
+
+    rows.push({ ...c, ...r });
+    console.log(
+      `  ${c.name.padEnd(11)} ${String(r.buffer).padStart(9)}  ` +
+      `${(1000 / r.median).toFixed(1).padStart(5)} fps   ` +
+      `frame ${r.median.toFixed(1).padStart(5)} ms (p95 ${r.p95.toFixed(1)})   ` +
+      `gpu ${r.gpuMs.toFixed(1).padStart(5)} ms`);
+  }
+
+  console.log(`\n▸ renderer: ${renderer}`);
+
+  // Relative cost of each feature, taken against the full-res case that
+  // shares its settings.
+  const fullRes = rows.find((r) => r.name === 'full-res');
+  if (fullRes) {
+    console.log('▸ cost of each term, measured at full res:');
+    for (const r of rows) {
+      if (r.name === 'full-res' || r.name === 'baseline') continue;
+      const saved = (1 - r.median / fullRes.median) * 100;
+      console.log(`    ${r.name.padEnd(11)} ${saved >= 0 ? '−' : '+'}${Math.abs(saved).toFixed(0)}% frame time`);
+    }
+  }
+  return rows;
 }
 
 /* ═══ interaction acceptance ══════════════════════════════════════

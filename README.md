@@ -142,6 +142,8 @@ python -m http.server
 node tools/verify.mjs                # 六種設定各載入、渲染、截圖，回報任何 console error
 node tools/verify.mjs --interact     # 端對端互動驗收（真的去拖曳滑鼠、滾滾輪、按鍵）
 node tools/verify.mjs --responsive   # 手機 / 平板 / 筆電 / 超寬視窗版面與像素預算
+node tools/verify.mjs --bench        # 固定負載的效能量測，逐項拆解成本
+node tools/verify.mjs --bench --gpu high   # 同上，但強制用獨顯
 node tools/verify.mjs --head         # 開可見的瀏覽器視窗
 node tools/verify.mjs --serve        # 只開靜態伺服器
 node tools/verify.mjs --eval probe.js --at "#/march"   # 在頁面裡執行探針，檢查活的 GPU 狀態
@@ -182,6 +184,34 @@ node tools/verify.mjs --eval probe.js --at "#/march"   # 在頁面裡執行探�
 
 第 5 個特別值得一提：它是被截圖裡「格線出現在地平線上方」這個細節抓到的，
 而不是被任何斷言抓到的 —— 這正是為什麼驗收工具要輸出可以用眼睛看的東西。
+
+---
+
+## 效能：雙顯示卡筆電
+
+`--bench` 跑固定負載（關掉鏡頭自轉與時間累積，兩者都會把成本藏進被抹掉的幀裡），
+量最近 90 幀的中位數與 p95，再逐項拆解每個著色項的成本。
+
+在一台同時有 Intel Iris Xe 與 GTX 1650 的機器上，1600×900：
+
+| | Iris Xe | GTX 1650 |
+|---|---|---|
+| 預設（0.75 縮放） | 25.8 ms GPU | **12.0 ms** |
+| 全解析度 | 42.5 ms GPU | **22.9 ms** |
+| 全關（無噪聲/反射/陰影/AO） | 11.4 ms GPU | **3.6 ms** |
+
+**Chrome 預設不會用獨顯。** WebGL context 上的 `powerPreference: 'high-performance'`
+是頁面在瀏覽器**已經決定用哪張卡之後**才給的提示，它自己搬不動你。要真的切過去：
+
+- **Windows 設定 → 系統 → 顯示器 → 圖形** → 加入 `chrome.exe` → 高效能，或
+- **NVIDIA 控制面板 → 管理 3D 設定 → 程式設定** → Chrome → 高效能 NVIDIA 處理器
+
+設好之後跑 `node tools/verify.mjs --bench`（**不加** `--gpu`），
+它印出的 renderer 字串會直接告訴你成功了沒 —— 那個設定是綁執行檔路徑的，
+所以驗收工具用的臨時 profile 也吃得到。
+
+讀數時看 **GPU ms 而不是 fps**：frame time 還包含合成與呈現的開銷，
+在無頭模式下有時會卡在與著色器無關的上限。
 
 ---
 
