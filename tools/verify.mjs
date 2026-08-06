@@ -45,9 +45,9 @@ const SHOTS_PLAN = [
   { name: '03-full',   hash: '#/march?scale=1&steps=160&spin=0&taa=0.9',  settle: 9000 },
   // `click` fires a burst at a sphere's centre and waits, so the ring has
   // travelled far enough across the surface to be visible in a still.
-  { name: '04-burst',  hash: '#/march?spin=0&scale=1&power=2.6&burst=16&rippleAmp=0.05&rippleFreq=13',
+  { name: '04-impact', hash: '#/march?spin=0&scale=1&rippleAmp=0.05&rippleFreq=13',
     settle: 5000, click: true, after: 260 },
-  { name: '05-crown',  hash: '#/march?spin=0&scale=1&rippleAmp=0.052&rippleFreq=12&rippleSpeed=0.95&burst=28&power=1.9&jet=4',
+  { name: '05-ripple', hash: '#/march?spin=0&scale=1&rippleAmp=0.052&rippleFreq=12&rippleSpeed=0.95',
     settle: 5000, click: true, after: 700 },
   { name: '06-lit',    hash: '#/march?light=0.18,0.62&tint=rose&ao=1&shadow=1', settle: 8000 },
 ];
@@ -534,16 +534,29 @@ async function interact(cdp, base, problems) {
 
   const burst = await cdp.eval(`({
     bursts: __aether.scene.bursts,
-    splash: __aether.scene.splashLive,
     ripples: [...__aether.scene.ripples].filter((_, i) => i % 4 === 3).filter((v) => v > 0).length,
     flash: +__aether.scene.flash.toFixed(2),
   })`);
-  check('a click bursts the surface', burst.bursts > bursts0,
-    `${bursts0} → ${burst.bursts} bursts, flash ${burst.flash}`);
-  check('the burst throws a spray', burst.splash > 0 && burst.splash <= 16,
-    `${burst.splash} droplets in flight`);
-  check('the burst leaves a ripple', burst.ripples > 0, `${burst.ripples} active`);
-  await shot(cdp, 'i0-burst');
+  check('a click strikes the surface', burst.bursts > bursts0,
+    `${bursts0} → ${burst.bursts} impacts, flash ${burst.flash}`);
+  check('the impact leaves a ripple', burst.ripples > 0, `${burst.ripples} active`);
+
+  // The ripple has to ride its host: everything here orbits, and a centre
+  // frozen in world space slides off the surface it belongs to.
+  const rode = await cdp.eval(`(() => {
+    const s = __aether.scene, i = [...s.ripples].findIndex((v, k) => k % 4 === 3 && v > 0);
+    return i < 0 ? null : [s.ripples[i - 3], s.ripples[i - 2], s.ripples[i - 1]];
+  })()`);
+  await sleep(600);
+  const rode2 = await cdp.eval(`(() => {
+    const s = __aether.scene, i = [...s.ripples].findIndex((v, k) => k % 4 === 3 && v > 0);
+    return i < 0 ? null : [s.ripples[i - 3], s.ripples[i - 2], s.ripples[i - 1]];
+  })()`);
+  const carried = rode && rode2
+    ? Math.hypot(rode2[0] - rode[0], rode2[1] - rode[1], rode2[2] - rode[2]) : -1;
+  check('the ripple rides its host', carried > 0.0005 && carried < 0.6,
+    `centre carried ${carried.toFixed(4)} world units`);
+  await shot(cdp, 'i0-impact');
 
   /* a click on empty sky must not burst anything */
   const bursts1 = await cdp.eval(`__aether.scene.bursts`);
