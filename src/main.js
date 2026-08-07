@@ -29,7 +29,7 @@ const SHORTCUTS = [
   ['Ctrl K', '指令面板'],
   ['Space', '暫停 / 繼續'],
   ['.', '暫停時前進一幀'],
-  ['R', '重設場景'],
+  ['R', '重設場景與所有參數'],
   ['S', '儲存截圖'],
   ['P', '顯示 / 隱藏參數面板'],
   ['Z', '禪模式（隱藏所有介面）'],
@@ -377,9 +377,16 @@ class App {
 
   /* ── actions ──────────────────────────────────────────────────── */
 
+  /**
+   * Reset means reset. It used to put the camera back but leave every
+   * slider where it was, with a second, separate command for the
+   * parameters — two half-resets, and no way to guess which one the
+   * button did.
+   */
   _reset() {
+    this._restoreDefaults();
     this.scene?.reset?.();
-    this.toaster.show('場景已重設');
+    this.toaster.show('場景與參數已重設');
   }
 
   _togglePause() { this.ui.paused.set((v) => !v); }
@@ -441,7 +448,8 @@ class App {
     }));
 
     return list.concat([
-      { label: '重設場景', glyph: '↺', meta: 'R', keywords: 'reset', run: () => this._reset() },
+      { label: '重設場景與所有參數', glyph: '↺', meta: 'R',
+        keywords: 'reset defaults restore params camera', run: () => this._reset() },
       { label: '暫停 / 繼續', glyph: '⏸', meta: 'Space', keywords: 'pause play', run: () => this._togglePause() },
       { label: '儲存 PNG 截圖', glyph: '⤓', meta: 'S', keywords: 'screenshot save png', run: () => this._screenshot() },
       { label: '複製含參數的連結', glyph: '⧉', meta: '', keywords: 'copy link share url', run: () => this._copyLink() },
@@ -449,18 +457,22 @@ class App {
       { label: '禪模式', glyph: '☯', meta: 'Z', keywords: 'zen hide ui clean', run: () => this._toggleZen() },
       { label: '全螢幕', glyph: '⛶', meta: 'F', keywords: 'fullscreen', run: () => this._toggleFullscreen() },
       { label: '快捷鍵一覽', glyph: '?', meta: '?', keywords: 'help keys shortcuts', run: () => $('help').showModal() },
-      { label: '恢復本場景預設值', glyph: '⟲', meta: '', keywords: 'defaults restore params', run: () => this._restoreDefaults() },
     ]);
   }
 
+  /**
+   * Every control the panel actually registered, back to the value its
+   * schema declares. Static blocks are skipped: they carry an id for the
+   * author's convenience but hold nothing.
+   */
   _restoreDefaults() {
     if (!this.sceneDef) return;
     const defaults = {};
-    for (const p of this.sceneDef.params) if (p.id !== undefined) defaults[p.id] = p.value;
+    for (const p of this.sceneDef.params) {
+      if (p.id !== undefined && this.panel.widgets.has(p.id)) defaults[p.id] = p.value;
+    }
     this.panel.setValues(defaults);
-    Object.assign(this.state, defaults);
     this.router.replaceParams({});
-    this.toaster.show('參數已回到預設值');
   }
 
   /* ── keyboard ─────────────────────────────────────────────────── */

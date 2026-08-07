@@ -980,11 +980,28 @@ async function interact(cdp, base, problems) {
   check('single-scene lab hides the tab bar',
     await cdp.eval(`getComputedStyle(document.getElementById('tabs')).display === 'none'`));
 
-  /* the panel restores its own defaults */
-  await cdp.eval(`__aether.__restore(); true`);
+  /* reset puts back everything: parameters, camera and the URL. It used
+     to do only half of that, with the other half hidden in a separate
+     command. */
+  await cdp.eval(`__aether.panel.setValues(
+    { tint: 'rose', steps: 180, erode: 0.4 }, { notify: true }); true`);
+  await drag([700, 450], [1050, 340]);
   await sleep(400);
-  check('defaults can be restored', (await cdp.eval(`location.hash`)) === '#/march',
-    await cdp.eval(`location.hash`));
+  const messy = await cdp.eval(`({ tint: __aether.state.tint, steps: __aether.state.steps,
+    erode: __aether.state.erode, yaw: +__aether.scene.yaw.toFixed(2) })`);
+
+  await key('r', { vk: 82 });
+  await sleep(600);
+  const clean = await cdp.eval(`({ tint: __aether.state.tint, steps: __aether.state.steps,
+    erode: __aether.state.erode, yaw: +__aether.scene.yaw.toFixed(2),
+    hash: location.hash })`);
+
+  check('reset restores every parameter',
+    clean.tint === 'amber' && clean.steps === 100 && clean.erode === 0.1,
+    `${JSON.stringify(messy)} → ${JSON.stringify(clean)}`);
+  check('reset restores the camera and the URL',
+    Math.abs(clean.yaw - 0.85) < 0.2 && clean.hash === '#/march',
+    `yaw ${messy.yaw} → ${clean.yaw}, hash ${clean.hash}`);
 
   check('no console errors during interaction', problems.length === 0,
     problems.map((p) => p.text.slice(0, 120)).join(' | '));

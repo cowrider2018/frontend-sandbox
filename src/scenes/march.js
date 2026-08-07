@@ -863,6 +863,9 @@ class MarchScene {
     this._rippleHost.fill(-2);
     this.flash = 0;
     this.bursts = 0;
+    // The app has just put every slider back, including the master, so
+    // forget where it last fired or it will stamp over them next frame.
+    this._lastQuality = null;
   }
 
   /* ── camera ───────────────────────────────────────────────────── */
