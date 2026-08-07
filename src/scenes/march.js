@@ -71,7 +71,7 @@ uniform vec4  uBound;
 
 uniform vec4  uRipples[RIPPLE_N]; // xyz = impact point, w = normalised age
 uniform float uRippleOn, uRippleAmp, uRippleSpeed, uRippleFreq, uRippleTight, uRippleGlow;
-uniform float uCrater;
+uniform float uErode;
 
 // quality
 uniform int   uSteps, uShadowSteps, uAoTaps, uReflectSteps;
@@ -160,40 +160,49 @@ float ripples(vec3 p) {
   return sum * uRippleAmp;
 }
 
+/** How wide the dissipation reaches. Harder blows spread further. */
+float erodeWidth() { return 0.22 + uErode * 0.9; }
+
 /**
- * The bite an impact takes out of the surface.
+ * Mass dissipating under the shock.
  *
- * The wave is a *perturbation* — it can only push the surface a little
- * way in or out before it stops being a distance field. Removing
- * material is a different operation: max(d, −sphere) is an exact
- * boolean, and the maximum of two 1-Lipschitz fields is still
- * 1-Lipschitz. So this can go as deep as you like without the tracer
- * losing its footing. Deep enough and it opens a hole clean through a
- * sphere, or severs the ring.
+ * Subtracting a sphere would be the obvious way to open a hole, and it
+ * is exact and cheap — but it leaves a machined circular rim, an edge
+ * no amount of energy would actually produce. This is an *additive*
+ * term instead: it pushes the surface inward wherever the impact's
+ * energy is high, and because the falloff is a smooth blob the surface
+ * tapers away to nothing rather than being cut. Where the dissipation
+ * exceeds the local thickness the surface simply stops existing, which
+ * is how the ring — 0.075 thick — opens a gap and then closes it again
+ * as the energy drains.
  *
- * It opens fast and closes as the wave spends itself, so the surface
- * heals behind the impact rather than staying broken.
+ * Being additive also means its gradient is amplitude over width rather
+ * than amplitude times frequency, so it feeds the same derived step
+ * bound as everything else instead of needing a special case.
  */
-float crater(vec3 p, float d) {
-  if (uCrater <= 0.0) return d;
+float erosion(vec3 p) {
+  if (uErode <= 0.0) return 0.0;
+  float w = erodeWidth();
+  float sum = 0.0;
   for (int i = 0; i < RIPPLE_N; i++) {
     float age = uRipples[i].w;
     if (age <= 0.0) continue;
-    float r = uCrater * smoothstep(0.0, 0.10, age) * (1.0 - age) * (1.0 - age);
-    if (r <= 0.0) continue;
-    d = max(d, r - length(p - uRipples[i].xyz));
+    // Energy: peaks just after the blow, then drains away.
+    float e = smoothstep(0.0, 0.10, age) * (1.0 - age) * (1.0 - age);
+    float d = length(p - uRipples[i].xyz) / w;
+    sum += e * exp(-d * d);
   }
-  return d;
+  return sum * uErode;
 }
 
 float clusterShape(vec3 p) {
   float d = clusterBase(p);
   if (uRippleOn > 0.5) {
     d += ripples(p);
-    // In the shape layer, not the full one: a hole has to be a hole for
+    // In the shape layer, not the full one: a gap has to be a gap for
     // the shadow and occlusion rays too, or light refuses to come
     // through something you can see straight out of.
-    d = crater(p, d);
+    d += erosion(p);
   }
   return d;
 }
@@ -262,7 +271,11 @@ float traceCluster(vec3 ro, vec3 rd, int steps, float tMin) {
   // goes, so it costs nothing here.
   float lip = 1.0;
   if (uDisplace > 0.0) lip += uDisplace * DISPLACE_AMP * 6.0;
-  if (uRippleOn > 0.5) lip += uRippleAmp * uRippleFreq * 0.9;
+  if (uRippleOn > 0.5) {
+    lip += uRippleAmp * uRippleFreq * 0.9;
+    // A Gaussian's steepest slope is its amplitude over its width.
+    lip += uErode * 0.9 / erodeWidth();
+  }
   float relax = 0.97 / lip;
 
   for (int i = 0; i < 256; i++) {
@@ -658,10 +671,10 @@ export default {
     // is derived from this value now, so the ceiling can go up — it just
     // costs frames as you climb.
     { id: 'rippleAmp', type: 'slider', label: '漣漪深度', min: 0, max: 0.16, step: 0.001, value: 0.042, digits: 3 },
-    // Radius of the bite. A sphere here is 0.30 across its radius and
-    // the ring is 0.075 thick, so ~0.15 severs the ring and ~0.6 opens a
-    // hole clean through a sphere.
-    { id: 'crater', type: 'slider', label: '撞擊坑', min: 0, max: 0.8, step: 0.005, value: 0.14, digits: 2 },
+    // How much material the blow takes away. The ring is 0.075 thick, so
+    // anything past about 0.10 opens a gap in it; a sphere's 0.30 radius
+    // needs roughly 0.38 before the far side shows through.
+    { id: 'erode', type: 'slider', label: '質量消散', min: 0, max: 0.45, step: 0.005, value: 0.10, digits: 2 },
     { id: 'rippleSpeed', type: 'slider', label: '傳播速度', min: 0.2, max: 4, step: 0.01, value: 1.0 },
     { id: 'rippleFreq', type: 'slider', label: '波數', min: 4, max: 60, step: 0.5, value: 16 },
     { id: 'rippleLife', type: 'slider', label: '持續時間', min: 0.4, max: 6, step: 0.05, value: 1.9, unit: 's' },
@@ -1201,7 +1214,7 @@ class MarchScene {
       uRippleFreq: state.rippleFreq,
       uRippleTight: 5.0,
       uRippleGlow: state.flash,
-      uCrater: state.crater,
+      uErode: state.erode,
 
       uSteps: Math.round(state.steps),
       uShadowSteps: Math.round(state.shadowSteps),
