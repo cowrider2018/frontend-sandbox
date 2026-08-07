@@ -100,10 +100,20 @@ const SHOTS_PLAN = [
     hold: { key: 'w', ms: 2200 } },
   // Close enough to read the pose: the follow camera puts you behind the
   // animal, so this frame is the back of a walking cat and nothing else.
+  // The tail should be arcing up and *behind* it, not out to one side,
+  // and the two diagonals should be plainly out of phase.
   { name: '13-cat-close', hash: '#/march?spin=0&scale=1&taa=0.9&camera=follow', settle: 2500,
     pre: 'const c = __aether.scene.cat; c.x = -0.6; c.z = 3.0; c.yaw = 1.57; return true;',
     hold: { key: 'w', ms: 2200 },
     poke: '__aether.scene.targetDist = 1.9; return true;' },
+
+  // Turning hard, photographed a quarter second after the keys are
+  // released: the body has stopped rotating and the tail has not. What
+  // is visible in this frame is entirely the spring chain unwinding.
+  { name: '14-cat-tail', hash: '#/march?spin=0&scale=1&taa=0.9&camera=follow', settle: 2500,
+    pre: 'const c = __aether.scene.cat; c.x = 0.2; c.z = 3.2; c.yaw = 1.57; return true;',
+    hold: { key: ['w', 'a'], ms: 2000, after: 240 },
+    poke: '__aether.scene.targetDist = 2.2; return true;' },
 ];
 
 /**
@@ -541,16 +551,22 @@ async function main() {
     // the only way to prove the app actually routes the key to the scene
     // instead of eating it as a shortcut.
     if (shot.hold) {
-      const { key, ms } = shot.hold;
-      const code = `Key${key.toUpperCase()}`;
-      const vk = key.toUpperCase().charCodeAt(0);
-      const ev = (type) => cdp.send('Input.dispatchKeyEvent', {
-        type, key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk,
+      const { key, ms, after = 400 } = shot.hold;
+      // Several at once, so a shot can walk and steer in the same frame
+      // — which is the only way to photograph anything that depends on
+      // the body turning.
+      const keys = Array.isArray(key) ? key : [key];
+      const ev = (type, k) => cdp.send('Input.dispatchKeyEvent', {
+        type,
+        key: k,
+        code: `Key${k.toUpperCase()}`,
+        windowsVirtualKeyCode: k.toUpperCase().charCodeAt(0),
+        nativeVirtualKeyCode: k.toUpperCase().charCodeAt(0),
       });
-      await ev('keyDown');
+      for (const k of keys) await ev('keyDown', k);
       await sleep(ms);
-      await ev('keyUp');
-      await sleep(400);
+      for (const k of keys) await ev('keyUp', k);
+      await sleep(after);
     }
 
     // Reach into the scene and pin state that time would otherwise carry
@@ -1038,6 +1054,96 @@ async function interact(cdp, base, problems) {
   /* a lab with one scene must not show a tab bar that cannot do anything */
   check('single-scene lab hides the tab bar',
     await cdp.eval(`getComputedStyle(document.getElementById('tabs')).display === 'none'`));
+
+  /* ── the cat ──
+     It is the one thing here made of triangles, and the one thing the
+     app has to hand keys to. */
+  await cdp.eval(`location.hash = '#/march?spin=0&scale=0.5'; true`);
+  await sleep(900);
+
+  const hold = async (keys, ms) => {
+    const ev = (type, k) => cdp.send('Input.dispatchKeyEvent', {
+      type, key: k, code: `Key${k.toUpperCase()}`,
+      windowsVirtualKeyCode: k.toUpperCase().charCodeAt(0),
+    });
+    for (const k of keys) await ev('rawKeyDown', k);
+    await sleep(ms);
+    for (const k of keys) await ev('keyUp', k);
+  };
+
+  const before = await cdp.eval(`(() => { const c = __aether.scene.cat;
+    c.x = 0; c.z = 3; c.yaw = 1.57; return [c.x, c.z]; })()`);
+  await hold(['w'], 700);
+  const after = await cdp.eval(`(() => { const c = __aether.scene.cat; return [c.x, c.z]; })()`);
+  check('W drives the cat along its heading',
+    after[0] - before[0] > 0.3 && Math.abs(after[1] - before[1]) < 0.2,
+    `(${before.map((n) => n.toFixed(2))}) → (${after.map((n) => n.toFixed(2))})`);
+
+  /* A cat walks diagonally: each hind leg swings with the front leg on
+     the *opposite* flank. The model names its two pairs from opposite
+     ends, so this is asserted on where the legs actually are — and it is
+     sampled at the extreme of the swing, because every gait passes
+     through zero twice a cycle and would pass a sloppier test there. */
+  const gait = await cdp.eval(`(() => {
+    const r = __aether.scene.cat.rig;
+    const xOf = (n) => r.rest.position[r.bone(n) * 3];
+    const rotOf = (n) => r.rotation[r.bone(n) * 3];
+    const hindPlus = xOf('hipHL') > xOf('hipHR') ? 'hipHL' : 'hipHR';
+    const frontPlus = xOf('pawFL') > xOf('pawFR') ? 'pawFL' : 'pawFR';
+    const frontMinus = frontPlus === 'pawFL' ? 'pawFR' : 'pawFL';
+    return { hip: rotOf(hindPlus), same: rotOf(frontPlus), opposite: rotOf(frontMinus) };
+  })()`);
+  await hold(['w'], 500);
+  const swing = await cdp.eval(`(() => {
+    const r = __aether.scene.cat.rig;
+    const xOf = (n) => r.rest.position[r.bone(n) * 3];
+    const rotOf = (n) => r.rotation[r.bone(n) * 3];
+    const hindPlus = xOf('hipHL') > xOf('hipHR') ? 'hipHL' : 'hipHR';
+    const frontPlus = xOf('pawFL') > xOf('pawFR') ? 'pawFL' : 'pawFR';
+    const frontMinus = frontPlus === 'pawFL' ? 'pawFR' : 'pawFL';
+    let best = null;
+    for (let i = 0; i < 40; i++) {
+      const h = rotOf(hindPlus);
+      if (!best || Math.abs(h) > Math.abs(best.hip)) {
+        best = { hip: h, same: rotOf(frontPlus), opposite: rotOf(frontMinus) };
+      }
+      __aether.scene.cat.update(1 / 60, -1.35);
+    }
+    return best;
+  })()`);
+  check('the gait is diagonal, not same-side',
+    Math.abs(swing.hip) > 0.05
+      && Math.sign(swing.hip) === Math.sign(swing.opposite)
+      && Math.sign(swing.hip) !== Math.sign(swing.same),
+    `hind ${swing.hip.toFixed(3)} · opposite front ${swing.opposite.toFixed(3)} · same-side front ${swing.same.toFixed(3)}`);
+
+  /* The tail is a spring chain, so it is still moving after the body has
+     stopped. If it were rigid every node would sit exactly on the base. */
+  await hold(['w', 'a'], 900);
+  const tail = await cdp.eval(`(() => {
+    const s = __aether.scene.cat.sway;
+    return { lagTip: s.yaw.a[8] - s.yaw.a[0], lagMid: s.yaw.a[4] - s.yaw.a[0] };
+  })()`);
+  check('the tail trails the body, tip furthest',
+    Math.abs(tail.lagTip) > 1e-3 && Math.abs(tail.lagTip) > Math.abs(tail.lagMid),
+    `tip lags ${tail.lagTip.toFixed(3)} rad, middle ${tail.lagMid.toFixed(3)}`);
+
+  /* WASD overlaps the app's own shortcuts, so the scene may only claim
+     them while there is something to steer. */
+  await hold(['s'], 400);
+  const claimed = await cdp.eval(`__aether.scene.cat.velocity`);
+  check('S drives the cat backwards while it is shown', claimed < -0.05,
+    `velocity ${claimed.toFixed(2)}`);
+
+  await cdp.eval(`__aether.panel.setValues({ cat: false }); true`);
+  await sleep(300);
+  const released = await cdp.eval(`(() => {
+    const e = { key: 's' };
+    return __aether.scene.onKey(e, true) === false;
+  })()`);
+  check('and hands S back when the cat is hidden', released);
+  await cdp.eval(`__aether.panel.setValues({ cat: true }); true`);
+  await sleep(200);
 
   /* reset puts back everything: parameters, camera and the URL. It used
      to do only half of that, with the other half hidden in a separate

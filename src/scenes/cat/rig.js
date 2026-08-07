@@ -19,7 +19,7 @@
  *
  *   header   JSON, padded to four bytes
  *   position float32 × 3          — the one thing a wrong bit shows in
- *   normal   snorm16 × 3          — far finer than a three-step ramp
+ *   normal   snorm16 × 4          — .xyz normal, .w outerness for sway
  *   colour   uint8 × 4            — sRGB, with the bone index in .a
  *   index    uint16 (or uint32)
  */
@@ -35,7 +35,7 @@ export function parseCat(buffer) {
 
   let o = 8 + headerLength + pad(headerLength);
   const position = new Float32Array(buffer, o, nv * 3); o += nv * 12;
-  const normal = new Int16Array(buffer, o, nv * 3); o += nv * 6 + pad(nv * 6);
+  const normal = new Int16Array(buffer, o, nv * 4); o += nv * 8;
   const color = new Uint8Array(buffer, o, nv * 4); o += nv * 4;
   const index = header.indexBits === 32
     ? new Uint32Array(buffer, o, ni)

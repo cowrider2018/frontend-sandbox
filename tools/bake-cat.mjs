@@ -95,8 +95,34 @@ const BONES = [
 
 const boneIndex = new Map(BONES.map(([, obj], i) => [obj, i]));
 
+/**
+ * Fixed rotations applied to a bone's vertices, in that bone's own space.
+ *
+ * The tail was authored for relpet, where the camera is locked to a
+ * three-quarter view of a cat that never turns around: its curve lies in
+ * the XY plane, so the arc reads as a silhouette from the side. Under a
+ * free camera that is just a tail sticking out sideways. Rotating it a
+ * quarter turn about Y swings the arc into the YZ plane, so it sweeps up
+ * and *behind* the animal and reads from anywhere.
+ *
+ * Baked into the vertices rather than added to the bone's rest rotation
+ * on purpose: it has to apply *after* the pose, or it would take the
+ * wag axis with it and the tail would swish forwards and backwards.
+ */
+const REORIENT = {
+  tail: new THREE.Matrix4().makeRotationY(Math.PI / 2),
+};
+
 // Rest pose is whatever buildCat left behind: matrixWorld for every node.
 parts.root.updateMatrixWorld(true);
+
+/**
+ * The model's own registry of bendable geometry. Each entry carries a
+ * per-vertex "outerness" — 0 at the base, 1 at the tip — which is the
+ * only thing needed to make a part trail behind the body it hangs off.
+ * Keyed by geometry, because that is what a mesh can be matched on.
+ */
+const flexByGeo = new Map((parts.flex || []).map((f) => [f.geo, f]));
 
 /** Nearest ancestor that is a bone, plus the object itself if it is one. */
 function nearestBone(obj) {
@@ -190,16 +216,30 @@ parts.root.traverse((obj) => {
     : obj.material.isMeshToonMaterial ? GROUP_LIT
     : GROUP_UNLIT;
 
-  // Rest transform from the bone's space down to this mesh. Baked into
-  // the vertices below, then forgotten.
+  // Rest transform from the bone's space down to this mesh, with any
+  // fixed reorientation on top. Baked into the vertices below, then
+  // forgotten.
   _boneInv.copy(BONES[bone][1].matrixWorld).invert();
   const rest = _boneInv.multiply(obj.matrixWorld);
+  const fix = REORIENT[BONES[bone][0]];
+  if (fix) rest.premultiply(fix);
   _nm.getNormalMatrix(rest);
+
+  /* Outerness, if this geometry is one of the model's bendable ones.
+     Everything else gets 0, which the shader reads as "rigid" — and
+     reads correctly without a branch, because zero lag is no rotation.
+
+     Only the tail for now. The whiskers are in the same registry but
+     bend around a pivot out at the cheek rather than around their bone's
+     origin, so they would need a per-part pivot the tail does not. */
+  const flex = BONES[bone][0] === 'tail' ? flexByGeo.get(geo) : null;
+  const outer = flex ? flex.o : null;
 
   const n = pos.count;
   const P = new Float32Array(n * 3);
   const N = new Float32Array(n * 3);
   const C = new Float32Array(n * 3);
+  const O = new Float32Array(n);
 
   for (let i = 0; i < n; i++) {
     // Root space, for the extent only — the outline hulls are included
@@ -225,6 +265,8 @@ parts.root.traverse((obj) => {
     } else {
       C[i * 3] = obj.material.color.r; C[i * 3 + 1] = obj.material.color.g; C[i * 3 + 2] = obj.material.color.b;
     }
+
+    O[i] = outer ? outer[i] : 0;
   }
 
   // Un-indexed geometry would be a bug in the model, not something to
@@ -232,7 +274,7 @@ parts.root.traverse((obj) => {
   const idx = geo.index;
   if (!idx) throw new Error(`un-indexed geometry on ${obj.material.type}`);
 
-  items[group].push({ P, N, C, bone, index: idx.array, count: n });
+  items[group].push({ P, N, C, O, bone, index: idx.array, count: n });
   vertexTotal += n;
   indexTotal += idx.count;
 });
@@ -249,9 +291,13 @@ parts.root.traverse((obj) => {
  * authored in before three linearised them. The bone index rides in the
  * colour's fourth byte: it is an integer under 32 and the slot was
  * already being padded.
+ *
+ * The normal's fourth component carries outerness. A three-component
+ * snorm16 attribute is padded to four by the driver anyway, so the
+ * channel that makes the tail soft is, in bytes, free.
  */
 const P = new Float32Array(vertexTotal * 3);
-const N = new Int16Array(vertexTotal * 3);
+const N = new Int16Array(vertexTotal * 4);
 const C = new Uint8Array(vertexTotal * 4);
 
 // The whole cat is well under 65536 vertices, so the element array is
@@ -275,7 +321,10 @@ for (let g = 0; g < items.length; g++) {
     for (let i = 0; i < it.count; i++) {
       const s = (vOff + i) * 3;
       P[s] = it.P[i * 3]; P[s + 1] = it.P[i * 3 + 1]; P[s + 2] = it.P[i * 3 + 2];
-      N[s] = s16(it.N[i * 3]); N[s + 1] = s16(it.N[i * 3 + 1]); N[s + 2] = s16(it.N[i * 3 + 2]);
+
+      const n4 = (vOff + i) * 4;
+      N[n4] = s16(it.N[i * 3]); N[n4 + 1] = s16(it.N[i * 3 + 1]); N[n4 + 2] = s16(it.N[i * 3 + 2]);
+      N[n4 + 3] = s16(it.O[i]);
 
       const c = (vOff + i) * 4;
       C[c] = u8(it.C[i * 3]); C[c + 1] = u8(it.C[i * 3 + 1]); C[c + 2] = u8(it.C[i * 3 + 2]);
@@ -301,6 +350,10 @@ const header = {
   indexCount: indexTotal,
   indexBits: wide ? 32 : 16,
   bounds: { min: lo, max: hi },
+  // Which bone the outerness channel belongs to. The lag angles the
+  // runtime uploads are in this bone's space, so it has to be named
+  // rather than assumed.
+  sway: { bone: 'tail' },
   bones,
   groups,
 };

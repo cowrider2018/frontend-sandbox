@@ -23,7 +23,7 @@
 import { Program } from '../../core/program.js';
 import { PRECISION } from '../../shaders/common.js';
 import { parseCat, Rig, modelMatrix } from './rig.js';
-import { Driver, applyPose } from './pose.js';
+import { Driver, Sway, applyPose } from './pose.js';
 
 const NEAR = 0.05;
 const FAR = 200.0;
@@ -32,7 +32,7 @@ const VERT_CAT = /* glsl */`
 ${PRECISION}
 
 in vec3 aPosition;
-in vec3 aNormal;
+in vec4 aNormal;     // xyz normal, w = outerness along a soft part
 in vec4 aColor;      // rgb sRGB, a = bone index / 255
 
 uniform mat4 uBones[BONE_N];
@@ -41,9 +41,34 @@ uniform vec3 uCamPos, uRight, uUp, uFwd;
 uniform float uFocal, uAspect;
 uniform vec2 uJitter;
 
+/** (pitch, yaw) deflection at each node of the tail's chain. */
+uniform vec2 uSway[SWAY_N];
+
 out vec3 vNormal;
 out vec3 vColor;
 out vec3 vWorld;
+
+/**
+ * How far this vertex trails the base, read out of the chain the CPU
+ * uploaded. Outerness is baked per vertex — 0 all along the rigid parts
+ * of the cat, rising to 1 at the tip of the tail — so this costs one
+ * texture-free lookup and no branch anywhere else in the model.
+ */
+vec2 swayAt(float o) {
+  float x = o * float(SWAY_N - 1);
+  float i = floor(x);
+  int lo = int(i);
+  int hi = min(lo + 1, SWAY_N - 1);
+  return mix(uSway[lo], uSway[hi], x - i);
+}
+
+/** Z then X, the order the model's own deformation used. */
+vec3 swayRotate(vec3 p, vec2 a) {
+  float c = cos(a.y), s = sin(a.y);
+  p = vec3(p.x * c - p.y * s, p.x * s + p.y * c, p.z);
+  c = cos(a.x); s = sin(a.x);
+  return vec3(p.x, p.y * c - p.z * s, p.y * s + p.z * c);
+}
 
 void main() {
   // The bone index rides in the colour's alpha byte. Rounding rather
@@ -52,10 +77,23 @@ void main() {
   int b = int(aColor.a * 255.0 + 0.5);
   mat4 bone = uBones[b];
 
-  vec4 world = uModel * (bone * vec4(aPosition, 1.0));
+  vec3 local = aPosition;
+  vec3 normal = aNormal.xyz;
+
+  // Soft parts bend in their own bone's space, around its origin —
+  // which for the tail is where it meets the body. Everything else has
+  // an outerness of zero and skips it.
+  float o = aNormal.w;
+  if (o > 0.0) {
+    vec2 a = swayAt(o);
+    local = swayRotate(local, a);
+    normal = swayRotate(normal, a);
+  }
+
+  vec4 world = uModel * (bone * vec4(local, 1.0));
   vWorld = world.xyz;
   vColor = aColor.rgb;
-  vNormal = mat3(uModel) * (mat3(bone) * aNormal);
+  vNormal = mat3(uModel) * (mat3(bone) * normal);
 
   // The camera basis is the march's, used the march's way: a ray for
   // NDC (x,y) has view-space direction (x·aspect/focal, y/focal, 1), so
@@ -136,10 +174,17 @@ export class Cat {
     this.header = data.header;
     this.rig = new Rig(data.header);
     this.driver = new Driver();
+    this.sway = new Sway();
+    this.time = 0;
 
     this.program = new Program(gl, VERT_CAT, FRAG_CAT, {
       name: 'cat/mesh',
-      defines: { BONE_N: this.rig.count, NEAR: NEAR.toFixed(4), FAR: FAR.toFixed(1) },
+      defines: {
+        BONE_N: this.rig.count,
+        SWAY_N: this.sway.count,
+        NEAR: NEAR.toFixed(4),
+        FAR: FAR.toFixed(1),
+      },
     });
 
     /* ── buffers ── */
@@ -161,7 +206,7 @@ export class Cat {
     const locNormal = gl.getAttribLocation(this.program.program, 'aNormal');
     this.vboNormal = buf(gl.ARRAY_BUFFER, data.normal);
     gl.enableVertexAttribArray(locNormal);
-    gl.vertexAttribPointer(locNormal, 3, gl.SHORT, true, 0, 0);
+    gl.vertexAttribPointer(locNormal, 4, gl.SHORT, true, 0, 0);
 
     const locColor = gl.getAttribLocation(this.program.program, 'aColor');
     this.vboColor = buf(gl.ARRAY_BUFFER, data.color);
@@ -241,13 +286,23 @@ export class Cat {
     this.z += Math.cos(this.yaw) * this.velocity * d;
 
     const speed = Math.min(1, Math.abs(this.velocity) / TOP_SPEED);
-    applyPose(this.rig, this.driver.step(d, speed, steer));
+    const pose = this.driver.step(d, speed, steer);
+    applyPose(this.rig, pose);
     this.rig.update();
 
+    /* The tail trails the *world* heading, not a bone. In the model this
+       came from, the cat only ever turned by rotating its root; here the
+       turn lives in the model matrix, so that is what the chain has to
+       be driven by — otherwise the tail would hang dead through every
+       corner, which is exactly when a real one swings widest. */
+    this.time += d;
+    this.sway.step(d, this.time, this.yaw, pose.bodyPitch, pose.tailYaw);
+
     // Anything the scene's temporal filter must not hold on to: walking,
-    // but also breathing, a flicking ear, or a blink — which lasts about
-    // six frames and would otherwise resolve as a smear.
-    this.animating = this.velocity !== 0 || this.rig.changed;
+    // but also breathing, a flicking ear, a blink — which lasts about six
+    // frames and would otherwise resolve as a smear — or a tail still
+    // settling after the body has stopped.
+    this.animating = this.velocity !== 0 || this.rig.changed || this.sway.activity > 2e-3;
 
     modelMatrix(this._model, this.x, floorY + this.footOffset, this.z, this.yaw, this.scale);
     return this;
@@ -262,6 +317,8 @@ export class Cat {
     this.releaseKeys();
     this.rig.reset();
     this.driver = new Driver();
+    this.sway = new Sway();
+    this.time = 0;
   }
 
   /**
@@ -300,6 +357,7 @@ export class Cat {
       uFocal: camera.focal,
       uAspect: camera.aspect,
       uJitter: this._jitter,
+      uSway: this.sway.nodes,
       uLightDir: light.dir,
       uTint: light.tint,
       uUnlit: 0,
