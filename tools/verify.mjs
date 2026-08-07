@@ -98,10 +98,9 @@ const SHOTS_PLAN = [
   { name: '12-cat-follow', hash: '#/march?spin=0&scale=1&taa=0.9&camera=follow', settle: 2500,
     pre: 'const c = __aether.scene.cat; c.x = -0.6; c.z = 3.0; c.yaw = 1.57; return true;',
     hold: { key: 'w', ms: 2200 } },
-  // Close enough to read the pose: the follow camera puts you behind the
-  // animal, so this frame is the back of a walking cat and nothing else.
-  // The tail should be arcing up and *behind* it, not out to one side,
-  // and the two diagonals should be plainly out of phase.
+  // Close enough to read the shading: the smooth falloff across the
+  // head, the broad sheen on the brow, and the ink — outline, eyes,
+  // whiskers — still flat on top of it.
   { name: '13-cat-close', hash: '#/march?spin=0&scale=1&taa=0.9&camera=follow', settle: 2500,
     pre: 'const c = __aether.scene.cat; c.x = -0.6; c.z = 3.0; c.yaw = 1.57; return true;',
     hold: { key: 'w', ms: 2200 },

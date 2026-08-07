@@ -22,8 +22,10 @@
    ------------------------------------------------------------------ */
 
 import { Program } from '../../core/program.js';
-import { PRECISION, ROTATE } from '../../shaders/common.js';
-import { CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_SHADOW, SKY } from '../cluster.js';
+import { PRECISION, CONSTANTS, ROTATE, SIMPLEX3 } from '../../shaders/common.js';
+import {
+  CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_LAYERS, CLUSTER_SHADOW, SKY,
+} from '../cluster.js';
 import { parseCat, Rig, modelMatrix } from './rig.js';
 import { Driver, Sway, applyPose } from './pose.js';
 
@@ -238,9 +240,12 @@ void main() {
 
 const FRAG_CAT = /* glsl */`
 ${PRECISION}
+${CONSTANTS}
 ${ROTATE}
+${SIMPLEX3}
 ${CLUSTER_UNIFORMS}
 ${CLUSTER_FIELD}
+${CLUSTER_LAYERS}
 ${CLUSTER_SHADOW}
 ${SKY}
 
@@ -251,7 +256,13 @@ out vec4 outColor;
 
 uniform vec3 uCamPos;
 uniform float uUnlit, uShadowSoft, uFog;
-uniform int uShadowSteps;
+
+/* Fur, in the same two terms the marcher's material() hands its own
+   shading. Rough, so the highlight is a broad sheen rather than a
+   glint; not metal, so it keeps its own colour and only catches a
+   little sky at grazing angles. */
+const float FUR_ROUGH = 0.95;
+const float FUR_METAL = 0.0;
 
 /* The bake stored colours as sRGB bytes because that is the space they
    were authored in and eight bits go furthest there. Everything past
@@ -269,37 +280,45 @@ void main() {
   vec3 rd = -toEye / dist;
 
   if (uUnlit < 0.5) {
+    /* The scene's own shading, term for term, rather than the model's
+       three-step gradient map.
+
+       The toon ramp came from relpet, where the cat is the whole
+       picture and a flat cel look is the point. Here it is one object
+       among several lit by one sun, and quantising only its diffuse
+       made it the single thing in frame that did not respond smoothly
+       to the light — which reads as a cut-out however good its shadow
+       is. The outlines stay: they are ink, not shading, and they are
+       what keeps the drawn look after the lighting stops being drawn. */
     vec3 n = normalize(vNormal);
-    float ndl = max(dot(n, uLightDir), 0.0);
+    vec3 l = uLightDir;
+    vec3 v = -rd;
+    vec3 hv = normalize(l + v);
+    float ndl = max(dot(n, l), 0.0);
 
-    // The model's three-step gradient map, inlined: 176 / 220 / 255 out
-    // of 255, sampled with a nearest filter. Quantising the diffuse term
-    // like this is the entire toon look — everything else is ordinary.
-    float ramp = ndl < 0.3333 ? 0.690 : ndl < 0.6667 ? 0.863 : 1.0;
-
-    /* Is the sun actually reaching this point? The cat asks the same
-       field the marcher does — the shape of it, anyway — so a sphere
-       drifting between the light and the animal darkens the animal. The
-       ray leaves the cluster's bounding sphere almost immediately from
-       out on the open floor, so most of the time this costs one miss.
+    /* Is the sun actually reaching this point? The cat marches the same
+       layered field the marcher shades against, through the same
+       function, so a sphere drifting between the light and the animal
+       darkens it with the identical penumbra.
 
        A surface facing away from the light is unlit whatever the ray
-       finds, so no ray is fired for it. */
+       finds, so no ray is fired for it. Nor does the cat shadow itself:
+       its capsules are a coarse fit that pokes through the real surface
+       in places, and self-shadowing against them is all acne. */
     float sh = 1.0;
     if (ndl > 0.0 && uShadowSoft > 0.0) {
-      sh = clusterShadow(vWorld + n * 0.01, uLightDir, mix(6.0, 26.0, uShadowSoft), uShadowSteps);
+      sh = clusterShadow(vWorld + n * 0.01, l, mix(6.0, 26.0, uShadowSoft));
     }
 
-    /* Floor plus key, normalised so a fully-lit surface lands near 1.0.
-       The scene tonemaps afterwards, and a toon ramp that runs hot just
-       gets crushed flat by the shoulder of the curve.
+    // Blinn-Phong with a roughness-derived exponent, as next door.
+    float spec = pow(max(dot(n, hv), 0.0), mix(400.0, 9.0, FUR_ROUGH))
+               * mix(0.35, 1.6, FUR_METAL);
+    spec *= step(0.0001, ndl);
+    float fresnel = pow(1.0 - max(dot(n, v), 0.0), 5.0);
 
-       The floor is what the shadow cannot take away — it is the sky, not
-       the sun — and it is set low deliberately. The marcher's own
-       ambient is a tenth of its key; a cat with a floor of 0.42 sits in
-       shadow at nearly half brightness while everything around it goes
-       almost black, which is exactly how a sticker behaves. */
-    col = albedo * (0.30 + 0.70 * ramp * sh) * mix(vec3(1.0), uTint, 0.22);
+    col = albedo * (uTint * 2.3 * ndl * sh + vec3(0.10, 0.12, 0.16));
+    col += uTint * spec * sh * 2.0;
+    col += sky(reflect(rd, n)) * (0.06 + fresnel * 0.9);
   }
 
   /* The same distance fog the marcher applies, toward the same horizon.
@@ -753,11 +772,20 @@ export class Cat {
       uFog: env.fog,
       uShadowSoft: env.shadowSoft,
       uShadowSteps: env.shadowSteps,
+      uShadowNoise: env.shadowNoise,
       uTime: env.time,
       uBlend: env.blend,
       uBallPos: env.ballPos,
       uBalls: env.balls,
       uBound: env.bound,
+      uRipples: env.ripples,
+      uRippleOn: env.rippleOn,
+      uRippleAmp: env.rippleAmp,
+      uRippleSpeed: env.rippleSpeed,
+      uRippleFreq: env.rippleFreq,
+      uRippleTight: 5.0,
+      uErode: env.erode,
+      uDisplace: env.displace,
 
       uUnlit: 0,
     });

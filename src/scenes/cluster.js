@@ -14,9 +14,13 @@
    ------------------------------------------------------------------ */
 
 export const BALL_N = 9;        // spheres in the cluster
+export const RIPPLE_N = 4;      // concurrent surface rings
 export const RING_MAJOR = 1.28;
 export const RING_MINOR = 0.075;
 export const FLOOR_Y = -1.35;
+
+/** Peak displacement per unit of the `displace` slider. */
+export const DISPLACE_AMP = 0.12;
 
 /**
  * Everything the shape needs, declared once. A shader that includes
@@ -26,9 +30,11 @@ export const FLOOR_Y = -1.35;
  */
 export const CLUSTER_UNIFORMS = /* glsl */`
 #define BALL_N ${BALL_N}
+#define RIPPLE_N ${RIPPLE_N}
 #define RING_MAJOR ${RING_MAJOR.toFixed(4)}
 #define RING_MINOR ${RING_MINOR.toFixed(4)}
 #define FLOOR_Y ${FLOOR_Y.toFixed(4)}
+#define DISPLACE_AMP ${DISPLACE_AMP.toFixed(4)}
 
 uniform float uTime;
 uniform float uBlend;
@@ -36,6 +42,14 @@ uniform vec4  uBallPos[BALL_N];   // xyz = centre, w = radius
 uniform float uBalls;
 /** xyz = centre, w = radius. Everything the cluster can reach. */
 uniform vec4  uBound;
+
+uniform vec4  uRipples[RIPPLE_N]; // xyz = impact point, w = normalised age
+uniform float uRippleOn, uRippleAmp, uRippleSpeed, uRippleFreq, uRippleTight;
+uniform float uErode, uDisplace;
+
+// Shadow quality, shared so both readers soften identically.
+uniform float uShadowNoise;
+uniform int   uShadowSteps;
 `;
 
 /** Primitives, the smooth minimum, and the ray/sphere span. */
@@ -88,6 +102,146 @@ float clusterBase(vec3 p) {
 `;
 
 /**
+ * The rest of the field, in the layers each consumer can afford.
+ *
+ *   clusterBase   spheres and ring          — the shape
+ *   clusterShape  + impact ripples          — shadows and occlusion
+ *   clusterFull   + surface displacement    — primary rays and normals
+ *
+ * These moved out of the marcher when the cat needed to cast its shadow
+ * ray through the same thing the marcher shades against. A shadow that
+ * walks a simpler field than the surface it lands on is a shadow of a
+ * slightly different object, and the two drift apart exactly when the
+ * scene is at its most active.
+ *
+ * Requires `snoise` and `PI`, so include SIMPLEX3 and CONSTANTS first.
+ */
+export const CLUSTER_LAYERS = /* glsl */`
+/**
+ * Expanding rings from each recorded impact.
+ *
+ * Displacing a distance field is not the same as displacing a mesh:
+ * there is no surface to move, so the ripple is authored as a term
+ * added to the distance itself. Keep the amplitude small — a large one
+ * breaks the field's Lipschitz bound and the sphere tracer starts
+ * overshooting straight through the surface.
+ */
+float ripples(vec3 p) {
+  float sum = 0.0;
+  for (int i = 0; i < RIPPLE_N; i++) {
+    float age = uRipples[i].w;
+    if (age <= 0.0) continue;
+    float d = length(p - uRipples[i].xyz);
+    float front = age * uRippleSpeed;
+    // Tight in space around the travelling front, fading in time.
+    float env = exp(-abs(d - front) * uRippleTight) * (1.0 - age) * (1.0 - age);
+    sum += sin((d - front) * uRippleFreq) * env;
+  }
+  return sum * uRippleAmp;
+}
+
+/** How far the damage can reach at its peak. Harder blows spread further. */
+float erodeReach() { return 0.26 + uErode * 1.15; }
+
+/**
+ * Width of the damaged region's soft edge. Held constant on purpose:
+ * it is what bounds the term's gradient, so the tracer's step budget
+ * does not depend on where in its life an impact happens to be.
+ */
+const float ERODE_EDGE = 0.20;
+
+/**
+ * Mass dissipating under the shock.
+ *
+ * Subtracting a sphere would be the obvious way to open a hole, and it
+ * is exact and cheap — but it leaves a machined circular rim, an edge
+ * no amount of energy would actually produce. This is an *additive*
+ * term instead: it pushes the surface inward wherever the impact's
+ * energy is high, and because the falloff is a smooth blob the surface
+ * tapers away to nothing rather than being cut. Where the dissipation
+ * exceeds the local thickness the surface simply stops existing, which
+ * is how the ring — 0.075 thick — opens a gap and then closes it again
+ * as the energy drains.
+ *
+ * Being additive also means its gradient is amplitude over width rather
+ * than amplitude times frequency, so it feeds the same derived step
+ * bound as everything else instead of needing a special case.
+ */
+float erodeMask(vec3 p) {
+  if (uErode <= 0.0) return 0.0;
+  float reach = erodeReach();
+  float sum = 0.0;
+  for (int i = 0; i < RIPPLE_N; i++) {
+    float age = uRipples[i].w;
+    if (age <= 0.0) continue;
+
+    // What closes is the damaged region's *radius*, not its depth.
+    //
+    // Fading the depth uniformly is the obvious move and it is wrong:
+    // anything small enough to sit entirely inside the damage just
+    // shrinks and then grows back out of its own middle. Contracting the
+    // boundary instead means the outermost material returns first and
+    // the centre is the last thing to close — which is how a hole in
+    // anything actually heals.
+    //
+    // Opens fast, closes slowly: the exponent skews the sine early.
+    float r = reach * sin(PI * pow(age, 0.62));
+    if (r <= 0.0) continue;
+
+    float d = length(p - uRipples[i].xyz);
+    sum += 1.0 - smoothstep(r - ERODE_EDGE, r, d);
+  }
+  return min(sum, 1.0);
+}
+
+float clusterShape(vec3 p) {
+  float d = clusterBase(p);
+  if (uRippleOn > 0.5) {
+    float gone = erodeMask(p);
+
+    // The wave is silenced inside the damage. A travelling sine has
+    // negative phases, and a negative phase pushes the surface *outward*
+    // — so without this the gap grows its own little lump of material at
+    // the centre and carries it out to the rim. Nothing that has been
+    // dissipated is left to carry a wave.
+    d += ripples(p) * (1.0 - gone);
+
+    // In the shape layer, not the full one: a gap has to be a gap for
+    // the shadow and occlusion rays too, or light refuses to come
+    // through something you can see straight out of.
+    d += gone * uErode;
+  }
+  return d;
+}
+
+/**
+ * The full field. The noise is the single most expensive thing here and
+ * it was being evaluated at every march step, every shadow tap and every
+ * AO tap — including at samples nowhere near a surface, where a
+ * displacement of a couple of centimetres cannot possibly change the
+ * answer.
+ *
+ * Outside a band a few amplitudes wide, subtracting the peak amplitude
+ * is a valid lower bound on the true distance: the tracer stays
+ * conservative, never overshoots, and skips the noise entirely.
+ */
+float clusterFull(vec3 p) {
+  float d = clusterShape(p);
+  if (uDisplace <= 0.0) return d;
+
+  float amp = uDisplace * DISPLACE_AMP;
+  if (d > amp * 4.0 + 0.02) return d - amp;
+
+  return d + amp * snoise(p * 3.1 + vec3(0.0, 0.0, uTime * 0.3));
+}
+
+/** The layer shadows and ambient occlusion march. */
+float clusterLit(vec3 p) {
+  return uShadowNoise > 0.5 ? clusterFull(p) : clusterShape(p);
+}
+`;
+
+/**
  * How much of the sun reaches a point, marching the cluster only.
  *
  * IQ's soft shadow: the closest approach along the ray *is* the
@@ -95,21 +249,22 @@ float clusterBase(vec3 p) {
  * sphere, which is what makes shadows on the open floor almost free —
  * and is why anything outside the cluster can afford to ask.
  *
- * The marcher has its own copy of this that walks the full perturbed
- * field. This one is the cheap version, over the shape alone: a
- * consumer that is not itself the surface cannot see a ripple in its
- * own shadow.
+ * One copy, marching the same layered field, with the same step
+ * schedule, for everything that asks. The spheres and the cat get the
+ * identical penumbra out of it because it is identically computed —
+ * which is the only way two objects lit by one sun can look like they
+ * are standing in the same room.
  */
 export const CLUSTER_SHADOW = /* glsl */`
-float clusterShadow(vec3 ro, vec3 rd, float k, int steps) {
+float clusterShadow(vec3 ro, vec3 rd, float k) {
   vec2 span = sphereSpan(ro, rd, uBound.xyz, uBound.w);
   if (span.y <= 0.02) return 1.0;
 
   float res = 1.0;
   float t = max(span.x, 0.06);
-  for (int i = 0; i < 48; i++) {
-    if (i >= steps) break;
-    float h = clusterBase(ro + rd * t);
+  for (int i = 0; i < 64; i++) {
+    if (i >= uShadowSteps) break;
+    float h = clusterLit(ro + rd * t);
     res = min(res, k * h / t);
     t += clamp(h, 0.02, 0.35);
     if (res < 0.004 || t > span.y) break;
