@@ -30,7 +30,7 @@ import {
   BALL_N, RING_MAJOR, RING_MINOR, FLOOR_Y,
   CLUSTER_UNIFORMS, CLUSTER_FIELD, SKY,
 } from './cluster.js';
-import { Cat } from './cat/index.js';
+import { Cat, CAT_PROXY_GLSL, CAT_CAPS } from './cat/index.js';
 
 const RIPPLE_N = 4;    // concurrent surface rings
 
@@ -44,6 +44,12 @@ const LOOK_PER_PIXEL = 0.0026;
 const LOOK_PER_SWEEP = 3.4;
 /** Vertical look is the camera's elevation, and rides much shallower. */
 const PITCH_FROM_LOOK = 0.75;
+
+/* Uploaded in place of the cat's capsules when there is no cat. The
+   shader is gated on the count, but a sampler-free uniform array still
+   has to be given something. */
+const ZERO_CAPS = new Float32Array(CAT_CAPS * 4);
+const ZERO_BOUND = new Float32Array(4);
 
 /** AO weight sum for the reference 5-tap schedule; see ambientOcclusion. */
 const AO_REFERENCE = 0.1959;
@@ -213,6 +219,8 @@ float clusterFull(vec3 p) {
   return d + amp * snoise(p * 3.1 + vec3(0.0, 0.0, uTime * 0.3));
 }
 
+${CAT_PROXY_GLSL}
+
 /** The field shadows and ambient occlusion march. */
 float clusterLit(vec3 p) {
   return uShadowNoise > 0.5 ? clusterFull(p) : clusterShape(p);
@@ -291,8 +299,7 @@ float traceFloor(vec3 ro, vec3 rd) {
  * bounding sphere, which is what makes shadows on the open floor
  * almost free.
  */
-float softShadow(vec3 ro, vec3 rd, float k) {
-  vec2 span = sphereSpan(ro, rd, uBound.xyz, uBound.w);
+float shadowAcross(vec3 ro, vec3 rd, float k, vec2 span) {
   if (span.y <= 0.02) return 1.0;
 
   float res = 1.0;
@@ -308,6 +315,15 @@ float softShadow(vec3 ro, vec3 rd, float k) {
 }
 
 /**
+ * The cluster is marched; the cat is solved. Two different answers to
+ * the same question, each the cheap one for its own shape.
+ */
+float softShadow(vec3 ro, vec3 rd, float k) {
+  float res = shadowAcross(ro, rd, k, sphereSpan(ro, rd, uBound.xyz, uBound.w));
+  return min(res, catShadow(ro, rd, k));
+}
+
+/**
  * Five-tap occlusion, generalised to any tap count. The accumulated
  * weight is normalised against the reference schedule so that changing
  * the tap count changes the cost and not the look.
@@ -318,8 +334,10 @@ float ambientOcclusion(vec3 p, vec3 n) {
   for (int i = 0; i < 8; i++) {
     if (i >= uAoTaps) break;
     float h = 0.02 + 0.14 * float(i) * span;
-    // If the field is closer than h, something is nearby: that is occlusion.
-    occ += (h - clusterLit(p + n * h)) * sca;
+    // If the field is closer than h, something is nearby: that is
+    // occlusion — and the cat counts, so it darkens the floor it stands
+    // on and the crease where it meets a sphere.
+    occ += (h - min(clusterLit(p + n * h), catProxy(p + n * h))) * sca;
     wsum += h * sca;
     sca *= 0.72;
   }
@@ -1453,6 +1471,12 @@ class MarchScene {
       uBallPos: this.ballPos,
       uBalls: this.ballCount,
       uBound: this.bound,
+
+      // The cat, as the shadow and occlusion queries see it.
+      uCatCapA: showCat ? this.cat.capA : ZERO_CAPS,
+      uCatCapB: showCat ? this.cat.capB : ZERO_CAPS,
+      uCatBound: showCat ? this.cat.capBound : ZERO_BOUND,
+      uCatCaps: showCat ? this.cat.capCount : 0,
 
       uRipples: this.ripples,
       uRippleOn: rippleActive > 0 ? 1 : 0,

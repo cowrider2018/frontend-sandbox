@@ -14,10 +14,11 @@
    one attached here is private, and exists only so the cat's own
    triangles sort against each other.
 
-   What is deliberately NOT here yet: the cat is lit by its own toon ramp
-   rather than the scene's light integrator, it casts no shadow, and the
-   spheres cannot see it. That is the next stage — this one is about
-   getting a solid, correctly occluded cat standing on the floor.
+   Light crosses the same boundary, in both directions. The cat fires a
+   shadow ray at the sun through the cluster's own field, so the spheres
+   darken it; and it hands the marcher a handful of capsules hung off its
+   skeleton, so it darkens the floor. Neither side has to know what the
+   other is made of.
    ------------------------------------------------------------------ */
 
 import { Program } from '../../core/program.js';
@@ -28,6 +29,98 @@ import { Driver, Sway, applyPose } from './pose.js';
 
 const NEAR = 0.05;
 const FAR = 200.0;
+
+/** Capsules in the shadow proxy. Seven are used; the slot count is fixed. */
+export const CAT_CAPS = 8;
+
+/**
+ * The cat as the distance field sees it.
+ *
+ * Nothing marches the real mesh — forty thousand triangles is the wrong
+ * shape of problem for a sphere tracer, and the marcher would have to
+ * learn about bones to do it. What goes into the field instead is seven
+ * capsules hung off the same skeleton: a body, a head, four legs and a
+ * tail. They are wrong in every detail and right in outline, which is
+ * all a shadow is.
+ *
+ * Deliberately *not* in the primary field. Rays that draw the picture
+ * still see only the cluster, or you would get a blobby second cat
+ * standing inside the real one. The proxy exists for the queries that
+ * ask "is anything in the way" — shadows and occlusion — and those
+ * cannot tell a capsule from a cat.
+ */
+export const CAT_PROXY_GLSL = /* glsl */`
+#define CAT_CAPS ${CAT_CAPS}
+
+uniform vec4 uCatCapA[CAT_CAPS];   // xyz = one end, w = radius
+uniform vec4 uCatCapB[CAT_CAPS];   // xyz = the other end
+uniform vec4 uCatBound;            // xyz = centre, w = radius
+uniform float uCatCaps;            // how many slots are live, 0 = no cat
+
+float sdCapsule(vec3 p, vec3 a, vec3 b, float r) {
+  vec3 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h) - r;
+}
+
+float catProxy(vec3 p) {
+  if (uCatCaps < 0.5) return 1e9;
+  float d = 1e9;
+  for (int i = 0; i < CAT_CAPS; i++) {
+    if (float(i) >= uCatCaps) break;
+    d = min(d, sdCapsule(p, uCatCapA[i].xyz, uCatCapB[i].xyz, uCatCapA[i].w));
+  }
+  return d;
+}
+
+/**
+ * How much of the sun a point loses to the cat — solved, not marched.
+ *
+ * A soft shadow is the closest the ray ever comes to the occluder,
+ * divided by how far it had gone when it got there. Against a union of
+ * capsules that closest approach has a closed form: the shortest
+ * distance between a ray and a line segment. So there is no loop over t
+ * at all, and the answer is exact rather than sampled.
+ *
+ * It had to become this. Marched, the loop landed inside softShadow,
+ * which the compiler inlines once for the primary ray and again for the
+ * reflection bounce, and the program stopped linking — reported as an
+ * empty log, which is worth knowing. This version is a handful of dot
+ * products per capsule and is strictly the better answer besides: a
+ * sampled march can step straight past the thinnest part of a leg.
+ */
+float catShadow(vec3 ro, vec3 rd, float k) {
+  if (uCatCaps < 0.5) return 1.0;
+
+  float res = 1.0;
+  for (int i = 0; i < CAT_CAPS; i++) {
+    if (float(i) >= uCatCaps) break;
+
+    vec3 a = uCatCapA[i].xyz;
+    vec3 ba = uCatCapB[i].xyz - a;
+    vec3 ao = ro - a;
+    float bb = max(dot(ba, ba), 1e-6);
+    float rb = dot(rd, ba);
+    float ab = dot(ao, ba);
+    float ar = dot(ao, rd);
+
+    // Where along the ray the two lines come closest; rd is unit, so the
+    // denominator is what is left of the segment across the ray.
+    float den = bb - rb * rb;
+    float t = abs(den) > 1e-5 ? (ab * rb - ar * bb) / den : -ar;
+
+    // Clamp to the segment, then re-solve the ray for that point: the
+    // nearest point on an infinite line is often off the end of a leg.
+    float s = clamp((ab + max(t, 0.0) * rb) / bb, 0.0, 1.0);
+    vec3 onSeg = a + ba * s;
+    t = max(dot(onSeg - ro, rd), 0.0);
+
+    float d = length(ro + rd * t - onSeg) - uCatCapA[i].w;
+    if (t > 0.02) res = min(res, k * d / t);
+  }
+  return clamp(res, 0.0, 1.0);
+}
+`;
 
 const VERT_CAT = /* glsl */`
 ${PRECISION}
@@ -345,6 +438,14 @@ export class Cat {
     this.keys = { w: false, a: false, s: false, d: false };
     this._model = new Float32Array(16);
     this._jitter = new Float32Array(2);
+
+    /* The shadow proxy, refilled every frame from the live skeleton.
+       Two ends and a radius per capsule, plus one sphere that contains
+       the lot so a shadow ray can miss the whole animal at once. */
+    this.capA = new Float32Array(CAT_CAPS * 4);
+    this.capB = new Float32Array(CAT_CAPS * 4);
+    this.capBound = new Float32Array(4);
+    this.capCount = 0;
   }
 
   /** Total ground speed, whichever direction it is going. */
@@ -504,7 +605,90 @@ export class Cat {
       || this.rig.changed || this.sway.activity > 2e-3;
 
     modelMatrix(this._model, this.x, floorY + this.footOffset, this.z, this.yaw, this.scale);
+    this._fitProxy();
     return this;
+  }
+
+  /**
+   * Hang the shadow capsules off the posed skeleton.
+   *
+   * Each end is a point in some bone's own space, pushed out through
+   * that bone's world matrix and then the cat's — so the proxy walks,
+   * turns and leans because the skeleton does, with nothing here having
+   * to know what a gait is. The radii are in model units and pick up the
+   * cat's scale on the way through.
+   */
+  _fitProxy() {
+    const B = this._proxyBones ??= {
+      body: this.rig.bone('bodyPivot'), head: this.rig.bone('head'),
+      tail: this.rig.bone('tail'),
+      hipL: this.rig.bone('hipHL'), hipR: this.rig.bone('hipHR'),
+      pawL: this.rig.bone('pawHL'), pawR: this.rig.bone('pawHR'),
+      frontL: this.rig.bone('pawFL'), frontR: this.rig.bone('pawFR'),
+    };
+    const m = this.rig.matrices, M = this._model;
+    let n = 0;
+
+    /** A point in a bone's space, in the world. */
+    const put = (into, bone, lx, ly, lz, w) => {
+      const o = bone * 16;
+      const bx = m[o] * lx + m[o + 4] * ly + m[o + 8] * lz + m[o + 12];
+      const by = m[o + 1] * lx + m[o + 5] * ly + m[o + 9] * lz + m[o + 13];
+      const bz = m[o + 2] * lx + m[o + 6] * ly + m[o + 10] * lz + m[o + 14];
+      const i = n * 4;
+      into[i] = M[0] * bx + M[4] * by + M[8] * bz + M[12];
+      into[i + 1] = M[1] * bx + M[5] * by + M[9] * bz + M[13];
+      into[i + 2] = M[2] * bx + M[6] * by + M[10] * bz + M[14];
+      into[i + 3] = w;
+    };
+
+    const capsule = (bone, a, b, radius) => {
+      put(this.capA, bone, a[0], a[1], a[2], radius * this.scale);
+      put(this.capB, bone, b[0], b[1], b[2], 0);
+      n++;
+    };
+
+    // Torso, from the hips up to the base of the neck.
+    capsule(B.body, [0, 0.1, -0.5], [0, 1.0, 0.5], 0.80);
+    // Head. Its bone sits at the base of the neck, so the ball of the
+    // skull is a radius up its own Y.
+    capsule(B.head, [0, 0.5, 0.1], [0, 1.3, 0.3], 0.95);
+    // Tail, along the bone's own Y — which is where the arc runs after
+    // the bake turns it to sweep out behind.
+    capsule(B.tail, [0, 0, 0], [0, 2.2, -0.6], 0.28);
+    // Legs. The hind pair reaches hip to paw; the front pair hangs from
+    // the shoulder, which is the only joint they have.
+    capsule(B.hipL, [0, -0.2, 0], [0, -0.9, 0.2], 0.34);
+    capsule(B.hipR, [0, -0.2, 0], [0, -0.9, 0.2], 0.34);
+    capsule(B.frontL, [0, -0.1, 0.1], [0, -0.6, 0.3], 0.30);
+    capsule(B.frontR, [0, -0.1, 0.1], [0, -0.6, 0.3], 0.30);
+
+    this.capCount = n;
+
+    /* One sphere around all of it. A shadow ray that misses this never
+       looks at a capsule, which is what keeps the cat almost free for
+       every pixel that is not near it. */
+    let cx = 0, cy = 0, cz = 0;
+    for (let i = 0; i < n; i++) {
+      cx += this.capA[i * 4] + this.capB[i * 4];
+      cy += this.capA[i * 4 + 1] + this.capB[i * 4 + 1];
+      cz += this.capA[i * 4 + 2] + this.capB[i * 4 + 2];
+    }
+    cx /= n * 2; cy /= n * 2; cz /= n * 2;
+
+    let r = 0;
+    for (let i = 0; i < n; i++) {
+      const rad = this.capA[i * 4 + 3];
+      for (const arr of [this.capA, this.capB]) {
+        const d = Math.hypot(arr[i * 4] - cx, arr[i * 4 + 1] - cy, arr[i * 4 + 2] - cz) + rad;
+        if (d > r) r = d;
+      }
+    }
+
+    this.capBound[0] = cx;
+    this.capBound[1] = cy;
+    this.capBound[2] = cz;
+    this.capBound[3] = r;
   }
 
   /** Put it back where it started, standing still. */

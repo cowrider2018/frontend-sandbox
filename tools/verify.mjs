@@ -131,6 +131,21 @@ const SHOTS_PLAN = [
            return true;`,
   })),
 
+  /* The cat's own shadow, thrown long across the floor by a low sun and
+     seen from above so it is the subject rather than a smudge under the
+     feet. Nothing marches the mesh — what casts this is seven capsules
+     hung off the same skeleton. */
+  /* A sun halfway up, for the same reason the check uses one: high and
+     the shadow hides under the cat, near the horizon and the floor has
+     no light on it to lose. */
+  { name: '18-cat-casts',
+    hash: '#/march?spin=0&scale=1&taa=0.9&shadow=1&ao=1&light=0.68,0.667&camera=follow',
+    settle: 2200, freeze: 8.0,
+    poke: `const sc = __aether.scene, c = sc.cat;
+           c.x = 4.2; c.z = 3.4; c.yaw = 1.2;
+           sc.targetDist = 3.6; sc.yaw = 2.4; sc.pitch = 0.66;
+           return true;` },
+
   /* Face on, with the head shaking. Camera-relative mode leaves the
      follow camera's heading free, so it can be parked on the nose while
      the cat turns underneath it — which keeps the whiskers' chain loaded
@@ -1323,6 +1338,81 @@ async function interact(cdp, base, problems) {
   check('the cluster casts a shadow onto the cat',
     unshadowed > 1 && shadowed < unshadowed * 0.85,
     `mean luma ${unshadowed.toFixed(1)} → ${shadowed.toFixed(1)}`);
+
+  /* ── the cat's own shadow ──
+     The other direction: the floor losing light to the animal standing
+     on it. Isolated by hiding the cat, which takes its capsules out of
+     the field with it, and sampling a patch of bare floor beside where
+     it stood — so the cat itself is never in the box either way, and
+     what changes there is only what it was blocking. */
+  /* A sun halfway up. High and the shadow lands under the cat, where
+     the cat hides it; near the horizon and the floor's own ndl drops to
+     nothing, so there is no light there for a shadow to remove. Around
+     thirty degrees the shadow clears the animal and the floor is still
+     lit enough to show it. */
+  await cdp.eval(`location.hash = '#/march?spin=0&scale=0.5&taa=0&shadow=1&ao=1&light=0.68,0.667'; true`);
+  await sleep(1200);
+  /* The locked camera, not the follow one. Hiding the cat also switches
+     follow mode off — there is nothing left to follow — so the camera
+     would jump between the two samples and the frames would not be
+     comparable at all. Orbit stays put whatever the cat is doing. */
+  await cdp.eval(`(() => {
+    const s = __aether.scene, c = s.cat;
+    __aether.clock.paused = true; __aether.clock.time = 8;
+    c.x = 1.9; c.z = 1.9; c.yaw = 1.2;
+    // High enough to see the floor beside the animal: the shadow is
+    // darkest directly beneath it, which is exactly where the cat itself
+    // hides it from a low camera.
+    s.yaw = 0.85; s.pitch = 1.02; s.targetDist = 4.4;
+    return true;
+  })()`);
+  await sleep(900);
+
+  /* Sample where the shadow *must* be rather than hunting for it.
+     A body centre h above the floor throws its shadow h/L.y back along
+     the light, so the landing point is known in world space and can be
+     projected with the same basis the shader rays are built from. A
+     search over the frame keeps finding the cat itself, or the cluster's
+     own much larger shadow; this cannot. */
+  const shadowPatch = () => cdp.eval(`(() => {
+    const sc = __aether.scene, cat = sc.cat, b = sc.basis, L = sc.lightDir, focal = 1.5;
+    const h = 0.55;                       // body centre above the floor
+    const wx = cat.x - L[0] * (h / L[1]);
+    const wz = cat.z - L[2] * (h / L[1]);
+    const rel = [wx - b.pos[0], -1.35 - b.pos[1], wz - b.pos[2]];
+    const vx = rel[0]*b.right[0] + rel[1]*b.right[1] + rel[2]*b.right[2];
+    const vy = rel[0]*b.up[0]    + rel[1]*b.up[1]    + rel[2]*b.up[2];
+    const vz = rel[0]*b.fwd[0]   + rel[1]*b.fwd[1]   + rel[2]*b.fwd[2];
+    const aspect = innerWidth / innerHeight;
+    const px = ((vx * focal / aspect / vz) * 0.5 + 0.5) * innerWidth;
+    const py = (0.5 - (vy * focal / vz) * 0.5) * innerHeight;
+
+    const c = document.getElementById('stage');
+    const sx = px / innerWidth * c.width, sy = py / innerHeight * c.height;
+    const box = c.width * 0.035;
+    const s = document.createElement('canvas');
+    s.width = 32; s.height = 32;
+    const g = s.getContext('2d');
+    g.drawImage(c, sx - box / 2, sy - box / 2, box, box, 0, 0, 32, 32);
+    const d = g.getImageData(0, 0, 32, 32).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += 0.2126*d[i] + 0.7152*d[i+1] + 0.0722*d[i+2];
+    return sum / (d.length / 4);
+  })()`);
+
+  const litByCat = await shadowPatch();
+  await cdp.eval(`__aether.panel.setValues({ cat: false }); true`);
+  await sleep(900);
+  const noCat = await shadowPatch();
+  await cdp.eval(`__aether.panel.setValues({ cat: true }); true`);
+  await sleep(400);
+
+  // The floor's own albedo is nearly black — it is a dark plane with a
+  // grid drawn on it — so the gate is only there to prove something was
+  // lit at all. The drop is what carries the claim.
+  check('the cat casts a shadow onto the floor',
+    noCat > 8 && litByCat < noCat * 0.7,
+    `floor where the shadow lands: ${noCat.toFixed(1)} without the cat → ${litByCat.toFixed(1)} with it`);
 
   // Hand the clock back. Everything below drives the cat with keys, and
   // a paused clock advances nothing.
