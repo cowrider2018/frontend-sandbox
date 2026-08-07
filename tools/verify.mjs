@@ -53,6 +53,9 @@ const SHOTS_PLAN = [
     settle: 5000, click: true, after: 260 },
   { name: '05-ripple', hash: '#/march?spin=0&scale=1&rippleAmp=0.052&rippleFreq=12&rippleSpeed=0.95',
     settle: 5000, click: true, after: 700 },
+  // Deep enough to open a hole clean through a sphere.
+  { name: '07-punch',  hash: '#/march?spin=0&scale=1&crater=0.62&rippleAmp=0.09&rippleLife=3',
+    settle: 5000, click: true, after: 700 },
   { name: '06-lit',    hash: '#/march?light=0.18,0.62&tint=rose&ao=1&shadow=1', settle: 8000 },
 ];
 

@@ -71,6 +71,7 @@ uniform vec4  uBound;
 
 uniform vec4  uRipples[RIPPLE_N]; // xyz = impact point, w = normalised age
 uniform float uRippleOn, uRippleAmp, uRippleSpeed, uRippleFreq, uRippleTight, uRippleGlow;
+uniform float uCrater;
 
 // quality
 uniform int   uSteps, uShadowSteps, uAoTaps, uReflectSteps;
@@ -159,9 +160,41 @@ float ripples(vec3 p) {
   return sum * uRippleAmp;
 }
 
+/**
+ * The bite an impact takes out of the surface.
+ *
+ * The wave is a *perturbation* — it can only push the surface a little
+ * way in or out before it stops being a distance field. Removing
+ * material is a different operation: max(d, −sphere) is an exact
+ * boolean, and the maximum of two 1-Lipschitz fields is still
+ * 1-Lipschitz. So this can go as deep as you like without the tracer
+ * losing its footing. Deep enough and it opens a hole clean through a
+ * sphere, or severs the ring.
+ *
+ * It opens fast and closes as the wave spends itself, so the surface
+ * heals behind the impact rather than staying broken.
+ */
+float crater(vec3 p, float d) {
+  if (uCrater <= 0.0) return d;
+  for (int i = 0; i < RIPPLE_N; i++) {
+    float age = uRipples[i].w;
+    if (age <= 0.0) continue;
+    float r = uCrater * smoothstep(0.0, 0.10, age) * (1.0 - age) * (1.0 - age);
+    if (r <= 0.0) continue;
+    d = max(d, r - length(p - uRipples[i].xyz));
+  }
+  return d;
+}
+
 float clusterShape(vec3 p) {
   float d = clusterBase(p);
-  if (uRippleOn > 0.5) d += ripples(p);
+  if (uRippleOn > 0.5) {
+    d += ripples(p);
+    // In the shape layer, not the full one: a hole has to be a hole for
+    // the shadow and occlusion rays too, or light refuses to come
+    // through something you can see straight out of.
+    d = crater(p, d);
+  }
   return d;
 }
 
@@ -219,9 +252,18 @@ float traceCluster(vec3 ro, vec3 rd, int steps, float tMin) {
   float tEnd = span.y;
 
   // A perturbed field is not a true distance function, so the step has
-  // to be under-relaxed. An unperturbed one does not, and gets the
-  // speed back.
-  float relax = (uDisplace > 0.0 || uRippleOn > 0.5) ? 0.88 : 0.97;
+  // to be under-relaxed — and by how much is not a constant to guess at.
+  // The wave's gradient scales with its own amplitude and frequency, so
+  // the bound is derived from them: crank the depth and the tracer slows
+  // down instead of cutting through the surface.
+  //
+  // The crater is deliberately absent from this: a boolean subtraction
+  // of two 1-Lipschitz fields is still 1-Lipschitz, however deep it
+  // goes, so it costs nothing here.
+  float lip = 1.0;
+  if (uDisplace > 0.0) lip += uDisplace * DISPLACE_AMP * 6.0;
+  if (uRippleOn > 0.5) lip += uRippleAmp * uRippleFreq * 0.9;
+  float relax = 0.97 / lip;
 
   for (int i = 0; i < 256; i++) {
     if (i >= steps) break;
@@ -611,10 +653,15 @@ export default {
     { id: 'displace', type: 'slider', label: '表面擾動', min: 0, max: 1, step: 0.01, value: 0.14 },
 
     { group: '撞擊' },
-    // Capped: past about 0.06 the added term overwhelms the field's
-    // Lipschitz bound and the tracer cuts through surfaces instead of
-    // rippling them.
-    { id: 'rippleAmp', type: 'slider', label: '漣漪深度', min: 0, max: 0.055, step: 0.001, value: 0.042, digits: 3 },
+    // The old 0.055 cap existed because the tracer's step was a fixed
+    // 0.88 and a deeper wave cut straight through the surface. The step
+    // is derived from this value now, so the ceiling can go up — it just
+    // costs frames as you climb.
+    { id: 'rippleAmp', type: 'slider', label: '漣漪深度', min: 0, max: 0.16, step: 0.001, value: 0.042, digits: 3 },
+    // Radius of the bite. A sphere here is 0.30 across its radius and
+    // the ring is 0.075 thick, so ~0.15 severs the ring and ~0.6 opens a
+    // hole clean through a sphere.
+    { id: 'crater', type: 'slider', label: '撞擊坑', min: 0, max: 0.8, step: 0.005, value: 0.14, digits: 2 },
     { id: 'rippleSpeed', type: 'slider', label: '傳播速度', min: 0.2, max: 4, step: 0.01, value: 1.0 },
     { id: 'rippleFreq', type: 'slider', label: '波數', min: 4, max: 60, step: 0.5, value: 16 },
     { id: 'rippleLife', type: 'slider', label: '持續時間', min: 0.4, max: 6, step: 0.05, value: 1.9, unit: 's' },
@@ -1154,6 +1201,7 @@ class MarchScene {
       uRippleFreq: state.rippleFreq,
       uRippleTight: 5.0,
       uRippleGlow: state.flash,
+      uCrater: state.crater,
 
       uSteps: Math.round(state.steps),
       uShadowSteps: Math.round(state.shadowSteps),
