@@ -107,6 +107,30 @@ const SHOTS_PLAN = [
     hold: { key: 'w', ms: 2200 },
     poke: '__aether.scene.targetDist = 1.9; return true;' },
 
+  /* The cat in the cluster's shadow, and the same cat on the sunlit side
+     of it. The pair differs by the cat's position and nothing else.
+
+     The sun is put near the horizon for this. With it high, a cat
+     standing on the floor cannot get behind the cluster at all without
+     standing inside it — there is barely a metre of clearance under the
+     ring — so the only way to have the spheres between the animal and
+     the light is to throw the shadow sideways. */
+  ...[
+    { name: '17-cat-nosun', shadow: 0 },
+    { name: '17-cat-shadowed', shadow: 1 },
+  ].map((s) => ({
+    name: s.name,
+    hash: `#/march?spin=0&scale=1&taa=0.9&shadow=${s.shadow}&light=0.68,0.95&camera=follow`,
+    settle: 2200, freeze: 8.0,
+    // Same cat, same camera, same light. The pair differs by whether the
+    // shadow ray is fired at all, so the difference between the two
+    // frames is the cluster blocking the sun and nothing else.
+    poke: `const sc = __aether.scene, c = sc.cat;
+           c.x = -2.25; c.z = -1.5; c.yaw = 1.9;
+           sc.targetDist = 2.6; sc.yaw = 1.5; sc.pitch = 0.12;
+           return true;`,
+  })),
+
   /* Face on, with the head shaking. Camera-relative mode leaves the
      follow camera's heading free, so it can be parked on the nose while
      the cat turns underneath it — which keeps the whiskers' chain loaded
@@ -114,9 +138,10 @@ const SHOTS_PLAN = [
   { name: '16-cat-face', hash: '#/march?spin=0&scale=1&taa=0.3&camera=follow', settle: 2000,
     pre: `const s = __aether.scene, c = s.cat;
           c.x = 3.0; c.z = 3.0; s.targetDist = 1.7; s.pitch = 0.10;
-          const until = performance.now() + 8000;
+          let stop = false;
+          window.__stopShotHook = () => { stop = true; };
           const shake = () => {
-            if (performance.now() > until) return;
+            if (stop) return;
             c.yaw = 0.45 * Math.sin(performance.now() / 1000 * 7);
             s.yaw = 0;                  // camera parked on the nose
             requestAnimationFrame(shake);
@@ -154,9 +179,10 @@ const SHOTS_PLAN = [
           c.x = 0.2; c.z = 3.2; s.targetDist = 2.6;
           s._setControlMode('look');
           document.exitPointerLock?.();
-          const until = performance.now() + 6000;
+          let stop = false;
+          window.__stopShotHook = () => { stop = true; };
           const spin = () => {
-            if (performance.now() > until) return;   // never outlives the shot
+            if (stop) return;                        // never outlives the shot
             c.look(0.030, 0);
             requestAnimationFrame(spin);
           };
@@ -587,6 +613,13 @@ async function main() {
       await ev('mouseReleased', 0);
       await sleep(shot.after ?? 600);
     }
+
+    /* Kill any per-frame hook a previous shot installed. Shots share one
+       page — only the hash changes — so a `requestAnimationFrame` loop
+       set up to drive one of them keeps running into the next and
+       quietly steers its camera. That is a scaffolding bug that looks
+       exactly like a rendering bug. */
+    await cdp.eval(`window.__stopShotHook?.(); window.__stopShotHook = null; true`);
 
     // Stage the scene before it is driven — where the subject starts
     // decides whether it is still in frame when the shutter opens.
@@ -1248,6 +1281,53 @@ async function interact(cdp, base, problems) {
     Math.abs(whisk.tip) > 1e-3 && Math.abs(whisk.tip) > Math.abs(whisk.mid)
       && whisk.deflect > 1e-3 && whisk.deflect < whisk.tailDeflect,
     `tip lags ${whisk.tip.toFixed(3)} rad; tip deflects ${whisk.deflect.toFixed(3)} vs tail ${whisk.tailDeflect.toFixed(3)}`);
+
+  /* ── the cat in the scene's light ──
+     Isolated by holding everything still and moving one slider. The cat,
+     the camera, the light direction and the clock are all fixed; only
+     the shadow term is switched on. Anything that changes on screen is
+     the cluster blocking the sun, because nothing else can be.
+
+     The cat is parked where the sun, put near the horizon, has the whole
+     cluster between it and the animal. */
+  await cdp.eval(`location.hash = '#/march?spin=0&scale=0.5&taa=0&light=0.68,0.95&shadow=0'; true`);
+  await sleep(1200);
+  await cdp.eval(`(() => {
+    const s = __aether.scene, c = s.cat;
+    __aether.clock.paused = true; __aether.clock.time = 8;
+    c.x = -2.82; c.z = -0.95; c.yaw = 1.9;
+    s.targetDist = 2.6; s.yaw = 1.5; s.pitch = 0.12;
+    return true;
+  })()`);
+  await sleep(900);
+
+  /** Mean luma over a box of the canvas, in CSS pixels. */
+  const patch = () => cdp.eval(`(() => {
+    const c = document.getElementById('stage');
+    const s = document.createElement('canvas');
+    s.width = 96; s.height = 96;
+    const g = s.getContext('2d');
+    // The cat sits mid-frame under this camera; sample only it.
+    g.drawImage(c, c.width * 0.42, c.height * 0.38, c.width * 0.16, c.height * 0.28, 0, 0, 96, 96);
+    const d = g.getImageData(0, 0, 96, 96).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+    return sum / (d.length / 4);
+  })()`);
+
+  const unshadowed = await patch();
+  await cdp.eval(`__aether.panel.setValues({ shadow: 1 }); true`);
+  await sleep(900);
+  const shadowed = await patch();
+
+  check('the cluster casts a shadow onto the cat',
+    unshadowed > 1 && shadowed < unshadowed * 0.85,
+    `mean luma ${unshadowed.toFixed(1)} → ${shadowed.toFixed(1)}`);
+
+  // Hand the clock back. Everything below drives the cat with keys, and
+  // a paused clock advances nothing.
+  await cdp.eval(`__aether.clock.paused = false; true`);
+  await sleep(300);
 
   /* WASD overlaps the app's own shortcuts, so the scene may only claim
      them while there is something to steer. */

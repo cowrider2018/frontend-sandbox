@@ -21,7 +21,8 @@
    ------------------------------------------------------------------ */
 
 import { Program } from '../../core/program.js';
-import { PRECISION } from '../../shaders/common.js';
+import { PRECISION, ROTATE } from '../../shaders/common.js';
+import { CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_SHADOW, SKY } from '../cluster.js';
 import { parseCat, Rig, modelMatrix } from './rig.js';
 import { Driver, Sway, applyPose } from './pose.js';
 
@@ -144,14 +145,20 @@ void main() {
 
 const FRAG_CAT = /* glsl */`
 ${PRECISION}
+${ROTATE}
+${CLUSTER_UNIFORMS}
+${CLUSTER_FIELD}
+${CLUSTER_SHADOW}
+${SKY}
 
 in vec3 vNormal;
 in vec3 vColor;
 in vec3 vWorld;
 out vec4 outColor;
 
-uniform vec3 uCamPos, uLightDir, uTint;
-uniform float uUnlit;
+uniform vec3 uCamPos;
+uniform float uUnlit, uShadowSoft, uFog;
+uniform int uShadowSteps;
 
 /* The bake stored colours as sRGB bytes because that is the space they
    were authored in and eight bits go furthest there. Everything past
@@ -164,6 +171,10 @@ void main() {
   vec3 albedo = srgbToLinear(vColor);
   vec3 col = albedo;
 
+  vec3 toEye = uCamPos - vWorld;
+  float dist = length(toEye);
+  vec3 rd = -toEye / dist;
+
   if (uUnlit < 0.5) {
     vec3 n = normalize(vNormal);
     float ndl = max(dot(n, uLightDir), 0.0);
@@ -173,15 +184,41 @@ void main() {
     // like this is the entire toon look — everything else is ordinary.
     float ramp = ndl < 0.3333 ? 0.690 : ndl < 0.6667 ? 0.863 : 1.0;
 
-    // Floor plus key, normalised so a fully-lit surface lands near 1.0.
-    // The scene tonemaps afterwards, and a toon ramp that runs hot just
-    // gets crushed flat by the shoulder of the curve.
-    col = albedo * (0.42 + 0.58 * ramp) * mix(vec3(1.0), uTint, 0.22);
+    /* Is the sun actually reaching this point? The cat asks the same
+       field the marcher does — the shape of it, anyway — so a sphere
+       drifting between the light and the animal darkens the animal. The
+       ray leaves the cluster's bounding sphere almost immediately from
+       out on the open floor, so most of the time this costs one miss.
+
+       A surface facing away from the light is unlit whatever the ray
+       finds, so no ray is fired for it. */
+    float sh = 1.0;
+    if (ndl > 0.0 && uShadowSoft > 0.0) {
+      sh = clusterShadow(vWorld + n * 0.01, uLightDir, mix(6.0, 26.0, uShadowSoft), uShadowSteps);
+    }
+
+    /* Floor plus key, normalised so a fully-lit surface lands near 1.0.
+       The scene tonemaps afterwards, and a toon ramp that runs hot just
+       gets crushed flat by the shoulder of the curve.
+
+       The floor is what the shadow cannot take away — it is the sky, not
+       the sun — and it is set low deliberately. The marcher's own
+       ambient is a tenth of its key; a cat with a floor of 0.42 sits in
+       shadow at nearly half brightness while everything around it goes
+       almost black, which is exactly how a sticker behaves. */
+    col = albedo * (0.30 + 0.70 * ramp * sh) * mix(vec3(1.0), uTint, 0.22);
   }
+
+  /* The same distance fog the marcher applies, toward the same horizon.
+     Without it the cat stays perfectly crisp while everything around it
+     softens with depth, which reads as a sticker however well it is lit.
+     Applied outside the branch on purpose: the outlines have to fade
+     with the body they wrap, or the cat dissolves and keeps its edges. */
+  col = mix(col, sky(rd), 1.0 - exp(-dist * uFog * 0.045));
 
   // Alpha is the scene's depth channel: distance travelled from the eye,
   // in world units, exactly as the march reports it.
-  outColor = vec4(col, length(vWorld - uCamPos));
+  outColor = vec4(col, dist);
 }
 `;
 
@@ -494,7 +531,7 @@ export class Cat {
    * alpha the scene reads as "nothing here" — 1e4 is what the march
    * writes for sky, and it is well inside half-float range.
    */
-  draw(camera, light, frame = 0) {
+  draw(camera, env, frame = 0) {
     const gl = this.gl;
 
     gl.enable(gl.DEPTH_TEST);
@@ -525,8 +562,19 @@ export class Cat {
       uJitter: this._jitter,
       uSway: this.sway.nodes,
       uWhisker: this.sway.whiskers,
-      uLightDir: light.dir,
-      uTint: light.tint,
+
+      // The scene's light, and the field it has to cast through.
+      uLightDir: env.dir,
+      uTint: env.tint,
+      uFog: env.fog,
+      uShadowSoft: env.shadowSoft,
+      uShadowSteps: env.shadowSteps,
+      uTime: env.time,
+      uBlend: env.blend,
+      uBallPos: env.ballPos,
+      uBalls: env.balls,
+      uBound: env.bound,
+
       uUnlit: 0,
     });
 

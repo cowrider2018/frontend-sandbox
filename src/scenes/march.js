@@ -26,14 +26,13 @@
 import { Program } from '../core/program.js';
 import { Target, DoubleTarget, bindScreen, BLEND } from '../core/gl.js';
 import { PRECISION, CONSTANTS, HASH, COLOR, ROTATE, SIMPLEX3, VERT_FULLSCREEN } from '../shaders/common.js';
+import {
+  BALL_N, RING_MAJOR, RING_MINOR, FLOOR_Y,
+  CLUSTER_UNIFORMS, CLUSTER_FIELD, SKY,
+} from './cluster.js';
 import { Cat } from './cat/index.js';
 
-const BALL_N = 9;      // spheres in the cluster
 const RIPPLE_N = 4;    // concurrent surface rings
-
-const RING_MAJOR = 1.28;
-const RING_MINOR = 0.075;
-const FLOOR_Y = -1.35;
 
 /** Peak displacement per unit of the `displace` slider. */
 const DISPLACE_AMP = 0.12;
@@ -56,10 +55,9 @@ ${HASH}
 ${COLOR}
 ${ROTATE}
 ${SIMPLEX3}
+${CLUSTER_UNIFORMS}
 
-#define BALL_N ${BALL_N}
 #define RIPPLE_N ${RIPPLE_N}
-#define FLOOR_Y ${FLOOR_Y.toFixed(4)}
 #define DISPLACE_AMP ${DISPLACE_AMP.toFixed(4)}
 #define AO_REFERENCE ${AO_REFERENCE.toFixed(6)}
 
@@ -68,15 +66,9 @@ out vec4 outColor;
 
 uniform vec3  uCamPos, uRight, uUp, uFwd;
 uniform vec2  uResolution;
-uniform float uFocal, uTime;
-uniform float uBlend, uDisplace, uRough, uFloorMix;
-uniform vec3  uLightDir, uTint;
+uniform float uFocal;
+uniform float uDisplace, uRough, uFloorMix;
 uniform float uReflect, uFog, uAO, uShadowSoft;
-
-uniform vec4  uBallPos[BALL_N];   // xyz = centre, w = radius
-uniform float uBalls;
-/** xyz = centre, w = radius. Everything the cluster can reach. */
-uniform vec4  uBound;
 
 uniform vec4  uRipples[RIPPLE_N]; // xyz = impact point, w = normalised age
 uniform float uRippleOn, uRippleAmp, uRippleSpeed, uRippleFreq, uRippleTight, uRippleGlow;
@@ -86,42 +78,13 @@ uniform float uErode;
 uniform int   uSteps, uShadowSteps, uAoTaps, uReflectSteps;
 uniform float uShadowNoise, uReflectLit;
 
-/* ═══ primitives ══════════════════════════════════════════════════ */
-
-float sdSphere(vec3 p, float r) { return length(p) - r; }
-
-float sdTorus(vec3 p, vec2 t) {
-  vec2 q = vec2(length(p.xz) - t.x, p.y);
-  return length(q) - t.y;
-}
-
-/** Polynomial smooth minimum — the operator that makes SDFs feel alive. */
-float smin(float a, float b, float k) {
-  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-  return mix(b, a, h) - k * h * (1.0 - h);
-}
-
-/**
- * Entry and exit distance along a ray for a sphere, or (1, -1) if it
- * misses. The direction must be unit length, which makes the
- * quadratic's leading coefficient 1 and the whole thing three dot
- * products. (No back-ticks in here: the shader lives inside a JS
- * template literal and one would end it.)
- */
-vec2 sphereSpan(vec3 ro, vec3 rd, vec3 c, float r) {
-  vec3 oc = ro - c;
-  float b = dot(oc, rd);
-  float k = dot(oc, oc) - r * r;
-  float h = b * b - k;
-  if (h < 0.0) return vec2(1.0, -1.0);
-  h = sqrt(h);
-  return vec2(-b - h, -b + h);
-}
+/* ═══ primitives and the shape ════════════════════════════════════ */
+${CLUSTER_FIELD}
 
 /* ═══ the field, in three layers ══════════════════════════════════
    Each consumer pays only for the detail it can show:
 
-     clusterBase   spheres and ring          — the shape
+     clusterBase   spheres and ring          — the shape, in cluster.js
      clusterShape  + impact ripples          — shadows and AO
      clusterFull   + surface displacement    — primary rays and normals
 
@@ -130,21 +93,6 @@ vec2 sphereSpan(vec3 ro, vec3 rd, vec3 c, float r) {
    ring, and their shadow and self-occlusion are plainly visible. The
    noise is a fifth of that, incoherent, and drifting — whether it needs
    to be in there is a judgement call, so it is a switch.            */
-
-float clusterBase(vec3 p) {
-  float d = 1e9;
-  for (int i = 0; i < BALL_N; i++) {
-    if (float(i) >= uBalls) break;
-    d = smin(d, sdSphere(p - uBallPos[i].xyz, uBallPos[i].w), uBlend);
-  }
-
-  // A ring threading the cluster, on its own slow tumble.
-  float t = uTime * 0.42;
-  vec3 q = p;
-  q.yz = rot2(t * 0.31) * q.yz;
-  q.xz = rot2(t * 0.19) * q.xz;
-  return smin(d, sdTorus(q, vec2(${RING_MAJOR}, ${RING_MINOR})), uBlend * 0.6);
-}
 
 /**
  * Expanding rings from each recorded impact.
@@ -380,19 +328,7 @@ float ambientOcclusion(vec3 p, vec3 n) {
 
 /* ═══ shading ═════════════════════════════════════════════════════ */
 
-vec3 sky(vec3 rd) {
-  float h = rd.y * 0.5 + 0.5;
-  vec3 top = vec3(0.045, 0.062, 0.10);
-  vec3 hor = vec3(0.10, 0.11, 0.135) * 1.1;
-  vec3 bot = vec3(0.015, 0.016, 0.022);
-  vec3 c = mix(bot, hor, smoothstep(0.35, 0.5, h));
-  c = mix(c, top, smoothstep(0.5, 1.0, h));
-  // A soft sun disc so reflections have something to catch.
-  float sun = pow(max(dot(rd, uLightDir), 0.0), 220.0);
-  c += uTint * sun * 4.0;
-  c += uTint * 0.14 * pow(max(dot(rd, uLightDir), 0.0), 5.0);
-  return c;
-}
+${SKY}
 
 vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
   if (mat > 1.5) {
@@ -1557,7 +1493,21 @@ class MarchScene {
           width: this.catRT.width,
           height: this.catRT.height,
         },
-        { dir: this.lightDir, tint },
+        {
+          dir: this.lightDir,
+          tint,
+          fog: 1.0,
+          shadowSoft: state.shadow,
+          // The cat's shadow ray walks the shape alone, so it converges
+          // in fewer steps than the marcher's does over the full field.
+          shadowSteps: Math.min(32, Math.round(state.shadowSteps)),
+          // The cluster, exactly as the marcher will see it this frame.
+          time: clock.time,
+          blend: state.blend,
+          ballPos: this.ballPos,
+          balls: this.ballCount,
+          bound: this.bound,
+        },
         this.frameCount++,
       );
     }
