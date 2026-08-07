@@ -160,8 +160,15 @@ float ripples(vec3 p) {
   return sum * uRippleAmp;
 }
 
-/** How wide the dissipation reaches. Harder blows spread further. */
-float erodeWidth() { return 0.22 + uErode * 0.9; }
+/** How far the damage can reach at its peak. Harder blows spread further. */
+float erodeReach() { return 0.26 + uErode * 1.15; }
+
+/**
+ * Width of the damaged region's soft edge. Held constant on purpose:
+ * it is what bounds the term's gradient, so the tracer's step budget
+ * does not depend on where in its life an impact happens to be.
+ */
+const float ERODE_EDGE = 0.20;
 
 /**
  * Mass dissipating under the shock.
@@ -180,29 +187,50 @@ float erodeWidth() { return 0.22 + uErode * 0.9; }
  * than amplitude times frequency, so it feeds the same derived step
  * bound as everything else instead of needing a special case.
  */
-float erosion(vec3 p) {
+/** How thoroughly the material at p has been dissipated, 0 to 1. */
+float erodeMask(vec3 p) {
   if (uErode <= 0.0) return 0.0;
-  float w = erodeWidth();
+  float reach = erodeReach();
   float sum = 0.0;
   for (int i = 0; i < RIPPLE_N; i++) {
     float age = uRipples[i].w;
     if (age <= 0.0) continue;
-    // Energy: peaks just after the blow, then drains away.
-    float e = smoothstep(0.0, 0.10, age) * (1.0 - age) * (1.0 - age);
-    float d = length(p - uRipples[i].xyz) / w;
-    sum += e * exp(-d * d);
+
+    // What closes is the damaged region's *radius*, not its depth.
+    //
+    // Fading the depth uniformly is the obvious move and it is wrong:
+    // anything small enough to sit entirely inside the damage just
+    // shrinks and then grows back out of its own middle. Contracting the
+    // boundary instead means the outermost material returns first and
+    // the centre is the last thing to close — which is how a hole in
+    // anything actually heals.
+    //
+    // Opens fast, closes slowly: the exponent skews the sine early.
+    float r = reach * sin(PI * pow(age, 0.62));
+    if (r <= 0.0) continue;
+
+    float d = length(p - uRipples[i].xyz);
+    sum += 1.0 - smoothstep(r - ERODE_EDGE, r, d);
   }
-  return sum * uErode;
+  return min(sum, 1.0);
 }
 
 float clusterShape(vec3 p) {
   float d = clusterBase(p);
   if (uRippleOn > 0.5) {
-    d += ripples(p);
+    float gone = erodeMask(p);
+
+    // The wave is silenced inside the damage. A travelling sine has
+    // negative phases, and a negative phase pushes the surface *outward*
+    // — so without this the gap grows its own little lump of material at
+    // the centre and carries it out to the rim. Nothing that has been
+    // dissipated is left to carry a wave.
+    d += ripples(p) * (1.0 - gone);
+
     // In the shape layer, not the full one: a gap has to be a gap for
     // the shadow and occlusion rays too, or light refuses to come
     // through something you can see straight out of.
-    d += erosion(p);
+    d += gone * uErode;
   }
   return d;
 }
@@ -273,8 +301,11 @@ float traceCluster(vec3 ro, vec3 rd, int steps, float tMin) {
   if (uDisplace > 0.0) lip += uDisplace * DISPLACE_AMP * 6.0;
   if (uRippleOn > 0.5) {
     lip += uRippleAmp * uRippleFreq * 0.9;
-    // A Gaussian's steepest slope is its amplitude over its width.
-    lip += uErode * 0.9 / erodeWidth();
+    // A smoothstep's steepest slope is 1.5 over its width, and that
+    // width is fixed, so this term does not grow as the damage opens.
+    // Both the dissipation itself and the wave it silences ride the same
+    // edge, so both are charged against it.
+    lip += (uErode + uRippleAmp) * 1.5 / ERODE_EDGE;
   }
   float relax = 0.97 / lip;
 

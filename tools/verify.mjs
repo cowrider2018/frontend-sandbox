@@ -56,6 +56,18 @@ const SHOTS_PLAN = [
   // Enough dissipation to open a gap in the ring and eat into a sphere.
   { name: '07-erode',  hash: '#/march?spin=0&scale=1&erode=0.4&rippleAmp=0.09&rippleLife=3',
     settle: 5000, click: true, after: 700 },
+
+  // One impact, photographed at four points in its life. Clock frozen
+  // and the age pinned, so these four frames differ by the age alone.
+  ...[0.15, 0.35, 0.55, 0.78].map((age, i) => ({
+    name: `08-heal-${'abcd'[i]}`,
+    hash: '#/march?spin=0&scale=1&erode=0.42&rippleAmp=0.02&taa=0.9',
+    settle: 3500,
+    freeze: 8.0,
+    click: true,
+    after: 200,
+    poke: `const s = __aether.scene; s._rippleAge[0] = ${age}; s.flash = 0; return true;`,
+  })),
   { name: '06-lit',    hash: '#/march?light=0.18,0.62&tint=rose&ao=1&shadow=1', settle: 8000 },
 ];
 
@@ -480,6 +492,15 @@ async function main() {
       await sleep(60);
       await ev('mouseReleased', 0);
       await sleep(shot.after ?? 600);
+    }
+
+    // Reach into the scene and pin state that time would otherwise carry
+    // past. With the clock frozen an impact stays at whatever age you
+    // set, which is the only way to photograph one stage of an animation
+    // and compare it against another.
+    if (shot.poke) {
+      await cdp.eval(`(() => { ${shot.poke} })()`);
+      await sleep(1400);
     }
 
     const diag = await cdp.eval(`(() => {
