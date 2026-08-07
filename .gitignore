@@ -1,8 +1,12 @@
 # Acceptance screenshots — regenerate with `node tools/verify.mjs`
 tools/shots/
 
-# Personal permission overrides
-.claude/settings.local.json
+# Machine-local agent config; only skills are shared
+.claude/*
+!.claude/skills/
+
+# Local-only working notes
+CLAUDE.md
 
 # OS noise
 Thumbs.db
