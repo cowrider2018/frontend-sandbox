@@ -236,12 +236,30 @@ export function buildCat(THREE, opts = {}) {
   bodyMesh.position.set(0, -BODY_CUT_Y, 0);
   bodyG.add(bodyMesh);
   const BODY_TILT = THREE.MathUtils.degToRad(35);
+  /* ── 卵形收窄 ──
+   * 球體 → 蛋：沿長軸把「垂直於長軸的整個截面」等比縮小，前端縮、後端不縮。
+   * 縮的是整整一圈（x 與 z 同時），不是單一方向 —— 只縮 x 是把身體壓扁，
+   * 只縮 z 是把身體縮短，兩者都不是蛋。
+   *
+   * 長軸是橢球自身的 y：前傾 35° 之後它指向「前上方」，而頭正是接在那裡
+   * （HEAD_ON_BODY 在 bodyMesh 空間是 +y +z）。所以往 +y 收＝收胸廓，
+   * 而髖部（-y，前傾後落在後下方）維持原寬。
+   */
+  // 最前端的截面縮多少（0 = 不收，0.16 = 窄 16%）。
+  const BODY_FRONT_NARROW = 0.06;
+  // 從長軸的哪裡開始收（-1 臀部、0 最寬的那一圈、+1 胸口最前）。
+  // 設在最寬處**之前**，收窄才會真的切過那一圈；設 0 以上等於只削前端一點。
+  const BODY_NARROW_FROM = -0.95;
   {
     const geo = new THREE.SphereGeometry(1.0, 52, 44);
     const rx = 1.12, ry = 1.06, rz = 1.14;                // 更胖(x,z)、更短(y 長軸)
     const ct = Math.cos(BODY_TILT), st = Math.sin(BODY_TILT);
     deform(geo, (v) => {
-      let x = v.x * rx, y = v.y * ry, z = v.z * rz;        // 1) 橢圓
+      // smoothstep 兩端斜率為 0：收窄平滑地長出來，不會在腰上生出新的折角。
+      const narrow = 1 - BODY_FRONT_NARROW * smooth(v.y, BODY_NARROW_FROM, 1);
+
+      // 1) 橢圓 + 卵形收窄：長軸 y 不動，截面 (x, z) 整圈同比例縮
+      let x = v.x * rx * narrow, y = v.y * ry, z = v.z * rz * narrow;
       const y2 = y * ct - z * st, z2 = y * st + z * ct;    // 2) 繞 X 前傾 35°（頂端往 +z）
       y = y2; z = z2;
       if (y < BODY_CUT_Y) y = BODY_CUT_Y;                  // 3) 水平切出平底（法線朝正下方）
@@ -260,7 +278,7 @@ export function buildCat(THREE, opts = {}) {
   for (const s of [-1, 1]) {
     // 髖關節樞紐（大腿頂後方）→ 整條後腿繞此上抬
     const hip = new THREE.Group();
-    hip.position.set(s * 0.92, -0.45, -0.4);
+    hip.position.set(s * 0.82, -0.45, -0.45);
     // 大腿 / 後臀（掛在髖上；與身體之間有黑邊）
     const tg = new THREE.SphereGeometry(0.46, 26, 20);
     deform(tg, (v) => { v.z *= 1.12; });                // 略前後拉長
