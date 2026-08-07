@@ -9,7 +9,7 @@
 
    The split is the one the original model used, and it is worth keeping:
    `applyPose` is the contract with the skeleton, so a different driver
-   (relpet's mood brain, say, or a path follower) can be swapped in later
+   (a mood brain, say, or a path follower) can be swapped in later
    without touching a single bone name.
    ------------------------------------------------------------------ */
 

@@ -20,12 +20,16 @@
  *   header   JSON, padded to four bytes
  *   position float32 × 3          — the one thing a wrong bit shows in
  *   normal   snorm16 × 4          — .xyz normal, .w outerness for sway
- *   colour   uint8 × 4            — sRGB, with the bone index in .a
+ *   colour   uint8 × 4, once per skin — sRGB, bone index in .a
  *   index    uint16 (or uint32)
+ *
+ * The colourways share everything but their palette, so the geometry is
+ * stored once and only the colour block repeats. Switching skin is then
+ * one buffer upload rather than another cat.
  */
 export function parseCat(buffer) {
   const view = new DataView(buffer);
-  if (view.getUint32(0, false) !== 0x43415431) throw new Error('cat.bin: bad magic');
+  if (view.getUint32(0, false) !== 0x43415432) throw new Error('cat.bin: bad magic');
 
   const headerLength = view.getUint32(4, true);
   const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 8, headerLength)));
@@ -36,12 +40,18 @@ export function parseCat(buffer) {
   let o = 8 + headerLength + pad(headerLength);
   const position = new Float32Array(buffer, o, nv * 3); o += nv * 12;
   const normal = new Int16Array(buffer, o, nv * 4); o += nv * 8;
-  const color = new Uint8Array(buffer, o, nv * 4); o += nv * 4;
+
+  const colors = new Map();
+  for (const name of header.skins) {
+    colors.set(name, new Uint8Array(buffer, o, nv * 4));
+    o += nv * 4;
+  }
+
   const index = header.indexBits === 32
     ? new Uint32Array(buffer, o, ni)
     : new Uint16Array(buffer, o, ni);
 
-  return { header, position, normal, color, index };
+  return { header, position, normal, colors, index };
 }
 
 /* ═══ the rig ═════════════════════════════════════════════════════ */

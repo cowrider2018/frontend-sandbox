@@ -1,15 +1,15 @@
 /* ── tools/bake-cat.mjs ──────────────────────────────────────────────
-   Bake relpet's procedural cat into a flat binary this project can draw
-   without three.js.
+   Bake the procedural cat in tools/cat-model.js into a flat binary the
+   app can draw without three.js.
 
-     node tools/bake-cat.mjs [--skin orangin] [--out src/scenes/cat/cat.bin]
+     node tools/bake-cat.mjs [--skins a,b,c] [--out src/scenes/cat/cat.bin]
 
    WHY THIS EXISTS
    ---------------
-   `cat-model.js` builds the cat out of ~40 deformed spheres, tubes and
-   boxes, and it takes THREE as an argument rather than importing it —
-   which is the whole reason this is possible. We run it once, here, in
-   Node, and throw the library away: what ships is vertices.
+   `tools/cat-model.js` builds the cat out of ~40 deformed spheres, tubes
+   and boxes, and it takes THREE as an argument rather than importing it,
+   which is what lets this run headless. We run it once, here, in Node,
+   and throw the library away: what ships is vertices.
 
    WHAT COMES OUT
    --------------
@@ -41,27 +41,45 @@ const value = (name, fallback) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
 };
 
-/* The model and the library both live in the sibling relpet checkout.
-   This is a build step run by hand, not part of the app, so pointing at
-   a sibling directory is honest rather than fragile — and both paths are
-   overridable when it moves. */
-const RELPET = resolve(ROOT, value('relpet', '../relpet'));
-const THREE_PATH = resolve(RELPET, 'node_modules/three/build/three.module.js');
-const MODEL_PATH = resolve(RELPET, 'public/cat-model.js');
+/* Both the model and the library it is written against live here, in
+   tools/. Nothing outside this repository is read, so the cat can still
+   be rebuilt long after wherever it came from is gone — which is the
+   only reason to keep a bake step at all rather than shipping the
+   binary and forgetting how it was made.
+
+   tools/ is cold path: none of this is served, bundled or imported by
+   the app, which still has no runtime dependencies whatsoever. */
+const THREE_PATH = resolve(ROOT, 'tools/vendor/three.module.min.js');
+const MODEL_PATH = resolve(ROOT, 'tools/cat-model.js');
 
 const OUT = resolve(ROOT, value('out', 'src/scenes/cat/cat.bin'));
-const SKIN = value('skin', 'orangin');
+
+/* Every colourway goes into one file. They differ only in vertex
+   colour — same vertices, same normals, same indices, same bones —
+   so paying for the geometry once and the palettes three times is
+   most of a megabyte cheaper than three whole cats, and switching
+   between them at runtime is one buffer upload instead of a reload. */
+const SKINS_WANTED = value('skins', 'orangin,tabby,calico').split(',');
 
 const THREE = await import(pathToFileURL(THREE_PATH).href);
 const { buildCat, SKINS } = await import(pathToFileURL(MODEL_PATH).href);
 
-if (!SKINS[SKIN]) {
-  console.error(`unknown skin "${SKIN}" — have: ${Object.keys(SKINS).join(', ')}`);
+for (const name of SKINS_WANTED) {
+  if (SKINS[name]) continue;
+  console.error(`unknown skin "${name}" — have: ${Object.keys(SKINS).join(', ')}`);
   process.exit(1);
 }
 
 /* ═══ build ═══════════════════════════════════════════════════════ */
 
+/**
+ * Walk one colourway of the model into flat arrays.
+ *
+ * Called once per skin. Everything but the vertex colours comes out
+ * identical every time — the palette cannot move a vertex — and the
+ * caller asserts exactly that rather than assuming it.
+ */
+function collect(SKIN) {
 const parts = buildCat(THREE, { skin: SKIN, gradientMap: null });
 
 /**
@@ -144,12 +162,11 @@ const boneWorld = BONES.map(([, obj, pivot]) => {
 /**
  * Fixed rotations applied to a bone's vertices, in that bone's own space.
  *
- * The tail was authored for relpet, where the camera is locked to a
- * three-quarter view of a cat that never turns around: its curve lies in
- * the XY plane, so the arc reads as a silhouette from the side. Under a
- * free camera that is just a tail sticking out sideways. Rotating it a
- * quarter turn about Y swings the arc into the YZ plane, so it sweeps up
- * and *behind* the animal and reads from anywhere.
+ * The tail's curve lies in the XY plane, so it arcs out to one side of
+ * the body. That reads under a camera locked to a three-quarter view;
+ * under this scene's free one it is a tail sticking out of a flank.
+ * Rotating it a quarter turn about Y swings the arc into the YZ plane,
+ * so it sweeps up and *behind* the animal and reads from anywhere.
  *
  * Baked into the vertices rather than added to the bone's rest rotation
  * on purpose: it has to apply *after* the pose, or it would take the
@@ -331,6 +348,28 @@ parts.root.traverse((obj) => {
   indexTotal += idx.count;
 });
 
+return { bones, items, vertexTotal, indexTotal, bounds: { min: lo, max: hi }, whiskers: whiskers.length };
+}
+
+/* ═══ collect every colourway ═════════════════════════════════════ */
+
+const takes = SKINS_WANTED.map(collect);
+const base = takes[0];
+
+/* The palette cannot move a vertex, so every take must agree on
+   geometry. Asserted rather than assumed: a skin that quietly changed
+   the head's subdivision would otherwise pack its colours against
+   somebody else's vertices, and the cat would come out tie-dyed. */
+for (let i = 1; i < takes.length; i++) {
+  const t = takes[i];
+  if (t.vertexTotal !== base.vertexTotal || t.indexTotal !== base.indexTotal) {
+    console.error(`skin "${SKINS_WANTED[i]}" does not share the geometry of "${SKINS_WANTED[0]}"`);
+    process.exit(1);
+  }
+}
+
+const { bones, items, vertexTotal, indexTotal } = base;
+
 /* ═══ pack ════════════════════════════════════════════════════════ */
 
 /**
@@ -350,7 +389,8 @@ parts.root.traverse((obj) => {
  */
 const P = new Float32Array(vertexTotal * 3);
 const N = new Int16Array(vertexTotal * 4);
-const C = new Uint8Array(vertexTotal * 4);
+/** One colour block per skin, laid end to end in the order requested. */
+const C = takes.map(() => new Uint8Array(vertexTotal * 4));
 
 // The whole cat is well under 65536 vertices, so the element array is
 // half the size it would otherwise be — and indices are the largest
@@ -369,7 +409,8 @@ let vOff = 0, iOff = 0;
 for (let g = 0; g < items.length; g++) {
   const start = iOff;
 
-  for (const it of items[g]) {
+  for (let itemIndex = 0; itemIndex < items[g].length; itemIndex++) {
+    const it = items[g][itemIndex];
     for (let i = 0; i < it.count; i++) {
       const s = (vOff + i) * 3;
       P[s] = it.P[i * 3]; P[s + 1] = it.P[i * 3 + 1]; P[s + 2] = it.P[i * 3 + 2];
@@ -378,10 +419,17 @@ for (let g = 0; g < items.length; g++) {
       N[n4] = s16(it.N[i * 3]); N[n4 + 1] = s16(it.N[i * 3 + 1]); N[n4 + 2] = s16(it.N[i * 3 + 2]);
       N[n4 + 3] = s16(it.O[i]);
 
+      /* Every skin's colours, written at the same vertex. The takes walk
+         the same graph in the same order, so `items[g][k]` is the same
+         mesh in each of them and the indices below line up for all. */
       const c = (vOff + i) * 4;
-      C[c] = u8(it.C[i * 3]); C[c + 1] = u8(it.C[i * 3 + 1]); C[c + 2] = u8(it.C[i * 3 + 2]);
-      // Bone in the low five bits, sway group in the top three.
-      C[c + 3] = it.bone | (it.sway << 5);
+      for (let t = 0; t < takes.length; t++) {
+        const src = takes[t].items[g][itemIndex].C;
+        C[t][c] = u8(src[i * 3]); C[t][c + 1] = u8(src[i * 3 + 1]); C[t][c + 2] = u8(src[i * 3 + 2]);
+        // Bone in the low five bits, sway group in the top three. Same
+        // for every skin, so any take could have supplied it.
+        C[t][c + 3] = it.bone | (it.sway << 5);
+      }
     }
     // Indices are absolute into the merged buffer, so the whole cat is
     // one element array and a group is a range inside it.
@@ -397,15 +445,17 @@ for (let g = 0; g < items.length; g++) {
 /* ═══ write ═══════════════════════════════════════════════════════ */
 
 const header = {
-  format: 'cat1',
-  skin: SKIN,
+  format: 'cat2',
+  /* Every colourway in the file, in the order their blocks appear. The
+     first is what loads unless the scene asks otherwise. */
+  skins: SKINS_WANTED,
   vertexCount: vertexTotal,
   indexCount: indexTotal,
   indexBits: wide ? 32 : 16,
-  bounds: { min: lo, max: hi },
+  bounds: base.bounds,
   // The chains the runtime has to drive, and what each one bends. The
   // angles it uploads are in the bending bone's own space.
-  sway: { tail: 'tail', whiskers: whiskers.length },
+  sway: { tail: 'tail', whiskers: base.whiskers },
   bones,
   groups,
 };
@@ -414,25 +464,27 @@ const headerBytes = new TextEncoder().encode(JSON.stringify(header));
 const pad = (n) => (4 - (n % 4)) % 4;
 const headerPadded = headerBytes.length + pad(headerBytes.length);
 
-const total = 8 + headerPadded + P.byteLength + N.byteLength + pad(N.byteLength) + C.byteLength + I.byteLength;
+const colourBytes = C.reduce((n, c) => n + c.byteLength, 0);
+const total = 8 + headerPadded + P.byteLength + N.byteLength + pad(N.byteLength)
+            + colourBytes + I.byteLength;
 const out = new Uint8Array(total);
 const view = new DataView(out.buffer);
 
-view.setUint32(0, 0x43415431, false);        // 'CAT1'
+view.setUint32(0, 0x43415432, false);        // 'CAT2'
 view.setUint32(4, headerBytes.length, true);
 out.set(headerBytes, 8);
 
 let o = 8 + headerPadded;
 out.set(new Uint8Array(P.buffer), o); o += P.byteLength;
 out.set(new Uint8Array(N.buffer), o); o += N.byteLength + pad(N.byteLength);
-out.set(C, o); o += C.byteLength;
+for (const c of C) { out.set(c, o); o += c.byteLength; }
 out.set(new Uint8Array(I.buffer), o);
 
 await mkdir(dirname(OUT), { recursive: true });
 await writeFile(OUT, out);
 
 const kb = (n) => `${(n / 1024).toFixed(1)} kB`;
-console.log(`baked "${SKIN}" → ${OUT}`);
+console.log(`baked ${SKINS_WANTED.length} skins (${SKINS_WANTED.join(', ')}) → ${OUT}`);
 console.log(`  ${vertexTotal} vertices · ${indexTotal / 3} triangles · ${bones.length} bones`);
 console.log(`  groups: ${groups.map((g) => `${g.name} ${g.count / 3}△`).join(' · ')}`);
-console.log(`  ${kb(total)} total (header ${kb(headerBytes.length)}, pos ${kb(P.byteLength)}, nrm ${kb(N.byteLength)}, col ${kb(C.byteLength)}, idx ${kb(I.byteLength)})`);
+console.log(`  ${kb(total)} total (header ${kb(headerBytes.length)}, pos ${kb(P.byteLength)}, nrm ${kb(N.byteLength)}, col ${kb(colourBytes)} for ${C.length}, idx ${kb(I.byteLength)})`);

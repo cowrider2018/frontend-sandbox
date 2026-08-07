@@ -283,13 +283,13 @@ void main() {
     /* The scene's own shading, term for term, rather than the model's
        three-step gradient map.
 
-       The toon ramp came from relpet, where the cat is the whole
-       picture and a flat cel look is the point. Here it is one object
-       among several lit by one sun, and quantising only its diffuse
-       made it the single thing in frame that did not respond smoothly
-       to the light — which reads as a cut-out however good its shadow
-       is. The outlines stay: they are ink, not shading, and they are
-       what keeps the drawn look after the lighting stops being drawn. */
+       The model arrives with a three-step gradient map, which suits a
+       cat that is the whole picture. Here it is one object among
+       several lit by one sun, and quantising only its diffuse made it
+       the single thing in frame that did not respond smoothly to the
+       light — which reads as a cut-out however good its shadow is. The
+       outlines stay: they are ink, not shading, and they are what keeps
+       the drawn look after the lighting stops being drawn. */
     vec3 n = normalize(vNormal);
     vec3 l = uLightDir;
     vec3 v = -rd;
@@ -413,8 +413,14 @@ export class Cat {
     gl.enableVertexAttribArray(locNormal);
     gl.vertexAttribPointer(locNormal, 4, gl.SHORT, true, 0, 0);
 
+    /* The colour buffer is the only thing a skin owns, so it is sized
+       once and refilled on a change rather than rebuilt. */
+    this.colors = data.colors;
+    this.skins = data.header.skins;
+    this.skin = this.skins[0];
+
     const locColor = gl.getAttribLocation(this.program.program, 'aColor');
-    this.vboColor = buf(gl.ARRAY_BUFFER, data.color);
+    this.vboColor = buf(gl.ARRAY_BUFFER, this.colors.get(this.skin), gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(locColor);
     // Not normalised for .a alone is not an option, so the bone index is
     // un-normalised in the shader instead.
@@ -478,6 +484,17 @@ export class Cat {
 
   releaseKeys() {
     this.keys.w = this.keys.a = this.keys.s = this.keys.d = false;
+  }
+
+  /** Swap the colourway. One buffer upload; the geometry is shared. */
+  setSkin(name) {
+    if (name === this.skin || !this.colors.has(name)) return false;
+    this.skin = name;
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboColor);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.colors.get(name));
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    return true;
   }
 
   setMode(mode) {

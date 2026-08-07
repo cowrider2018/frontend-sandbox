@@ -563,6 +563,12 @@ export default {
 
     { group: '貓' },
     { id: 'cat', type: 'switch', label: '顯示貓', value: true },
+    { id: 'skin', type: 'select', label: '花色', value: 'orangin',
+      options: [
+        { value: 'orangin', label: '橘白' },
+        { value: 'tabby', label: '虎斑' },
+        { value: 'calico', label: '三花' },
+      ] },
     { id: 'camera', type: 'select', label: '鏡頭', value: 'orbit',
       options: [
         { value: 'orbit', label: '鎖定星體' },
@@ -1243,6 +1249,9 @@ class MarchScene {
     const showCat = Boolean(this.cat && state.cat);
     this._showCat = showCat;                    // read by onKey, which has no state
     if (showCat) {
+      // Changing the colourway invalidates the accumulated history the
+      // same way moving does — the pixels change without the cat having.
+      if (this.cat.setSkin(state.skin)) this.moving = 1;
       this._feedLook(pointer);
       // Last frame's basis, deliberately: the camera has not been moved
       // yet this frame, and steering off the picture the user is

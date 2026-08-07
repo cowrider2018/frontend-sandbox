@@ -145,6 +145,19 @@ const SHOTS_PLAN = [
            sc.targetDist = 3.6; sc.yaw = 2.4; sc.pitch = 0.66;
            return true;` },
 
+  /* The three colourways. They share one set of vertices, one set of
+     normals and one element array — only the palette differs — so these
+     three frames are the same cat with a different buffer bound. */
+  ...['orangin', 'tabby', 'calico'].map((skin) => ({
+    name: `19-skin-${skin}`,
+    hash: `#/march?spin=0&scale=1&taa=0.9&camera=follow&skin=${skin}`,
+    settle: 2000, freeze: 8.0,
+    poke: `const sc = __aether.scene, c = sc.cat;
+           c.x = 3.0; c.z = 3.0; c.yaw = 0.35;
+           sc.targetDist = 2.0; sc.yaw = 0.0; sc.pitch = 0.16;
+           return true;`,
+  })),
+
   /* Face on, with the head shaking. Camera-relative mode leaves the
      follow camera's heading free, so it can be parked on the nose while
      the cat turns underneath it — which keeps the whiskers' chain loaded
