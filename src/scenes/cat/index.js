@@ -257,12 +257,19 @@ out vec4 outColor;
 uniform vec3 uCamPos;
 uniform float uUnlit, uShadowSoft, uFog;
 
-/* Fur, in the same two terms the marcher's material() hands its own
-   shading. Rough, so the highlight is a broad sheen rather than a
-   glint; not metal, so it keeps its own colour and only catches a
-   little sky at grazing angles. */
-const float FUR_ROUGH = 0.95;
-const float FUR_METAL = 0.0;
+/* Fur is not a polished surface, so it does not get a polished
+   surface's highlight. What it has is a sheen: light catching the pile
+   at grazing angles, broad and soft, brightest around the silhouette.
+
+   Broad is the operative word. A Blinn lobe tight enough to read as a
+   highlight raises a dot product to about the 28th power, and that is
+   an error amplifier — it turns a small disagreement between
+   neighbouring normals into a visible seam. Sheen is a low power of a
+   grazing term and stays quiet over the same normals. */
+const float FUR_SHEEN = 0.55;
+const float FUR_SHEEN_POWER = 3.0;
+/** How much sky the coat catches. Far less than the metal next door. */
+const float FUR_SKY = 0.30;
 
 /* The bake stored colours as sRGB bytes because that is the space they
    were authored in and eight bits go furthest there. Everything past
@@ -293,7 +300,6 @@ void main() {
     vec3 n = normalize(vNormal);
     vec3 l = uLightDir;
     vec3 v = -rd;
-    vec3 hv = normalize(l + v);
     float ndl = max(dot(n, l), 0.0);
 
     /* Is the sun actually reaching this point? The cat marches the same
@@ -310,15 +316,14 @@ void main() {
       sh = clusterShadow(vWorld + n * 0.01, l, mix(6.0, 26.0, uShadowSoft));
     }
 
-    // Blinn-Phong with a roughness-derived exponent, as next door.
-    float spec = pow(max(dot(n, hv), 0.0), mix(400.0, 9.0, FUR_ROUGH))
-               * mix(0.35, 1.6, FUR_METAL);
-    spec *= step(0.0001, ndl);
+    // Grazing sheen instead of a specular lobe, gated on the lit side so
+    // it rims the coat rather than glowing all the way round it.
+    float sheen = pow(1.0 - max(dot(n, v), 0.0), FUR_SHEEN_POWER) * ndl;
     float fresnel = pow(1.0 - max(dot(n, v), 0.0), 5.0);
 
     col = albedo * (uTint * 2.3 * ndl * sh + vec3(0.10, 0.12, 0.16));
-    col += uTint * spec * sh * 2.0;
-    col += sky(reflect(rd, n)) * (0.06 + fresnel * 0.9);
+    col += uTint * sheen * sh * FUR_SHEEN;
+    col += sky(reflect(rd, n)) * (0.04 + fresnel * FUR_SKY);
   }
 
   /* The same distance fog the marcher applies, toward the same horizon.

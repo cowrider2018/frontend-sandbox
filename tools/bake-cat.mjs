@@ -176,6 +176,96 @@ const REORIENT = {
   tail: new THREE.Matrix4().makeRotationY(Math.PI / 2),
 };
 
+/**
+ * Average the normals across a mesh, without moving a vertex.
+ *
+ * The head is a sphere with a muzzle pushed out of its front, and the
+ * push starts and stops at a hard boundary — inside a test on y and z,
+ * with nothing feathering the edge. The surface is therefore continuous
+ * but its *derivative* is not, and `computeVertexNormals` faithfully
+ * reports the kink: the faces either side of the boundary disagree, and
+ * the shading shows a crisp arc across the cheek.
+ *
+ * A quantised three-step ramp hid this, because both sides of the kink
+ * fell in the same step. Continuous shading does not, and a specular
+ * lobe positively advertises it.
+ *
+ * So the normals are smoothed and the vertices are left alone. The
+ * silhouette, the outline shells and the shadow proxy are all unchanged
+ * — only the direction each point claims to face is relaxed, which is
+ * exactly the quantity that was wrong.
+ *
+ * Two passes, both over the index buffer:
+ *
+ *   weld    vertices at the same position get one shared normal. Sphere
+ *           geometry duplicates its seam and poles for UVs, and those
+ *           duplicates otherwise carry different normals — a seam of its
+ *           own, running up the back of the head.
+ *   relax   each vertex takes the mean of the vertices it shares an edge
+ *           with. This is what actually softens the crease.
+ */
+function smoothNormals(geo, passes) {
+  const pos = geo.attributes.position;
+  const nor = geo.attributes.normal;
+  const idx = geo.index.array;
+  const n = pos.count;
+
+  // Weld by quantised position. The grid is far finer than any feature
+  // and far coarser than the float noise two equal vertices pick up.
+  const key = new Map();
+  const rep = new Int32Array(n);
+  const q = (v) => Math.round(v * 1e5);
+  for (let i = 0; i < n; i++) {
+    const k = `${q(pos.getX(i))},${q(pos.getY(i))},${q(pos.getZ(i))}`;
+    if (!key.has(k)) key.set(k, i);
+    rep[i] = key.get(k);
+  }
+
+  const nx = new Float64Array(n), ny = new Float64Array(n), nz = new Float64Array(n);
+  for (let i = 0; i < n; i++) { nx[i] = nor.getX(i); ny[i] = nor.getY(i); nz[i] = nor.getZ(i); }
+
+  const share = (src) => {
+    const ax = new Float64Array(n), ay = new Float64Array(n), az = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      const r = rep[i];
+      ax[r] += src.x[i]; ay[r] += src.y[i]; az[r] += src.z[i];
+    }
+    for (let i = 0; i < n; i++) {
+      const r = rep[i];
+      src.x[i] = ax[r]; src.y[i] = ay[r]; src.z[i] = az[r];
+    }
+  };
+  share({ x: nx, y: ny, z: nz });
+
+  for (let p = 0; p < passes; p++) {
+    const ax = new Float64Array(n), ay = new Float64Array(n), az = new Float64Array(n);
+    // Every triangle contributes each of its corners to the other two.
+    for (let t = 0; t < idx.length; t += 3) {
+      for (let a = 0; a < 3; a++) {
+        for (let b = 0; b < 3; b++) {
+          if (a === b) continue;
+          const i = rep[idx[t + a]], j = rep[idx[t + b]];
+          ax[i] += nx[j]; ay[i] += ny[j]; az[i] += nz[j];
+        }
+      }
+    }
+    // Keep half of what the vertex already claimed, so the surface
+    // relaxes toward its neighbours instead of dissolving into them.
+    for (let i = 0; i < n; i++) {
+      const r = rep[i];
+      let x = nx[r] + ax[r] * 0.5, y = ny[r] + ay[r] * 0.5, z = nz[r] + az[r] * 0.5;
+      const l = Math.hypot(x, y, z) || 1;
+      nx[i] = x / l; ny[i] = y / l; nz[i] = z / l;
+    }
+    share({ x: nx, y: ny, z: nz });
+  }
+
+  for (let i = 0; i < n; i++) {
+    const l = Math.hypot(nx[i], ny[i], nz[i]) || 1;
+    nor.setXYZ(i, nx[i] / l, ny[i] / l, nz[i] / l);
+  }
+}
+
 /** Nearest ancestor that is a bone, plus the object itself if it is one. */
 function nearestBone(obj) {
   for (let o = obj; o; o = o.parent) {
@@ -250,6 +340,9 @@ const bones = BONES.map(([name, obj, pivot], i) => {
  */
 const GROUP_LIT = 0, GROUP_UNLIT = 1, GROUP_OUTLINE = 2;
 
+/** Relaxation passes over the creased shapes' normals. See smoothNormals. */
+const SMOOTH_PASSES = 2;
+
 /** Which spring chain, if any, bends a vertex. Rides in the bone byte. */
 const SWAY_NONE = 0, SWAY_TAIL = 1, SWAY_WHISKER_R = 2, SWAY_WHISKER_L = 3;
 
@@ -298,6 +391,16 @@ parts.root.traverse((obj) => {
      in opposite directions in their own local frames — mirrored so both
      trail the same way in the world. That sign is the only difference
      between the two whisker groups. */
+  /* The two shapes with a hand-cut crease in them: the head, where the
+     muzzle is pushed out of the sphere's front, and the body, where the
+     underside is sliced flat. Both are painted with vertex colours,
+     which is what tells them apart from the plain toon parts hanging off
+     the same bones — the nose is on the head bone too. */
+  const boneName = BONES[bone][0];
+  if (renderGroup === GROUP_LIT && col && (boneName === 'head' || boneName === 'body')) {
+    smoothNormals(geo, SMOOTH_PASSES);
+  }
+
   const flex = flexByGeo.get(geo);
   const outer = flex ? flex.o : null;
   const sway = !flex ? SWAY_NONE
