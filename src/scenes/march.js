@@ -777,9 +777,10 @@ export default {
         { value: 'follow', label: '跟隨貓（第三人稱）' },
       ] },
     { id: 'hintCat', type: 'hint',
-      text: 'WASD 驅動貓在地面上走動。按 Y 切換操作方式：'
-        + '「A／D 轉向」是預設；「滑鼠轉向」則由滑鼠滑動轉身（不用按鍵）、A／D 改成左右平移。'
-        + '滑鼠轉向會鎖定指標，Esc 放開，點畫布重新鎖定。跟隨模式下鏡頭會擺到牠身後。' },
+      text: 'WASD 驅動貓在地面上走動。預設「依鏡頭方向」：WASD 是畫面上的前後左右，'
+        + '貓會轉向該方向再走過去——按 S 牠就轉過身朝你走來。'
+        + '按 Y 切換成「滑鼠轉向」：滑鼠滑動轉身（不用按鍵）、A／D 改成左右平移；'
+        + '這個模式會鎖定指標，Esc 放開，點畫布重新鎖定。' },
 
     { group: '呈現' },
     { id: 'taa', type: 'slider', label: '時間累積', min: 0, max: 0.94, step: 0.01, value: 0.78 },
@@ -946,7 +947,7 @@ class MarchScene {
     // Y swaps how the cat is driven. Guarded against auto-repeat, or
     // holding the key flips the mode sixty times a second.
     if (down && !e.repeat && e.key.toLowerCase() === 'y') {
-      this._setControlMode(this.cat.mode === 'look' ? 'turn' : 'look');
+      this._setControlMode(this.cat.mode === 'look' ? 'camera' : 'look');
       return true;
     }
     return this.cat.onKey(e, down);
@@ -1063,26 +1064,25 @@ class MarchScene {
       cy0 = ay = chest;
       cz = az = cat.z;
 
-      /* Swing behind the cat. Shortest way round, or the camera takes
-         the long path through a full turn every time the yaw crosses ±π.
+      /* Whether the camera chases the cat's heading depends entirely on
+         who is steering, and getting this wrong breaks the other mode.
 
-         How fast depends on who is steering. Under mouse-look the mouse
-         *is* the camera, so any lag reads as the view sticking; it is
-         pinned. Under A/D the lag is the point — snapping the camera
-         round the instant the cat turns takes the steering out of the
-         player's hands, so it drifts back only while under way. */
-      const want = cat.yaw + Math.PI;
-      let delta = (want - this.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+         Under mouse-look the mouse *is* the camera, so it is pinned to
+         directly behind: any lag there reads as the view sticking.
 
+         Under camera-relative keys it must NOT chase. WASD names a
+         direction in this camera's frame, so a camera that swings to
+         follow the cat also swings the meaning of the keys — hold S and
+         the cat turns to face you, the camera comes round behind it,
+         "toward you" now points somewhere else, and it turns again. It
+         spins on the spot forever. The camera tracks position only, and
+         its heading stays the user's to set by dragging. */
       if (looking) {
-        this.yaw += delta;
+        const want = cat.yaw + Math.PI;
+        // Shortest way round, or the camera takes the long path through
+        // a full turn every time the yaw crosses ±π.
+        this.yaw += (want - this.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI;
         moved = true;
-      } else {
-        const speed = Math.min(1, Math.abs(cat.velocity) / 2.6);
-        if (speed > 0.01 && !pointer.down) {
-          this.yaw += delta * (1 - Math.exp(-clock.wallDt * 2.4 * speed));
-          moved = true;
-        }
       }
       if (cat.speed > 1e-3) moved = true;
     }
@@ -1452,7 +1452,10 @@ class MarchScene {
     this._showCat = showCat;                    // read by onKey, which has no state
     if (showCat) {
       this._feedLook(pointer);
-      this.cat.update(dt, FLOOR_Y);
+      // Last frame's basis, deliberately: the camera has not been moved
+      // yet this frame, and steering off the picture the user is
+      // actually looking at is both correct and one less feedback path.
+      this.cat.update(dt, FLOOR_Y, this.basis);
     } else if (this.cat) {
       this.cat.releaseKeys();                   // or it resumes mid-stride
     }
@@ -1625,7 +1628,7 @@ class MarchScene {
       // the mouse does and how far the cat can turn — so it is stated.
       out['操作模式'] = this.cat.mode === 'look'
         ? (this.locked ? '滑鼠轉向 · 已鎖定指標' : '滑鼠轉向 · 未鎖定（點畫布可重新鎖定）')
-        : 'A／D 轉向';
+        : 'WASD 依鏡頭方向';
     }
     return out;
   }

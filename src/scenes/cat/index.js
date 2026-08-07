@@ -159,21 +159,28 @@ void main() {
 const ACCEL = 7.0;       // how hard it gets moving, units/s²
 const DRAG = 6.0;        // and how hard it stops
 const TOP_SPEED = 2.6;   // units/s at full scale
-const TURN_RATE = 3.2;   // radians/s
+const TURN_RATE = 3.2;   // radians/s, steering into a corner
+/** Turning to a heading you pointed at. Faster, because it is a reply. */
+const TURN_RATE_COURSE = 6.0;
 const STRAFE_SCALE = 0.85;  // sidling is slower than walking, as it should be
 
 /**
  * Two ways to drive a cat.
  *
- *   turn   A and D steer the body, W and S drive it along its nose.
- *          Everything is relative to the animal; the mouse is free for
- *          orbiting and for striking the spheres.
+ *   camera  WASD names a direction *on screen* — W away from you, S
+ *           toward you — and the cat turns to face it and walks. It only
+ *           ever walks forward; there is no reversing and no sidling,
+ *           because an animal turns round and then goes.
  *
- *   look   the mouse turns it — no button held — and WASD becomes the
- *          usual four-way: W/S along the nose, A/D sidestepping. The
- *          body can now move in a direction it is not facing.
+ *   look    the mouse turns it, no button held, and WASD becomes the
+ *           usual four-way relative to the body: W/S along the nose,
+ *           A/D sidestepping. Here it *can* move in a direction it is
+ *           not facing.
+ *
+ * The names say which frame WASD is expressed in, which is the whole of
+ * the difference.
  */
-export const CONTROL_MODES = ['turn', 'look'];
+export const CONTROL_MODES = ['camera', 'look'];
 
 export class Cat {
   /** Fetch and upload. Returns null if the asset is missing, never throws. */
@@ -255,7 +262,7 @@ export class Cat {
     this.strafeVel = 0;
     this.floorY = 0;
     this.animating = true;
-    this.mode = 'turn';
+    this.mode = 'camera';
     /** Radians of mouse-look banked since the last update. */
     this._lookYaw = 0;
     this._lookPitch = 0;
@@ -312,35 +319,74 @@ export class Cat {
   }
 
   /**
+   * Turn toward the direction the keys are pointing at *on screen*, and
+   * report how fast to walk along the nose.
+   *
+   * The keys name a direction in the camera's frame, which is flattened
+   * to the ground first — a camera looking down at the cat still has to
+   * mean "away from me" by W, and its unflattened forward is mostly
+   * downward. The camera's own right vector is already horizontal, so it
+   * is used as it comes: "right" then means the same thing here as it
+   * does in the shader that drew the picture you are reacting to.
+   *
+   * Speed is scaled by how well the body already points where it is
+   * going, with a floor. Without the scale the cat power-slides through
+   * every reversal; without the floor it stops dead at every corner.
+   *
+   * @returns {number} 0…1, the forward throttle
+   */
+  _steerToCourse(kx, kz, d, camera) {
+    if (!camera || (kx === 0 && kz === 0)) return 0;
+
+    let cfx = camera.fwd[0], cfz = camera.fwd[2];
+    const cl = Math.hypot(cfx, cfz);
+    if (cl < 1e-4) return 0;    // camera straight down: no usable heading
+    cfx /= cl; cfz /= cl;
+
+    let dx = cfx * kz + camera.right[0] * kx;
+    let dz = cfz * kz + camera.right[2] * kx;
+    const dl = Math.hypot(dx, dz);
+    if (dl < 1e-6) return 0;
+    dx /= dl; dz /= dl;
+
+    // Shortest way round, then clamped to what one frame is allowed to
+    // turn — so a reversal is a pivot the eye can follow, not a snap.
+    const want = Math.atan2(dx, dz);
+    const delta = (want - this.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+    const step = TURN_RATE_COURSE * d;
+    this.yaw += Math.max(-step, Math.min(step, delta));
+
+    const align = Math.sin(this.yaw) * dx + Math.cos(this.yaw) * dz;
+    return 0.35 + 0.65 * Math.max(0, align);
+  }
+
+  /**
    * Advance locomotion and the pose.
    *
-   * Movement is always in the floor plane and always relative to the
-   * cat, never to the camera — what changes between the two modes is
-   * only what A and D mean, and where the heading comes from.
+   * Movement is always in the floor plane, and the cat only ever travels
+   * along its own nose unless it is sidling. What changes between the
+   * modes is where the heading comes from — the keys, or the mouse.
    */
-  update(dt, floorY) {
+  update(dt, floorY, camera) {
     const d = Math.min(0.05, Math.max(0, dt));
     this.floorY = floorY;
 
-    const forward = (this.keys.w ? 1 : 0) - (this.keys.s ? 1 : 0);
-    const ad = (this.keys.a ? 1 : 0) - (this.keys.d ? 1 : 0);
     const look = this.mode === 'look';
-    const steer = look ? 0 : ad;
-    const strafe = look ? -ad : 0;   // A is left, and left is −right
+    const kx = (this.keys.d ? 1 : 0) - (this.keys.a ? 1 : 0);
+    const kz = (this.keys.w ? 1 : 0) - (this.keys.s ? 1 : 0);
 
     const yawBefore = this.yaw;
+    let forward = 0, strafe = 0;
 
     if (look) {
       // Turning right means *decreasing* yaw: the heading (sin, cos)
       // differentiates to (cos, −sin), which points along the cat's left.
       this.yaw -= this._lookYaw;
       this._lookYaw = 0;
+      forward = kz;
+      strafe = kx;
     } else {
-      // Turning is scaled by how fast it is going, with a floor so the
-      // cat can still pivot on the spot — a body that spins at full rate
-      // while stationary looks like a turret.
-      this.yaw += steer * TURN_RATE * d
-        * (0.35 + 0.65 * Math.min(1, Math.abs(this.velocity) / TOP_SPEED));
+      forward = this._steerToCourse(kx, kz, d, camera);
     }
 
     const ease = (v, want, input) => v + (want - v) * (1 - Math.exp(-d * (input ? ACCEL : DRAG)));
@@ -398,7 +444,7 @@ export class Cat {
     this.strafeVel = 0;
     this.turnRate = 0;
     this._lookYaw = this._lookPitch = 0;
-    this.mode = 'turn';
+    this.mode = 'camera';
     this.releaseKeys();
     this.rig.reset();
     this.driver = new Driver();

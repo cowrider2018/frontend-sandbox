@@ -119,13 +119,32 @@ const SHOTS_PLAN = [
     hold: { key: ['d'], ms: 1400 },
     poke: '__aether.scene.targetDist = 2.6; return true;' },
 
-  // Turning hard, photographed a quarter second after the keys are
-  // released: the body has stopped rotating and the tail has not. What
-  // is visible in this frame is entirely the spring chain unwinding.
-  { name: '14-cat-tail', hash: '#/march?spin=0&scale=1&taa=0.9&camera=follow', settle: 2500,
-    pre: 'const c = __aether.scene.cat; c.x = 0.2; c.z = 3.2; c.yaw = 1.57; return true;',
-    hold: { key: ['w', 'a'], ms: 2000, after: 240 },
-    poke: '__aether.scene.targetDist = 2.2; return true;' },
+  /* Walking a continuous circle, so the tail's deflection is a steady
+     state rather than a transient.
+
+     Photographing the swing right after a turn does not work: the chain
+     settles in about a third of a second and the temporal filter
+     averages most of that away, so the shutter has to be luckier than a
+     test should need to be. Turning without stopping holds the tail out
+     at a fixed angle for as long as you like. The mouse is driven
+     through the same `look()` the pointer would call. */
+  // Low accumulation on purpose: a camera pinned behind a turning cat
+  // sweeps the whole background, and at 0.9 the history smears it into
+  // streaks that say nothing about the tail.
+  { name: '14-cat-tail', hash: '#/march?spin=0&scale=1&taa=0.35&camera=follow', settle: 2500,
+    pre: `const s = __aether.scene, c = s.cat;
+          c.x = 0.2; c.z = 3.2; s.targetDist = 2.6;
+          s._setControlMode('look');
+          document.exitPointerLock?.();
+          const until = performance.now() + 6000;
+          const spin = () => {
+            if (performance.now() > until) return;   // never outlives the shot
+            c.look(0.030, 0);
+            requestAnimationFrame(spin);
+          };
+          requestAnimationFrame(spin);
+          return true;`,
+    hold: { key: ['w'], ms: 1800, after: 0 } },
 ];
 
 /**
@@ -1083,13 +1102,40 @@ async function interact(cdp, base, problems) {
     for (const k of keys) await ev('keyUp', k);
   };
 
-  const before = await cdp.eval(`(() => { const c = __aether.scene.cat;
-    c.x = 0; c.z = 3; c.yaw = 1.57; return [c.x, c.z]; })()`);
-  await hold(['w'], 700);
-  const after = await cdp.eval(`(() => { const c = __aether.scene.cat; return [c.x, c.z]; })()`);
-  check('W drives the cat along its heading',
-    after[0] - before[0] > 0.3 && Math.abs(after[1] - before[1]) < 0.2,
-    `(${before.map((n) => n.toFixed(2))}) → (${after.map((n) => n.toFixed(2))})`);
+  /* Camera-relative by default: W means "away from the camera" on
+     screen, whichever way the cat happened to be facing. Asserted
+     against the camera's own flattened forward, because that is the
+     direction the user was looking at when they pressed the key. */
+  await cdp.eval(`(() => { const c = __aether.scene.cat;
+    c.x = 0; c.z = 3; c.yaw = 1.57; c.velocity = 0; return true; })()`);
+  await sleep(200);
+  const away = await cdp.eval(`(() => {
+    const s = __aether.scene, f = s.basis.fwd;
+    const l = Math.hypot(f[0], f[2]);
+    return { x: s.cat.x, z: s.cat.z, fx: f[0] / l, fz: f[2] / l };
+  })()`);
+  await hold(['w'], 900);
+  const wentTo = await cdp.eval(`(() => {
+    const c = __aether.scene.cat; return { x: c.x, z: c.z, yaw: c.yaw }; })()`);
+  const dxw = wentTo.x - away.x, dzw = wentTo.z - away.z;
+  const alongCam = dxw * away.fx + dzw * away.fz;
+  check('W walks the cat away from the camera, not along its old heading',
+    alongCam > 0.4 && alongCam > Math.hypot(dxw, dzw) * 0.85,
+    `moved ${Math.hypot(dxw, dzw).toFixed(2)}, of which ${alongCam.toFixed(2)} away from camera`);
+
+  /* The point of camera-relative steering: S turns the animal round to
+     face the viewer rather than reversing it. */
+  await cdp.eval(`(() => { const c = __aether.scene.cat;
+    c.velocity = 0; return true; })()`);
+  await hold(['s'], 1200);
+  const faced = await cdp.eval(`(() => {
+    const s = __aether.scene, f = s.basis.fwd;
+    const l = Math.hypot(f[0], f[2]);
+    // +1 when the cat faces straight back at the camera.
+    return -(Math.sin(s.cat.yaw) * f[0] / l + Math.cos(s.cat.yaw) * f[2] / l);
+  })()`);
+  check('S turns the cat to face the camera and walk toward it', faced > 0.9,
+    `facing·(toward camera) = ${faced.toFixed(3)}`);
 
   /* A cat walks diagonally: each hind leg swings with the front leg on
      the *opposite* flank. The model names its two pairs from opposite
@@ -1129,23 +1175,42 @@ async function interact(cdp, base, problems) {
       && Math.sign(swing.hip) !== Math.sign(swing.same),
     `hind ${swing.hip.toFixed(3)} · opposite front ${swing.opposite.toFixed(3)} · same-side front ${swing.same.toFixed(3)}`);
 
-  /* The tail is a spring chain, so it is still moving after the body has
-     stopped. If it were rigid every node would sit exactly on the base. */
-  await hold(['w', 'a'], 900);
+  /* The tail is a spring chain: under a sustained turn the lag has to
+     grow monotonically from base to tip.
+
+     Driven directly rather than through the keys, and measured during a
+     *steady* turn. Camera-relative steering turns once and then goes
+     straight, so holding a key settles the chain and leaves it
+     overshooting — where the tip can legitimately read less than the
+     middle on its way back through. That is the spring behaving, not
+     failing, and a test that caught it there would be testing the
+     moment it sampled rather than the thing it claims. */
   const tail = await cdp.eval(`(() => {
-    const s = __aether.scene.cat.sway;
-    return { lagTip: s.yaw.a[8] - s.yaw.a[0], lagMid: s.yaw.a[4] - s.yaw.a[0] };
+    const c = __aether.scene.cat, s = __aether.scene;
+    const was = c.mode;
+    c.setMode('look');
+    let best = null;
+    for (let i = 0; i < 90; i++) {
+      c.look(0.05, 0);                       // a steady 3 rad/s turn
+      c.update(1 / 60, -1.35, s.basis);
+      const tip = c.sway.yaw.a[8] - c.sway.yaw.a[0];
+      const mid = c.sway.yaw.a[4] - c.sway.yaw.a[0];
+      if (!best || Math.abs(tip) > Math.abs(best.tip)) best = { tip, mid };
+    }
+    c.setMode(was);
+    return best;
   })()`);
   check('the tail trails the body, tip furthest',
-    Math.abs(tail.lagTip) > 1e-3 && Math.abs(tail.lagTip) > Math.abs(tail.lagMid),
-    `tip lags ${tail.lagTip.toFixed(3)} rad, middle ${tail.lagMid.toFixed(3)}`);
+    Math.abs(tail.tip) > 1e-3 && Math.abs(tail.tip) > Math.abs(tail.mid),
+    `tip lags ${tail.tip.toFixed(3)} rad, middle ${tail.mid.toFixed(3)}`);
 
   /* WASD overlaps the app's own shortcuts, so the scene may only claim
      them while there is something to steer. */
+  await cdp.eval(`(() => { __aether.scene.cat.velocity = 0; return true; })()`);
   await hold(['s'], 400);
-  const claimed = await cdp.eval(`__aether.scene.cat.velocity`);
-  check('S drives the cat backwards while it is shown', claimed < -0.05,
-    `velocity ${claimed.toFixed(2)}`);
+  const claimed = await cdp.eval(`__aether.scene.cat.speed`);
+  check('S reaches the cat rather than the screenshot shortcut', claimed > 0.05,
+    `speed ${claimed.toFixed(2)}`);
 
   await cdp.eval(`__aether.panel.setValues({ cat: false }); true`);
   await sleep(300);
@@ -1210,11 +1275,16 @@ async function interact(cdp, base, problems) {
     c.velocity = 0; c.strafeVel = 0;
     return { mode: c.mode, yaw: c.yaw };
   })()`);
-  await hold(['d'], 600);
-  const steered = await cdp.eval(`__aether.scene.cat.yaw`);
-  check('Y switches back, and A/D steers again',
-    back.mode === 'turn' && Math.abs(steered - back.yaw) > 0.1,
-    `mode = ${back.mode}, yaw ${back.yaw.toFixed(2)} → ${steered.toFixed(2)}`);
+  await hold(['d'], 700);
+  const steered = await cdp.eval(`(() => {
+    const s = __aether.scene, r = s.basis.right;
+    // Back in camera-relative: D should have turned the cat to face
+    // screen-right, not sidled it while facing where it was.
+    return { yaw: s.cat.yaw, align: Math.sin(s.cat.yaw) * r[0] + Math.cos(s.cat.yaw) * r[2] };
+  })()`);
+  check('Y switches back, and D turns the cat toward screen-right',
+    back.mode === 'camera' && steered.align > 0.9,
+    `mode = ${back.mode}, facing·screen-right = ${steered.align.toFixed(3)}`);
 
   /* reset puts back everything: parameters, camera and the URL. It used
      to do only half of that, with the other half hidden in a separate
