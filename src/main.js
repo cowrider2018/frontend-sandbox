@@ -27,6 +27,7 @@ const MAX_PIXELS = 2.6e6;
 const SHORTCUTS = [
   ['1…4', '切換場景'],
   ['Ctrl K', '指令面板'],
+  ['W A S D', '驅動貓走動（顯示貓時；此時 S 不是截圖）'],
   ['Space', '暫停 / 繼續'],
   ['.', '暫停時前進一幀'],
   ['R', '重設場景與所有參數'],
@@ -502,6 +503,16 @@ class App {
         }
       }
 
+      // The scene gets first refusal. A scene that is driving something
+      // needs keys the shortcuts already claim — WASD overlaps S for
+      // screenshot — and only the scene knows whether it is currently in
+      // a state where that key means something. Returning true is how it
+      // says "mine", and nothing below runs.
+      if (this.scene?.onKey?.(e, true)) {
+        e.preventDefault();
+        return;
+      }
+
       const index = '1234'.indexOf(e.key);
       if (index >= 0 && index < SCENES.length) {
         this._dismissIntro?.();
@@ -525,6 +536,14 @@ class App {
           }
       }
     });
+
+    // Key release only ever concerns the scene — nothing in the shell is
+    // held down.
+    window.addEventListener('keyup', (e) => { this.scene?.onKey?.(e, false); });
+
+    // Alt-tabbing away with a key held would otherwise leave the scene
+    // believing it is still held, and whatever it drives running away.
+    window.addEventListener('blur', () => { this.scene?.releaseKeys?.(); });
   }
 
   /* ── context loss ─────────────────────────────────────────────── */

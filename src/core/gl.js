@@ -106,7 +106,15 @@ export function createTexture(gl, {
 
 /* ═══ render target ═══════════════════════════════════════════════ */
 
-/** A colour texture plus the framebuffer that draws into it. */
+/**
+ * A colour texture plus the framebuffer that draws into it.
+ *
+ * `depth: true` adds a depth renderbuffer. Nothing that marches a field
+ * needs one — the ray already knows how far it went — but anything that
+ * *rasterises* does, or its own triangles sort by draw order. It is a
+ * renderbuffer rather than a texture because so far nobody samples it:
+ * the scene publishes depth in the colour target's alpha instead.
+ */
 export class Target {
   constructor(gl, opts) {
     this.gl = gl;
@@ -123,6 +131,14 @@ export class Target {
     this.texelSize = this.texture.texelSize;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture, 0);
+
+    if (this.opts.depth) {
+      this.depthBuffer = gl.createRenderbuffer();
+      gl.bindRenderbuffer(gl.RENDERBUFFER, this.depthBuffer);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, width, height);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.depthBuffer);
+      gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+    }
 
     const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
     if (status !== gl.FRAMEBUFFER_COMPLETE) {
@@ -150,12 +166,14 @@ export class Target {
   resize(width, height) {
     if (width === this.width && height === this.height) return this;
     this.gl.deleteTexture(this.texture);
+    if (this.depthBuffer) this.gl.deleteRenderbuffer(this.depthBuffer);
     this._alloc(width, height);
     return this;
   }
 
   dispose() {
     this.gl.deleteTexture(this.texture);
+    if (this.depthBuffer) this.gl.deleteRenderbuffer(this.depthBuffer);
     this.gl.deleteFramebuffer(this.fbo);
   }
 }

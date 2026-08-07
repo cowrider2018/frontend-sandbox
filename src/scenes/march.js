@@ -26,6 +26,7 @@
 import { Program } from '../core/program.js';
 import { Target, DoubleTarget, bindScreen, BLEND } from '../core/gl.js';
 import { PRECISION, CONSTANTS, HASH, COLOR, ROTATE, SIMPLEX3, VERT_FULLSCREEN } from '../shaders/common.js';
+import { Cat } from './cat/index.js';
 
 const BALL_N = 9;      // spheres in the cluster
 const RIPPLE_N = 4;    // concurrent surface rings
@@ -536,10 +537,18 @@ void main() {
 `;
 
 /**
- * Temporal accumulation. Written to a ping-pong pair, never in place:
- * sampling a texture that is also the current colour attachment is
- * undefined behaviour, and the artefacts it produces look plausible
- * enough to waste an evening on.
+ * Temporal accumulation, and the one place the rasterised cat meets the
+ * marched scene.
+ *
+ * Both write the same quantity into alpha — distance travelled from the
+ * eye, in world units — so resolving them is a comparison and nothing
+ * more. No depth buffer is shared, no matrices are reconciled, and the
+ * march did not have to learn that the cat exists. Sky is 1e4 on both
+ * sides, so an empty pixel resolves to the scene either way.
+ *
+ * Written to a ping-pong pair, never in place: sampling a texture that
+ * is also the current colour attachment is undefined behaviour, and the
+ * artefacts it produces look plausible enough to waste an evening on.
  */
 const FRAG_ACCUM = /* glsl */`
 ${PRECISION}
@@ -547,9 +556,19 @@ in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D uSrc;
 uniform sampler2D uHistory;
-uniform float uBlend;
+uniform sampler2D uCat;
+uniform float uBlend, uCatOn;
+
 void main() {
-  outColor = vec4(mix(texture(uSrc, vUv).rgb, texture(uHistory, vUv).rgb, uBlend), 1.0);
+  vec4 scene = texture(uSrc, vUv);
+  vec3 col = scene.rgb;
+
+  if (uCatOn > 0.5) {
+    vec4 cat = texture(uCat, vUv);
+    if (cat.a < scene.a) col = cat.rgb;
+  }
+
+  outColor = vec4(mix(col, texture(uHistory, vUv).rgb, uBlend), 1.0);
 }
 `;
 
@@ -742,6 +761,16 @@ export default {
     { id: 'shadowNoise', type: 'switch', label: '陰影含表面擾動', value: true },
     { id: 'reflectLit', type: 'switch', label: '反射含陰影遮蔽', value: true },
 
+    { group: '貓' },
+    { id: 'cat', type: 'switch', label: '顯示貓', value: true },
+    { id: 'camera', type: 'select', label: '鏡頭', value: 'orbit',
+      options: [
+        { value: 'orbit', label: '鎖定星體' },
+        { value: 'follow', label: '跟隨貓（第三人稱）' },
+      ] },
+    { id: 'hintCat', type: 'hint',
+      text: 'WASD 驅動貓在地面上走動；W／S 前後，A／D 轉向。跟隨模式下鏡頭會擺到牠身後。' },
+
     { group: '呈現' },
     { id: 'taa', type: 'slider', label: '時間累積', min: 0, max: 0.94, step: 0.01, value: 0.78 },
     { id: 'exposure', type: 'slider', label: '曝光', min: 0.2, max: 3, step: 0.01, value: 1.25 },
@@ -765,15 +794,37 @@ class MarchScene {
     this.rt = new Target(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR });
     this.history = new DoubleTarget(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR });
 
+    /* The cat is the one thing here made of triangles, so it is also the
+       only thing that needs somewhere to sort them. Its target carries a
+       depth attachment; the canvas still does not have one. */
+    this.catRT = new Target(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR, depth: true });
+
+    /* Loaded off the critical path: the scene renders from the first
+       frame and the cat joins when its geometry arrives. A failure here
+       is not fatal — you lose the cat, not the scene. */
+    this.cat = null;
+    this.catError = null;
+    this._showCat = false;
+    Cat.load(gl, new URL('./cat/cat.bin', import.meta.url).href)
+      .then((cat) => { this.cat = cat; })
+      .catch((err) => { this.catError = err; console.error('cat failed to load', err); });
+
     this.yaw = 0.85;
     this.pitch = 0.22;
     this.dist = 4.6;
     this.targetDist = 4.6;
+    /* What the camera orbits, and what it looks at. They are not the
+       same point — the locked view circles the origin but aims a little
+       above it — and in follow mode both chase the cat. */
+    this.center = new Float32Array([0, 0, 0]);
+    this.target = new Float32Array([0, 0.1, 0]);
+    this.camMode = 'orbit';
     this.scale = 0;
     this.width = 2;
     this.height = 2;
     this.moving = 1;
     this.time = 0;
+    this.frameCount = 0;
 
     this.basis = {
       pos: new Float32Array(3),
@@ -838,6 +889,20 @@ class MarchScene {
     this._pressed = false;
   }
 
+  /**
+   * WASD drives the cat. The app's own shortcuts include S for
+   * screenshot and R for reset, so this claims a key only when there is
+   * actually a cat to steer — and says so by returning true, which is
+   * what stops the app from acting on it as well. With the cat hidden,
+   * every key means what it always meant.
+   */
+  onKey(e, down) {
+    if (!this.cat || !this._showCat) return false;
+    return this.cat.onKey(e, down);
+  }
+
+  releaseKeys() { this.cat?.releaseKeys(); }
+
   resize(width, height) {
     this.width = width;
     this.height = height;
@@ -850,6 +915,9 @@ class MarchScene {
     const w = Math.max(2, Math.round(this.width * scale));
     const h = Math.max(2, Math.round(this.height * scale));
     this.rt.resize(w, h);
+    // The cat is composited per-texel against the march, so it has to be
+    // rendered at exactly the march's resolution — not the canvas's.
+    this.catRT.resize(w, h);
     this.history.resize(w, h);
     this.history.clear(0, 0, 0, 1);
   }
@@ -858,6 +926,10 @@ class MarchScene {
     this.yaw = 0.85;
     this.pitch = 0.22;
     this.targetDist = 4.6;
+    this.center.set([0, 0, 0]);
+    this.target.set([0, 0.1, 0]);
+    this.camMode = 'orbit';
+    this.cat?.reset();
     this.history.clear(0, 0, 0, 1);
     this._rippleAge.fill(0);
     this._rippleHost.fill(-2);
@@ -871,32 +943,90 @@ class MarchScene {
   /* ── camera ───────────────────────────────────────────────────── */
 
   _updateCamera(state, clock, pointer) {
+    // Following something that is not being drawn is just a camera stuck
+    // in a corner, so the mode needs the cat to actually be there.
+    const follow = state.camera === 'follow' && Boolean(this.cat) && Boolean(state.cat);
     let moved = false;
+
     if (pointer.down && pointer.moved) {
       this.yaw -= pointer.dx * 3.6;
       this.pitch = clamp(this.pitch + pointer.dy * 2.4, -0.35, 1.25);
       moved = true;
-    } else if (state.spin) {
+    } else if (state.spin && !follow) {
+      // Orbiting a cat you are trying to steer is motion sickness, not a
+      // feature; the auto-spin only belongs to the locked mode.
       this.yaw += clock.dt * 0.075;
       moved = clock.dt > 0;
     }
+
+    /* ── where to orbit, and where to look ──
+       Both modes are the same spherical rig; all that differs is the
+       point at its centre and whether the yaw has a mind of its own.
+       Centre and aim are not the same point: the locked view orbits the
+       origin but aims slightly above it, which is what puts the cluster
+       on the upper third of the frame instead of dead centre. */
+    let cx = 0, cy0 = 0, cz = 0;
+    let ax = 0, ay = 0.1, az = 0;
+
+    if (follow) {
+      const cat = this.cat;
+      // Chest height, so the camera looks at the animal and not at the
+      // floor it is standing on.
+      const chest = FLOOR_Y + cat.footOffset + cat.header.bounds.max[1] * cat.scale * 0.55;
+      cx = ax = cat.x;
+      cy0 = ay = chest;
+      cz = az = cat.z;
+
+      // Swing behind the cat, but only in proportion to how fast it is
+      // actually going. Snapping the camera round the moment the cat
+      // turns takes the steering out of the player's hands; letting it
+      // drift back while under way keeps them looking where they drive.
+      const want = cat.yaw + Math.PI;
+      const speed = Math.min(1, Math.abs(cat.velocity) / 2.6);
+      if (speed > 0.01 && !pointer.down) {
+        // Shortest way round, or the camera takes the long path through
+        // a full turn every time the yaw crosses ±π.
+        let delta = (want - this.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+        this.yaw += delta * (1 - Math.exp(-clock.wallDt * 2.4 * speed));
+        moved = true;
+      }
+      if (Math.abs(cat.velocity) > 1e-3) moved = true;
+    }
+
+    // Ease both rather than jumping: at speed the cat covers several
+    // units a second, and a rigid target turns every change of direction
+    // into a snap. On the first follow frame there is nothing to ease
+    // from, so the rig is placed outright instead of flying across the
+    // scene from wherever the locked view left it.
+    const snap = follow !== (this.camMode === 'follow');
+    this.camMode = follow ? 'follow' : 'orbit';
+    const k = snap ? 1 : 1 - Math.exp(-clock.wallDt * (follow ? 6 : 4));
+
+    this.center[0] += (cx - this.center[0]) * k;
+    this.center[1] += (cy0 - this.center[1]) * k;
+    this.center[2] += (cz - this.center[2]) * k;
+    this.target[0] += (ax - this.target[0]) * k;
+    this.target[1] += (ay - this.target[1]) * k;
+    this.target[2] += (az - this.target[2]) * k;
+
     const prevDist = this.dist;
     this.dist += (this.targetDist - this.dist) * (1 - Math.exp(-clock.wallDt * 8));
     if (Math.abs(prevDist - this.dist) > 1e-4) moved = true;
     this.moving = moved ? 1 : 0;
 
     const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
-    const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
+    const cyw = Math.cos(this.yaw), syw = Math.sin(this.yaw);
     const { pos, right, up, fwd } = this.basis;
 
-    pos[0] = this.dist * cp * sy;
-    pos[1] = this.dist * sp + 0.35;
-    pos[2] = this.dist * cp * cy;
+    pos[0] = this.center[0] + this.dist * cp * syw;
+    pos[1] = this.center[1] + this.dist * sp + 0.35;
+    pos[2] = this.center[2] + this.dist * cp * cyw;
 
-    // Aim slightly above the origin so the cluster sits on the upper
-    // third of the frame rather than dead centre.
-    const tx = 0, ty = 0.1, tz = 0;
-    let fx = tx - pos[0], fy = ty - pos[1], fz = tz - pos[2];
+    // Never let the camera drop through the floor while chasing a cat
+    // that is, by definition, standing on it.
+    if (follow && pos[1] < FLOOR_Y + 0.3) pos[1] = FLOOR_Y + 0.3;
+
+    let fx = this.target[0] - pos[0], fy = this.target[1] - pos[1], fz = this.target[2] - pos[2];
     const fl = Math.hypot(fx, fy, fz) || 1;
     fx /= fl; fy /= fl; fz /= fl;
     fwd[0] = fx; fwd[1] = fy; fwd[2] = fz;
@@ -1187,7 +1317,24 @@ class MarchScene {
     const { gl, tri, empty } = this.ctx;
     this._applyQuality(state);
     this._applyScale(Number(state.scale));
+
+    const dt = Math.min(clock.dt, 1 / 30);
+
+    /* ── the cat ──
+       Stepped before the camera, not after: a follow shot that reads
+       last frame's position lags the animal it is following by exactly
+       the amount that makes it feel loose. */
+    const showCat = Boolean(this.cat && state.cat);
+    this._showCat = showCat;                    // read by onKey, which has no state
+    if (showCat) this.cat.update(dt, FLOOR_Y);
+    else if (this.cat) this.cat.releaseKeys();  // or it resumes mid-stride
+
     this._updateCamera(state, clock, pointer);
+
+    // A cat that moved invalidates the accumulated history, exactly like
+    // a travelling ripple does — and "moved" includes breathing and
+    // blinking, not just walking.
+    if (showCat && this.cat.animating) this.moving = 1;
 
     // XY pad → hemisphere direction.
     const az = (state.light[0] - 0.5) * Math.PI * 2.2;
@@ -1197,7 +1344,6 @@ class MarchScene {
     this.lightDir[2] = Math.cos(el) * Math.cos(az);
 
     const tint = TINTS[state.tint] || TINTS.amber;
-    const dt = Math.min(clock.dt, 1 / 30);
 
     this._updateBalls(state, clock.time);
 
@@ -1259,6 +1405,32 @@ class MarchScene {
     });
     tri.draw();
 
+    /* ── the cat, rasterised ──
+       Its own target, its own depth buffer, the same camera basis. The
+       alpha it clears to is the same 1e4 the march writes for sky, so an
+       uncovered pixel loses the depth comparison to anything at all. */
+    if (showCat) {
+      this.catRT.bind();
+      gl.clearColor(0, 0, 0, 1e4);
+      gl.clearDepth(1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      this.cat.draw(
+        {
+          pos: this.basis.pos,
+          right: this.basis.right,
+          up: this.basis.up,
+          fwd: this.basis.fwd,
+          focal: 1.5,
+          aspect: this.catRT.width / Math.max(this.catRT.height, 1),
+          width: this.catRT.width,
+          height: this.catRT.height,
+        },
+        { dir: this.lightDir, tint },
+        this.frameCount++,
+      );
+    }
+
     // Temporal blend is dialled back while anything moves, or the jitter
     // turns into a smear.
     const blend = this.moving ? Math.min(state.taa, 0.55) : state.taa;
@@ -1267,6 +1439,8 @@ class MarchScene {
     this.accum.use({
       uSrc: this.rt.texture,
       uHistory: this.history.read.texture,
+      uCat: this.catRT.texture,
+      uCatOn: showCat ? 1 : 0,
       uBlend: blend,
     });
     tri.draw();
@@ -1299,14 +1473,28 @@ class MarchScene {
   }
 
   readout() {
-    return {
+    // The scene's own boast is that it has no geometry. That is still
+    // true of the field — the triangles are the cat's, and saying so is
+    // more honest than either claiming zero or lumping them together.
+    const geometry = this._showCat
+      ? `場：0 頂點 · 貓：${this.cat.triangles.toLocaleString()} 三角形`
+      : '0 頂點 · 0 三角形';
+
+    const out = {
       '渲染尺寸': `${this.rt.width}×${this.rt.height}`,
-      '幾何': '0 頂點 · 0 三角形',
+      '幾何': geometry,
       '場景半徑': this.bound[3].toFixed(2),
       '進行中的漣漪': String(this._rippleAge.reduce((n, a) => n + (a > 0 ? 1 : 0), 0)),
       '撞擊次數': String(this.bursts),
       '鏡頭距離': this.dist.toFixed(2),
     };
+
+    if (this.catError) out['貓'] = '載入失敗';
+    else if (this._showCat) {
+      out['貓的位置'] = `${this.cat.x.toFixed(2)}, ${this.cat.z.toFixed(2)}`;
+      out['貓的速度'] = `${Math.abs(this.cat.velocity).toFixed(2)} u/s`;
+    }
+    return out;
   }
 
   dispose() {
@@ -1316,7 +1504,9 @@ class MarchScene {
     this.resolve.dispose();
     this.flare.dispose();
     this.rt.dispose();
+    this.catRT.dispose();
     this.history.dispose();
+    this.cat?.dispose();
   }
 }
 

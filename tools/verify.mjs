@@ -69,6 +69,41 @@ const SHOTS_PLAN = [
     poke: `const s = __aether.scene; s._rippleAge[0] = ${age}; s.flash = 0; return true;`,
   })),
   { name: '06-lit',    hash: '#/march?light=0.18,0.62&tint=rose&ao=1&shadow=1', settle: 8000 },
+
+  /* ── the cat ──
+     Placed by hand with the clock frozen, so the gait, the blink and the
+     idle tail drift cannot vary between runs. */
+  { name: '09-cat',    hash: '#/march?spin=0&scale=1&taa=0.9', settle: 3000, freeze: 8.0,
+    poke: 'const c = __aether.scene.cat; c.x = 1.7; c.z = 1.9; c.yaw = -2.35; return true;' },
+
+  // The proof that the composite is a per-pixel depth comparison and not
+  // a layer stacked on top: the cat stands *inside* the cluster, so the
+  // spheres in front of it must cut into its silhouette while it hides
+  // the ones behind. A layered composite would show a whole cat.
+  { name: '10-cat-occlude', hash: '#/march?spin=0&scale=1&taa=0.9', settle: 3000, freeze: 8.0,
+    poke: 'const c = __aether.scene.cat; c.x = 0.15; c.z = 0.1; c.yaw = -2.35; return true;' },
+
+  /* Driven for real, through the app's own key handling — the clock has
+     to run for these, so they are moving frames rather than fixed
+     references. They prove the key routing, the gait and the follow
+     camera in one go.
+
+     `pre` aims the cat before it is driven. Left on its default heading
+     it walks straight behind the cluster, which photographs as a cat
+     that never moved — the staging has to keep the subject in shot. */
+  { name: '11-cat-walk',   hash: '#/march?spin=0&scale=1&taa=0.9', settle: 2500,
+    pre: 'const c = __aether.scene.cat; c.x = 0.4; c.z = 2.6; c.yaw = 1.9; return true;',
+    hold: { key: 'w', ms: 1700 } },
+  // Third person: the camera swings to `catYaw + π` and rides behind.
+  { name: '12-cat-follow', hash: '#/march?spin=0&scale=1&taa=0.9&camera=follow', settle: 2500,
+    pre: 'const c = __aether.scene.cat; c.x = -0.6; c.z = 3.0; c.yaw = 1.57; return true;',
+    hold: { key: 'w', ms: 2200 } },
+  // Close enough to read the pose: the follow camera puts you behind the
+  // animal, so this frame is the back of a walking cat and nothing else.
+  { name: '13-cat-close', hash: '#/march?spin=0&scale=1&taa=0.9&camera=follow', settle: 2500,
+    pre: 'const c = __aether.scene.cat; c.x = -0.6; c.z = 3.0; c.yaw = 1.57; return true;',
+    hold: { key: 'w', ms: 2200 },
+    poke: '__aether.scene.targetDist = 1.9; return true;' },
 ];
 
 /**
@@ -492,6 +527,30 @@ async function main() {
       await sleep(60);
       await ev('mouseReleased', 0);
       await sleep(shot.after ?? 600);
+    }
+
+    // Stage the scene before it is driven — where the subject starts
+    // decides whether it is still in frame when the shutter opens.
+    if (shot.pre) {
+      await cdp.eval(`(() => { ${shot.pre} })()`);
+      await sleep(120);
+    }
+
+    // Hold a key down, let the scene act on it, release. Synthesising
+    // the key rather than poking the scene's state is the point: it is
+    // the only way to prove the app actually routes the key to the scene
+    // instead of eating it as a shortcut.
+    if (shot.hold) {
+      const { key, ms } = shot.hold;
+      const code = `Key${key.toUpperCase()}`;
+      const vk = key.toUpperCase().charCodeAt(0);
+      const ev = (type) => cdp.send('Input.dispatchKeyEvent', {
+        type, key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk,
+      });
+      await ev('keyDown');
+      await sleep(ms);
+      await ev('keyUp');
+      await sleep(400);
     }
 
     // Reach into the scene and pin state that time would otherwise carry

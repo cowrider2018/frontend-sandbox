@@ -3,7 +3,7 @@
 一個完全跑在 GPU 上的場景。**零依賴、零建置、零打包器**：沒有 npm、沒有框架、沒有函式庫，
 `index.html` 開起來就是全部。所有東西都是 `<canvas>`、原生 ES modules，與手寫 GLSL。
 
-整個場景**沒有任何一個頂點、沒有任何一個三角形**。一道 fragment shader 沿著射線走進由距離函數
+**距離場裡沒有任何一個頂點、沒有任何一個三角形。** 一道 fragment shader 沿著射線走進由距離函數
 定義的隱式曲面：一團互相以 smooth-min 焊接的公轉球體，加上一個以自己的節奏翻滾的環。
 陰影來自朝光源再走一次，環境遮蔽來自在命中點周圍取樣距離場，反射來自沿鏡射方向再走一次，
 抗鋸齒來自每幀抖動取樣點再讓時間累積把它收斂掉。
@@ -11,6 +11,9 @@
 **點擊星體或星環，被碰到的那一點會盪出漣漪** —— 表面凹出一個火山口，
 一圈熾熱的環沿著表面擴散出去。把「質量消散」拉大，那一擊會把星環啃出一個缺口、
 甚至把球體吃穿；能量排空之後兩者都長回來。
+
+場景裡唯一由三角形構成的東西是**那隻貓**，用 `WASD` 驅動牠在地面上走動。牠不走同一條管線，
+兩者在「深度」相接 —— 見〈[一隻光柵化的貓](#一隻光柵化的貓)〉。
 
 ```
 index.html          ← 直接開這個
@@ -32,8 +35,14 @@ src/
     cmdk.js         指令面板（模糊搜尋）
   shaders/common.js GLSL 共用區塊（simplex、色彩、tonemap）
   scenes/march.js   場景本體
+  scenes/cat/
+    index.js        貓的 GL 資源、著色器、WASD 移動
+    rig.js          .bin 解析 + 骨架與矩陣（取代 THREE.Object3D）
+    pose.js         步態／待機姿勢，以及 pose → 骨架
+    cat.bin         烘焙好的幾何（715 kB，由 tools/bake-cat.mjs 產生）
 archive/            ← 不在 app 裡的東西，附完整接回步驟（見該目錄的 README）
 tools/verify.mjs    ← 零依賴的無頭驗收工具（見下）
+tools/bake-cat.mjs  ← 一次性的離線烘焙（見下；app 本身仍然零依賴）
 ```
 
 ---
@@ -125,21 +134,77 @@ texture unit。整個專案沒有一行 `getUniformLocation`。
 
 ---
 
+## 一隻光柵化的貓
+
+貓來自另一個專案（relpet）的程序化模型：~40 顆球體／管狀體，經過二次塑型、頂點染色、
+反殼描邊。它唯一能被搬過來的原因是 `cat-model.js` **不 import three，THREE 由呼叫端傳入** ——
+所以我們在 Node 裡跑它一次，把 three 丟掉，留下頂點。
+
+### 兩條管線在哪裡相接
+
+不是在幾何上，是在**深度**上。這個場景本來就已經把深度公開了：march pass 把射線走過的距離
+寫進 colour target 的 alpha，好讓撞擊閃光能躲在幾何後面（`outColor.a = mat > 0.5 ? t : 1e4`）。
+
+貓寫同一個量 —— `length(world - camera)`，同樣的單位 —— 進自己 target 的 alpha。
+於是合成就只是每個 pixel 一次比較，寫在時間累積那一遍裡：
+
+```glsl
+vec4 scene = texture(uSrc, vUv);
+vec4 cat   = texture(uCat, vUv);
+if (cat.a < scene.a) col = cat.rgb;
+```
+
+畫布上**依然沒有 depth buffer**（`depth: false` 沒有動過）。貓自己的 target 掛了一個私有的
+depth renderbuffer，那只是為了讓牠自己的三角形彼此排序。march 完全不知道貓存在。
+
+投影矩陣不是另外建的，是從 march 用的同一組 `uRight/uUp/uFwd/uFocal` 反推出來的 ——
+沒有第二份相機資料可以走偏。
+
+### 骨架：沒有一個蒙皮權重
+
+原模型是**剛體階層**動畫：每個部位是一整塊網格繞關節轉。所以不需要 glTF 意義上的骨架，
+只需要 17 根骨頭的 TRS，和一次由父到子的前向遍歷。`bake-cat.mjs` 把骨頭之間所有靜態變換
+**折進頂點裡**，執行期只剩 `applyPose` 真正會動的通道。
+
+```
+node tools/bake-cat.mjs                    # 預設讀 ../relpet
+node tools/bake-cat.mjs --skin tabby       # 換花色
+node tools/bake-cat.mjs --relpet ../foo    # relpet 在別的地方
+```
+
+輸出 715 kB：position `f32`、normal `snorm16`、colour `sRGB u8`（骨頭索引就藏在第四個 byte
+裡）、index `u16`。**這是一次性的離線步驟，app 本身仍然零依賴、零建置**；three 只是隔壁專案的
+devDependency，永遠不會被 ship。
+
+### 這一階段刻意還沒做的事
+
+貓用自己的三階 toon ramp 打光，**不走場景的光照積分**：牠不接受星體的陰影、自己也不投影、
+星體看不見牠、沒有距離霧。所以牠現在看起來會有點像貼上去的。
+
+下一階段是**代理距離場** —— 6~8 顆膠囊跟著骨架走，加進場景的 `clusterShape()`。
+那一步同時解決投影與「和星體互動」，而真正的三角形網格永遠不進 march。
+
+---
+
 ## 快捷鍵
 
 | 鍵 | 動作 |
 |---|---|
 `Ctrl`+`K` | 指令面板（模糊搜尋所有動作）
+`W` `A` `S` `D` | 驅動貓走動（`W`／`S` 前後，`A`／`D` 轉向）
 `Space` | 暫停 / 繼續
 `.` | 暫停時前進一幀
 `R` | 重設場景
-`S` | 存成 PNG
+`S` | 存成 PNG（**顯示貓時 `S` 是後退**；截圖請用工具列或指令面板）
 `P` | 顯示 / 隱藏參數面板
 `Z` | 禪模式（隱藏所有介面）
 `F` | 全螢幕
 `?` | 快捷鍵一覽
 
 **點擊星體或星環會在那一點盪出漣漪。** 拖曳畫布繞行鏡頭，滾輪縮放，面板裡的 XY 盤轉動光源。
+
+鏡頭有兩種模式（面板「貓」分組）：**鎖定星體**（原本的繞行）與**跟隨貓**（第三人稱，
+鏡頭會擺到牠身後）。關掉「顯示貓」時，`WASD` 全部還給原本的快捷鍵。
 
 ---
 
