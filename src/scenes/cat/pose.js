@@ -39,6 +39,17 @@ const CH_C = 15;
 const TAIL_GY = 0.20;  // to yaw — the sideways swish when it turns
 const TAIL_GP = 0.20;  // to pitch — the fore-and-aft float
 
+/* Whiskers follow the head rather than the body, and barely move — they
+   are stiff, short and light. Well under the tail's gain, or they read
+   as antennae rather than as whiskers.
+
+   Above the 0.05 the original used, though: that was authored for a
+   locked close-up where the cat fills the frame, and this scene watches
+   a much smaller animal from much further away. At 0.05 the sweep here
+   is under half a degree of arc on screen — correct, and invisible. */
+const WHISKER_GY = 0.12;
+const WHISKER_GP = 0.12;
+
 class Chain {
   constructor() {
     this.a = new Float64Array(SEG + 1);
@@ -90,8 +101,14 @@ export class Sway {
   constructor() {
     this.yaw = new Chain();
     this.pitch = new Chain();
-    /** (ax, az) per node, packed for a `vec2[]` uniform. */
+    /** The head's own chains. Whiskers hang off the head, not the body,
+        so they trail a turn of the neck the body never made. */
+    this.headYaw = new Chain();
+    this.headPitch = new Chain();
+    /** (ax, az) per node for the tail, packed for a `vec2[]` uniform. */
     this.nodes = new Float32Array((SEG + 1) * 2);
+    /** (ay, az) per node for the whiskers, for one side of the face. */
+    this.whiskers = new Float32Array((SEG + 1) * 2);
     this.count = SEG + 1;
   }
 
@@ -103,28 +120,39 @@ export class Sway {
    *                        turn lives in the model matrix
    * @param {number} pitch  the body's pitch
    * @param {number} wag    the tail's own swing, above its rest roll
+   * @param {object} pose   the frame's pose, for the head's own turn
    */
-  step(d, t, yaw, pitch, wag) {
+  step(d, t, yaw, pitch, wag, pose) {
     // The wag drives the same chain as the body's turn, so a deliberate
     // swish also arrives at the tip late rather than moving the whole
     // tail as one rigid piece.
     this.yaw.step(yaw + wag, d);
     this.pitch.step(pitch, d);
 
+    // The head's absolute aim: where the body points, plus where the neck
+    // is turned on top of it. Same multipliers `applyPose` uses, or the
+    // whiskers would trail a head that is not the one being drawn.
+    this.headYaw.step(yaw + pose.headYaw * 0.85, d);
+    this.headPitch.step(pitch + pose.headPitch * 0.8, d);
+
     for (let i = 0; i <= SEG; i++) {
       const o = i / SEG;
       this.nodes[i * 2] = this.pitch.lag(o) * TAIL_GP + windAx(o, t);
       this.nodes[i * 2 + 1] = this.yaw.lag(o) * TAIL_GY + windAz(o, t);
+
+      // No breeze on these: a whisker is far too stiff for it, and the
+      // drift that reads as life on a tail reads as a twitch on a face.
+      this.whiskers[i * 2] = this.headYaw.lag(o) * WHISKER_GY;
+      this.whiskers[i * 2 + 1] = this.headPitch.lag(o) * WHISKER_GP;
     }
     return this.nodes;
   }
 
-  /** How much the chain is still doing, for the temporal filter. */
+  /** How much the chains are still doing, for the temporal filter. */
   get activity() {
     let m = 0;
-    for (let i = 1; i <= SEG; i++) {
-      m += Math.abs(this.yaw.a[i] - this.yaw.a[0]) + Math.abs(this.yaw.v[i])
-         + Math.abs(this.pitch.a[i] - this.pitch.a[0]) + Math.abs(this.pitch.v[i]);
+    for (const c of [this.yaw, this.pitch, this.headYaw, this.headPitch]) {
+      for (let i = 1; i <= SEG; i++) m += Math.abs(c.a[i] - c.a[0]) + Math.abs(c.v[i]);
     }
     return m;
   }

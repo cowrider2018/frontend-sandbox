@@ -33,7 +33,7 @@ ${PRECISION}
 
 in vec3 aPosition;
 in vec4 aNormal;     // xyz normal, w = outerness along a soft part
-in vec4 aColor;      // rgb sRGB, a = bone index / 255
+in vec4 aColor;      // rgb sRGB, a = bone index | sway group << 5
 
 uniform mat4 uBones[BONE_N];
 uniform mat4 uModel;
@@ -41,8 +41,9 @@ uniform vec3 uCamPos, uRight, uUp, uFwd;
 uniform float uFocal, uAspect;
 uniform vec2 uJitter;
 
-/** (pitch, yaw) deflection at each node of the tail's chain. */
+/** Deflection at each node: the tail's chain, and the whiskers' own. */
 uniform vec2 uSway[SWAY_N];
+uniform vec2 uWhisker[SWAY_N];
 
 out vec3 vNormal;
 out vec3 vColor;
@@ -54,40 +55,70 @@ out vec3 vWorld;
  * of the cat, rising to 1 at the tip of the tail — so this costs one
  * texture-free lookup and no branch anywhere else in the model.
  */
-vec2 swayAt(float o) {
+vec2 sampleChain(vec2 chain[SWAY_N], float o) {
   float x = o * float(SWAY_N - 1);
   float i = floor(x);
   int lo = int(i);
   int hi = min(lo + 1, SWAY_N - 1);
-  return mix(uSway[lo], uSway[hi], x - i);
+  return mix(chain[lo], chain[hi], x - i);
 }
 
-/** Z then X, the order the model's own deformation used. */
-vec3 swayRotate(vec3 p, vec2 a) {
-  float c = cos(a.y), s = sin(a.y);
-  p = vec3(p.x * c - p.y * s, p.x * s + p.y * c, p.z);
-  c = cos(a.x); s = sin(a.x);
+vec3 rotZ(vec3 p, float a) {
+  float c = cos(a), s = sin(a);
+  return vec3(p.x * c - p.y * s, p.x * s + p.y * c, p.z);
+}
+vec3 rotX(vec3 p, float a) {
+  float c = cos(a), s = sin(a);
   return vec3(p.x, p.y * c - p.z * s, p.y * s + p.z * c);
+}
+vec3 rotY(vec3 p, float a) {
+  float c = cos(a), s = sin(a);
+  return vec3(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
+}
+
+/**
+ * Bend a vertex by whichever chain owns it, in its own bone's space.
+ *
+ * The axes differ because the parts do. A tail is carried behind the
+ * body and swings across it and floats fore-and-aft — Z then X. A
+ * whisker sticks out sideways from a face, so the same head movements
+ * sweep it back and tilt it — Z then Y. Both orders are the model's own.
+ *
+ * The two sides of the face take the same angles with the sign flipped:
+ * mirrored in their local frames is what makes them trail the *same*
+ * way in the world.
+ */
+vec3 swayRotate(vec3 p, float o, int group) {
+  if (group == SWAY_TAIL) {
+    vec2 a = sampleChain(uSway, o);
+    return rotX(rotZ(p, a.y), a.x);
+  }
+  vec2 a = sampleChain(uWhisker, o);
+  if (group == SWAY_WHISKER_L) a = -a;
+  return rotY(rotZ(p, a.y), a.x);
 }
 
 void main() {
-  // The bone index rides in the colour's alpha byte. Rounding rather
-  // than truncating matters: 8/255 does not survive the trip to float
-  // exactly, and floor() would land one bone short.
-  int b = int(aColor.a * 255.0 + 0.5);
+  /* The colour's alpha byte carries the bone in its low five bits and
+     the sway group in its top three. Rounding rather than truncating
+     matters: 8/255 does not survive the trip to float exactly, and
+     floor() would land one bone short. */
+  int packed = int(aColor.a * 255.0 + 0.5);
+  int b = packed & 31;
+  int group = packed >> 5;
   mat4 bone = uBones[b];
 
   vec3 local = aPosition;
   vec3 normal = aNormal.xyz;
 
-  // Soft parts bend in their own bone's space, around its origin —
-  // which for the tail is where it meets the body. Everything else has
-  // an outerness of zero and skips it.
+  /* Soft parts bend in their own bone's space, around its origin. For
+     the tail that is where it meets the body; the whiskers were each
+     given a bone of their own at the cheek so the same thing is true of
+     them. Everything else is group 0 and skips it. */
   float o = aNormal.w;
-  if (o > 0.0) {
-    vec2 a = swayAt(o);
-    local = swayRotate(local, a);
-    normal = swayRotate(normal, a);
+  if (group != SWAY_NONE) {
+    local = swayRotate(local, o, group);
+    normal = swayRotate(normal, o, group);
   }
 
   vec4 world = uModel * (bone * vec4(local, 1.0));
@@ -203,6 +234,10 @@ export class Cat {
       defines: {
         BONE_N: this.rig.count,
         SWAY_N: this.sway.count,
+        // Must match the bake's numbering; it packs these into a byte.
+        SWAY_NONE: 0,
+        SWAY_TAIL: 1,
+        SWAY_WHISKER_L: 3,
         NEAR: NEAR.toFixed(4),
         FAR: FAR.toFixed(1),
       },
@@ -422,7 +457,7 @@ export class Cat {
        be driven by — otherwise the tail would hang dead through every
        corner, which is exactly when a real one swings widest. */
     this.time += d;
-    this.sway.step(d, this.time, this.yaw, pose.bodyPitch, pose.tailYaw);
+    this.sway.step(d, this.time, this.yaw, pose.bodyPitch, pose.tailYaw, pose);
 
     // Anything the scene's temporal filter must not hold on to: walking,
     // but also breathing, a flicking ear, a blink — which lasts about six
@@ -489,6 +524,7 @@ export class Cat {
       uAspect: camera.aspect,
       uJitter: this._jitter,
       uSway: this.sway.nodes,
+      uWhisker: this.sway.whiskers,
       uLightDir: light.dir,
       uTint: light.tint,
       uUnlit: 0,

@@ -107,6 +107,24 @@ const SHOTS_PLAN = [
     hold: { key: 'w', ms: 2200 },
     poke: '__aether.scene.targetDist = 1.9; return true;' },
 
+  /* Face on, with the head shaking. Camera-relative mode leaves the
+     follow camera's heading free, so it can be parked on the nose while
+     the cat turns underneath it — which keeps the whiskers' chain loaded
+     and the face toward the lens at the same time. */
+  { name: '16-cat-face', hash: '#/march?spin=0&scale=1&taa=0.3&camera=follow', settle: 2000,
+    pre: `const s = __aether.scene, c = s.cat;
+          c.x = 3.0; c.z = 3.0; s.targetDist = 1.7; s.pitch = 0.10;
+          const until = performance.now() + 8000;
+          const shake = () => {
+            if (performance.now() > until) return;
+            c.yaw = 0.45 * Math.sin(performance.now() / 1000 * 7);
+            s.yaw = 0;                  // camera parked on the nose
+            requestAnimationFrame(shake);
+          };
+          requestAnimationFrame(shake);
+          return true;`,
+    poke: 'return true;' },
+
   // Mouse-look, sidling. The body is facing where it started and the
   // whole cat has moved across its own nose — the one thing A and D
   // cannot do in the default mode.
@@ -1203,6 +1221,33 @@ async function interact(cdp, base, problems) {
   check('the tail trails the body, tip furthest',
     Math.abs(tail.tip) > 1e-3 && Math.abs(tail.tip) > Math.abs(tail.mid),
     `tip lags ${tail.tip.toFixed(3)} rad, middle ${tail.mid.toFixed(3)}`);
+
+  /* The whiskers hang off the head and run on their own chain, so they
+     have to lag too — and by much less, because a whisker is stiff and
+     the gain is a quarter of the tail's. Both facts are asserted: a
+     whisker that swept like a tail would read as an antenna. */
+  const whisk = await cdp.eval(`(() => {
+    const c = __aether.scene.cat, s = __aether.scene;
+    const was = c.mode;
+    c.setMode('look');
+    let best = null;
+    for (let i = 0; i < 90; i++) {
+      c.look(0.05, 0);
+      c.update(1 / 60, -1.35, s.basis);
+      const w = c.sway;
+      const tip = w.headYaw.a[8] - w.headYaw.a[0];
+      const mid = w.headYaw.a[4] - w.headYaw.a[0];
+      if (!best || Math.abs(tip) > Math.abs(best.tip)) {
+        best = { tip, mid, deflect: Math.abs(w.whiskers[16]), tailDeflect: Math.abs(w.nodes[17]) };
+      }
+    }
+    c.setMode(was);
+    return best;
+  })()`);
+  check('the whiskers trail the head, and far less than the tail',
+    Math.abs(whisk.tip) > 1e-3 && Math.abs(whisk.tip) > Math.abs(whisk.mid)
+      && whisk.deflect > 1e-3 && whisk.deflect < whisk.tailDeflect,
+    `tip lags ${whisk.tip.toFixed(3)} rad; tip deflects ${whisk.deflect.toFixed(3)} vs tail ${whisk.tailDeflect.toFixed(3)}`);
 
   /* WASD overlaps the app's own shortcuts, so the scene may only claim
      them while there is something to steer. */

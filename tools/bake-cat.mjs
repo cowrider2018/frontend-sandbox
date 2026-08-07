@@ -73,6 +73,32 @@ const parts = buildCat(THREE, { skin: SKIN, gradientMap: null });
  * leans while its feet stay planted. Preserving that split matters more
  * than the handful of matrices it costs.
  */
+// Rest pose is whatever buildCat left behind: matrixWorld for every node.
+parts.root.updateMatrixWorld(true);
+
+/**
+ * The model's own registry of bendable geometry. Each entry carries a
+ * per-vertex "outerness" — 0 at the base, 1 at the tip — which is the
+ * only thing needed to make a part trail behind the body it hangs off.
+ * Keyed by geometry, because that is what a mesh can be matched on.
+ */
+const flexByGeo = new Map((parts.flex || []).map((f) => [f.geo, f]));
+
+/**
+ * The whiskers, which bend around a pivot out at the cheek rather than
+ * around the origin of the bone they hang off. That is the one thing
+ * that stopped them being done with the tail: a shader that rotates
+ * about a bone's origin cannot bend them where they actually hinge.
+ *
+ * So each one is given a bone of its own, placed at its pivot. Nothing
+ * poses these — they exist purely to put an origin in the right place,
+ * and after that the whiskers use the same machinery as the tail.
+ */
+const whiskers = [];
+parts.root.traverse((o) => {
+  if (o.isMesh && flexByGeo.get(o.geometry)?.src === 'head') whiskers.push(o);
+});
+
 const BONES = [
   ['root',    parts.root],
   ['torso',   parts.torso],
@@ -91,9 +117,29 @@ const BONES = [
   ['pawFR',   parts.pawFR],
   ...parts.eyes.map((e, i) => [`eye${i}`, e]),
   ...parts.pupils.map((p, i) => [`pupil${i}`, p]),
+  // Appended last, so every bone still follows its parent in the array
+  // and the runtime's single forward pass stays valid.
+  ...whiskers.map((w, i) => [`whisker${i}`, w, flexByGeo.get(w.geometry).pivot]),
 ].filter(([, obj]) => obj);
 
+/* The bone index shares a byte with the sway group, five bits to three.
+   Nothing here is close to the limit, but a silent wrap would show up as
+   a stray triangle welded to the wrong joint. */
+if (BONES.length > 32) throw new Error(`too many bones for a 5-bit index: ${BONES.length}`);
+
 const boneIndex = new Map(BONES.map(([, obj], i) => [obj, i]));
+
+/**
+ * Where each bone actually sits at rest. Usually its object's own place
+ * in the world; for the whiskers, shifted out to the pivot they hinge
+ * around. Held separately because a synthetic bone has no object whose
+ * matrix could answer for it.
+ */
+const boneWorld = BONES.map(([, obj, pivot]) => {
+  const m = obj.matrixWorld.clone();
+  if (pivot) m.multiply(new THREE.Matrix4().makeTranslation(pivot.x, pivot.y, pivot.z));
+  return m;
+});
 
 /**
  * Fixed rotations applied to a bone's vertices, in that bone's own space.
@@ -112,17 +158,6 @@ const boneIndex = new Map(BONES.map(([, obj], i) => [obj, i]));
 const REORIENT = {
   tail: new THREE.Matrix4().makeRotationY(Math.PI / 2),
 };
-
-// Rest pose is whatever buildCat left behind: matrixWorld for every node.
-parts.root.updateMatrixWorld(true);
-
-/**
- * The model's own registry of bendable geometry. Each entry carries a
- * per-vertex "outerness" — 0 at the base, 1 at the tip — which is the
- * only thing needed to make a part trail behind the body it hangs off.
- * Keyed by geometry, because that is what a mesh can be matched on.
- */
-const flexByGeo = new Map((parts.flex || []).map((f) => [f.geo, f]));
 
 /** Nearest ancestor that is a bone, plus the object itself if it is one. */
 function nearestBone(obj) {
@@ -148,7 +183,9 @@ const _m = new THREE.Matrix4();
  *
  * — and the runtime only ever touches localTRS, exactly as applyPose does.
  */
-const bones = BONES.map(([name, obj], i) => {
+const _pivot = new THREE.Vector3();
+
+const bones = BONES.map(([name, obj, pivot], i) => {
   const parent = i === 0 ? -1 : nearestBone(obj.parent);
 
   // Everything strictly between the parent bone and this bone.
@@ -157,11 +194,18 @@ const bones = BONES.map(([name, obj], i) => {
     _m.premultiply(o.matrix);
   }
 
+  /* A pivoted bone sits at `objectMatrix · translate(pivot)`, and that
+     is still a plain TRS: the translation is simply rotated into the
+     object's own frame first. Keeping it in TRS form means the runtime
+     needs no special case for these at all. */
+  _pivot.set(0, 0, 0);
+  if (pivot) _pivot.set(pivot.x, pivot.y, pivot.z).applyQuaternion(obj.quaternion).multiply(obj.scale);
+
   return {
     name,
     parent,
     offset: [..._m.elements],
-    position: [obj.position.x, obj.position.y, obj.position.z],
+    position: [obj.position.x + _pivot.x, obj.position.y + _pivot.y, obj.position.z + _pivot.z],
     rotation: [obj.rotation.x, obj.rotation.y, obj.rotation.z],
     order: obj.rotation.order,
     scale: [obj.scale.x, obj.scale.y, obj.scale.z],
@@ -189,6 +233,9 @@ const bones = BONES.map(([name, obj], i) => {
  */
 const GROUP_LIT = 0, GROUP_UNLIT = 1, GROUP_OUTLINE = 2;
 
+/** Which spring chain, if any, bends a vertex. Rides in the bone byte. */
+const SWAY_NONE = 0, SWAY_TAIL = 1, SWAY_WHISKER_R = 2, SWAY_WHISKER_L = 3;
+
 const items = [[], [], []];
 let vertexTotal = 0, indexTotal = 0;
 
@@ -212,14 +259,14 @@ parts.root.traverse((obj) => {
   if (!pos || !nor) throw new Error(`mesh without position/normal: ${obj.name || obj.type}`);
 
   const bone = nearestBone(obj);
-  const group = obj.material.side === THREE.BackSide ? GROUP_OUTLINE
+  const renderGroup = obj.material.side === THREE.BackSide ? GROUP_OUTLINE
     : obj.material.isMeshToonMaterial ? GROUP_LIT
     : GROUP_UNLIT;
 
   // Rest transform from the bone's space down to this mesh, with any
   // fixed reorientation on top. Baked into the vertices below, then
   // forgotten.
-  _boneInv.copy(BONES[bone][1].matrixWorld).invert();
+  _boneInv.copy(boneWorld[bone]).invert();
   const rest = _boneInv.multiply(obj.matrixWorld);
   const fix = REORIENT[BONES[bone][0]];
   if (fix) rest.premultiply(fix);
@@ -229,11 +276,16 @@ parts.root.traverse((obj) => {
      Everything else gets 0, which the shader reads as "rigid" — and
      reads correctly without a branch, because zero lag is no rotation.
 
-     Only the tail for now. The whiskers are in the same registry but
-     bend around a pivot out at the cheek rather than around their bone's
-     origin, so they would need a per-part pivot the tail does not. */
-  const flex = BONES[bone][0] === 'tail' ? flexByGeo.get(geo) : null;
+     The group says which chain drives it. The whiskers follow the head
+     and the tail follows the body, and the two sides of the face bend
+     in opposite directions in their own local frames — mirrored so both
+     trail the same way in the world. That sign is the only difference
+     between the two whisker groups. */
+  const flex = flexByGeo.get(geo);
   const outer = flex ? flex.o : null;
+  const sway = !flex ? SWAY_NONE
+    : flex.src === 'head' ? (obj.position.x > 0 ? SWAY_WHISKER_R : SWAY_WHISKER_L)
+    : SWAY_TAIL;
 
   const n = pos.count;
   const P = new Float32Array(n * 3);
@@ -274,7 +326,7 @@ parts.root.traverse((obj) => {
   const idx = geo.index;
   if (!idx) throw new Error(`un-indexed geometry on ${obj.material.type}`);
 
-  items[group].push({ P, N, C, O, bone, index: idx.array, count: n });
+  items[renderGroup].push({ P, N, C, O, bone, sway, index: idx.array, count: n });
   vertexTotal += n;
   indexTotal += idx.count;
 });
@@ -328,7 +380,8 @@ for (let g = 0; g < items.length; g++) {
 
       const c = (vOff + i) * 4;
       C[c] = u8(it.C[i * 3]); C[c + 1] = u8(it.C[i * 3 + 1]); C[c + 2] = u8(it.C[i * 3 + 2]);
-      C[c + 3] = it.bone;
+      // Bone in the low five bits, sway group in the top three.
+      C[c + 3] = it.bone | (it.sway << 5);
     }
     // Indices are absolute into the merged buffer, so the whole cat is
     // one element array and a group is a range inside it.
@@ -350,10 +403,9 @@ const header = {
   indexCount: indexTotal,
   indexBits: wide ? 32 : 16,
   bounds: { min: lo, max: hi },
-  // Which bone the outerness channel belongs to. The lag angles the
-  // runtime uploads are in this bone's space, so it has to be named
-  // rather than assumed.
-  sway: { bone: 'tail' },
+  // The chains the runtime has to drive, and what each one bends. The
+  // angles it uploads are in the bending bone's own space.
+  sway: { tail: 'tail', whiskers: whiskers.length },
   bones,
   groups,
 };
