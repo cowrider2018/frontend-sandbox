@@ -38,6 +38,14 @@ const FLOOR_Y = -1.35;
 /** Peak displacement per unit of the `displace` slider. */
 const DISPLACE_AMP = 0.12;
 
+/* Mouse-look sensitivity. The locked figure is per device pixel and is
+   the usual first-person number; the unlocked one is per canvas width,
+   so one sweep across the screen is a little over half a turn. */
+const LOOK_PER_PIXEL = 0.0026;
+const LOOK_PER_SWEEP = 3.4;
+/** Vertical look is the camera's elevation, and rides much shallower. */
+const PITCH_FROM_LOOK = 0.75;
+
 /** AO weight sum for the reference 5-tap schedule; see ambientOcclusion. */
 const AO_REFERENCE = 0.1959;
 
@@ -769,7 +777,9 @@ export default {
         { value: 'follow', label: '跟隨貓（第三人稱）' },
       ] },
     { id: 'hintCat', type: 'hint',
-      text: 'WASD 驅動貓在地面上走動；W／S 前後，A／D 轉向。跟隨模式下鏡頭會擺到牠身後。' },
+      text: 'WASD 驅動貓在地面上走動。按 Y 切換操作方式：'
+        + '「A／D 轉向」是預設；「滑鼠轉向」則由滑鼠滑動轉身（不用按鍵）、A／D 改成左右平移。'
+        + '滑鼠轉向會鎖定指標，Esc 放開，點畫布重新鎖定。跟隨模式下鏡頭會擺到牠身後。' },
 
     { group: '呈現' },
     { id: 'taa', type: 'slider', label: '時間累積', min: 0, max: 0.94, step: 0.01, value: 0.78 },
@@ -868,6 +878,35 @@ class MarchScene {
       this.targetDist = clamp(this.targetDist * Math.exp(e.deltaY * 0.0011), 2.0, 12);
     };
     ctx.canvas.addEventListener('wheel', this._onWheel, { passive: false });
+
+    /* ── mouse-look ──
+       Pointer lock is what makes turning unbounded: without it the
+       cursor reaches the edge of the screen and the cat stops turning
+       halfway through a corner. It is requested on the keypress that
+       enters the mode, which is the user gesture browsers require.
+
+       It is not required, though. If the lock is refused, or the user
+       drops it with Escape, the mode still works off the ordinary
+       pointer deltas the app already accumulates — it just runs out of
+       desk. Degrading to something usable beats refusing the mode. */
+    this._lookDx = 0;
+    this._lookDy = 0;
+
+    this._onMouseMove = (e) => {
+      if (document.pointerLockElement !== ctx.canvas) return;
+      this._lookDx += e.movementX;
+      this._lookDy += e.movementY;
+    };
+    this._onLockChange = () => {
+      this._lookDx = this._lookDy = 0;
+    };
+    document.addEventListener('mousemove', this._onMouseMove);
+    document.addEventListener('pointerlockchange', this._onLockChange);
+  }
+
+  /** True while the cursor is captured, which changes what the mouse means. */
+  get locked() {
+    return document.pointerLockElement === this.ctx.canvas;
   }
 
   /* ── pointer ──────────────────────────────────────────────────── */
@@ -882,6 +921,11 @@ class MarchScene {
   onPointerDown() {
     this._pressed = true;
     this._dragDist = 0;
+
+    // Escape drops the lock, and there has to be a way back that is not
+    // "toggle the mode off and on again". Clicking the canvas is the
+    // convention, and it costs the click nothing: the burst still fires.
+    if (this._showCat && this.cat.mode === 'look' && !this.locked) this._requestLock();
   }
 
   onPointerUp() {
@@ -898,7 +942,44 @@ class MarchScene {
    */
   onKey(e, down) {
     if (!this.cat || !this._showCat) return false;
+
+    // Y swaps how the cat is driven. Guarded against auto-repeat, or
+    // holding the key flips the mode sixty times a second.
+    if (down && !e.repeat && e.key.toLowerCase() === 'y') {
+      this._setControlMode(this.cat.mode === 'look' ? 'turn' : 'look');
+      return true;
+    }
     return this.cat.onKey(e, down);
+  }
+
+  /**
+   * Switching modes also decides who owns the cursor. Entering mouse-look
+   * asks for it; leaving gives it back, because a captured cursor cannot
+   * reach the parameter panel and there is no way to guess that Escape
+   * is what releases it.
+   */
+  _setControlMode(mode) {
+    if (!this.cat?.setMode(mode)) return;
+    this._lookDx = this._lookDy = 0;
+
+    if (mode === 'look') this._requestLock();
+    else if (this.locked) document.exitPointerLock?.();
+  }
+
+  /**
+   * Ask for the cursor, and do not care if the answer is no.
+   *
+   * Refusal is routine rather than exceptional: an embedded or
+   * automated document may not be allowed the lock at all, and a user
+   * can simply have denied it. The mode is built to work either way, so
+   * the rejection is swallowed — left alone it surfaces as an
+   * unhandled promise, which reads like a fault and is not one. Older
+   * browsers return nothing here, hence the optional chaining.
+   */
+  _requestLock() {
+    try {
+      this.ctx.canvas.requestPointerLock?.()?.catch?.(() => {});
+    } catch { /* synchronous refusal, same non-event */ }
   }
 
   releaseKeys() { this.cat?.releaseKeys(); }
@@ -946,9 +1027,14 @@ class MarchScene {
     // Following something that is not being drawn is just a camera stuck
     // in a corner, so the mode needs the cat to actually be there.
     const follow = state.camera === 'follow' && Boolean(this.cat) && Boolean(state.cat);
+    // In mouse-look the pointer already has a job. Letting it orbit as
+    // well would fight the steering for the same movement.
+    const looking = this._showCat && this.cat?.mode === 'look';
     let moved = false;
 
-    if (pointer.down && pointer.moved) {
+    if (looking) {
+      moved = true;
+    } else if (pointer.down && pointer.moved) {
       this.yaw -= pointer.dx * 3.6;
       this.pitch = clamp(this.pitch + pointer.dy * 2.4, -0.35, 1.25);
       moved = true;
@@ -977,20 +1063,28 @@ class MarchScene {
       cy0 = ay = chest;
       cz = az = cat.z;
 
-      // Swing behind the cat, but only in proportion to how fast it is
-      // actually going. Snapping the camera round the moment the cat
-      // turns takes the steering out of the player's hands; letting it
-      // drift back while under way keeps them looking where they drive.
+      /* Swing behind the cat. Shortest way round, or the camera takes
+         the long path through a full turn every time the yaw crosses ±π.
+
+         How fast depends on who is steering. Under mouse-look the mouse
+         *is* the camera, so any lag reads as the view sticking; it is
+         pinned. Under A/D the lag is the point — snapping the camera
+         round the instant the cat turns takes the steering out of the
+         player's hands, so it drifts back only while under way. */
       const want = cat.yaw + Math.PI;
-      const speed = Math.min(1, Math.abs(cat.velocity) / 2.6);
-      if (speed > 0.01 && !pointer.down) {
-        // Shortest way round, or the camera takes the long path through
-        // a full turn every time the yaw crosses ±π.
-        let delta = (want - this.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI;
-        this.yaw += delta * (1 - Math.exp(-clock.wallDt * 2.4 * speed));
+      let delta = (want - this.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+
+      if (looking) {
+        this.yaw += delta;
         moved = true;
+      } else {
+        const speed = Math.min(1, Math.abs(cat.velocity) / 2.6);
+        if (speed > 0.01 && !pointer.down) {
+          this.yaw += delta * (1 - Math.exp(-clock.wallDt * 2.4 * speed));
+          moved = true;
+        }
       }
-      if (Math.abs(cat.velocity) > 1e-3) moved = true;
+      if (cat.speed > 1e-3) moved = true;
     }
 
     // Ease both rather than jumping: at speed the cat covers several
@@ -1046,12 +1140,42 @@ class MarchScene {
     up[2] = rx * fy - ry * fx;
   }
 
+  /**
+   * Hand this frame's mouse movement to the cat, in radians.
+   *
+   * Two sources for the same gesture. Locked, the browser reports raw
+   * device movement in pixels and the cursor never runs out of room.
+   * Unlocked, the app's own pointer deltas are already accumulated per
+   * frame — they are in fractions of the canvas, so a sweep across it is
+   * about half a turn, and that is as far as one sweep can go.
+   */
+  _feedLook(pointer) {
+    if (this.cat.mode !== 'look') return;
+
+    if (this.locked) {
+      this.cat.look(this._lookDx * LOOK_PER_PIXEL, this._lookDy * LOOK_PER_PIXEL);
+      this._lookDx = this._lookDy = 0;
+    } else {
+      this.cat.look(pointer.dx * LOOK_PER_SWEEP, pointer.dy * LOOK_PER_SWEEP);
+    }
+
+    // Pitch belongs to the camera, not the animal. Same sign as the
+    // existing orbit drag, so pushing the mouse down raises the camera
+    // whichever way you are steering.
+    this.pitch = clamp(this.pitch + this.cat.takeLookPitch() * PITCH_FROM_LOOK, -0.35, 1.25);
+  }
+
   /** The ray under the pointer, in world space. Matches the shader. */
   _pointerRay(pointer, out) {
     const focal = 1.5;
     const aspect = this.width / Math.max(this.height, 1);
-    const ndcX = pointer.x * 2 - 1;
-    const ndcY = 1 - pointer.y * 2;
+    // With the cursor captured there is no cursor to aim with: it stops
+    // reporting a position the moment the lock takes hold. Centre of
+    // frame is the only honest answer, and it is what a crosshair would
+    // do anyway — so clicking still strikes the surface in mouse-look.
+    const locked = this.locked;
+    const ndcX = locked ? 0 : pointer.x * 2 - 1;
+    const ndcY = locked ? 0 : 1 - pointer.y * 2;
     const { right, up, fwd } = this.basis;
 
     let x = fwd[0] + right[0] * ndcX * aspect / focal + up[0] * ndcY / focal;
@@ -1326,8 +1450,12 @@ class MarchScene {
        the amount that makes it feel loose. */
     const showCat = Boolean(this.cat && state.cat);
     this._showCat = showCat;                    // read by onKey, which has no state
-    if (showCat) this.cat.update(dt, FLOOR_Y);
-    else if (this.cat) this.cat.releaseKeys();  // or it resumes mid-stride
+    if (showCat) {
+      this._feedLook(pointer);
+      this.cat.update(dt, FLOOR_Y);
+    } else if (this.cat) {
+      this.cat.releaseKeys();                   // or it resumes mid-stride
+    }
 
     this._updateCamera(state, clock, pointer);
 
@@ -1492,13 +1620,22 @@ class MarchScene {
     if (this.catError) out['貓'] = '載入失敗';
     else if (this._showCat) {
       out['貓的位置'] = `${this.cat.x.toFixed(2)}, ${this.cat.z.toFixed(2)}`;
-      out['貓的速度'] = `${Math.abs(this.cat.velocity).toFixed(2)} u/s`;
+      out['貓的速度'] = `${this.cat.speed.toFixed(2)} u/s`;
+      // Whether the cursor is captured is not cosmetic — it decides what
+      // the mouse does and how far the cat can turn — so it is stated.
+      out['操作模式'] = this.cat.mode === 'look'
+        ? (this.locked ? '滑鼠轉向 · 已鎖定指標' : '滑鼠轉向 · 未鎖定（點畫布可重新鎖定）')
+        : 'A／D 轉向';
     }
     return out;
   }
 
   dispose() {
     this.ctx.canvas.removeEventListener('wheel', this._onWheel);
+    document.removeEventListener('mousemove', this._onMouseMove);
+    document.removeEventListener('pointerlockchange', this._onLockChange);
+    // Leaving the scene must never leave the cursor captured by it.
+    if (this.locked) document.exitPointerLock?.();
     this.march.dispose();
     this.accum.dispose();
     this.resolve.dispose();

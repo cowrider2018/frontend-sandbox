@@ -160,6 +160,20 @@ const ACCEL = 7.0;       // how hard it gets moving, units/s²
 const DRAG = 6.0;        // and how hard it stops
 const TOP_SPEED = 2.6;   // units/s at full scale
 const TURN_RATE = 3.2;   // radians/s
+const STRAFE_SCALE = 0.85;  // sidling is slower than walking, as it should be
+
+/**
+ * Two ways to drive a cat.
+ *
+ *   turn   A and D steer the body, W and S drive it along its nose.
+ *          Everything is relative to the animal; the mouse is free for
+ *          orbiting and for striking the spheres.
+ *
+ *   look   the mouse turns it — no button held — and WASD becomes the
+ *          usual four-way: W/S along the nose, A/D sidestepping. The
+ *          body can now move in a direction it is not facing.
+ */
+export const CONTROL_MODES = ['turn', 'look'];
 
 export class Cat {
   /** Fetch and upload. Returns null if the asset is missing, never throws. */
@@ -234,20 +248,28 @@ export class Cat {
     this.x = 1.6;
     this.z = 1.6;
     this.yaw = -0.6;
+    /** Signed speed along the nose. Kept as the scalar it always was —
+        the camera, the gait and the readout all still mean this by it. */
     this.velocity = 0;
+    /** Signed speed along the cat's own right. Only `look` mode has it. */
+    this.strafeVel = 0;
     this.floorY = 0;
     this.animating = true;
+    this.mode = 'turn';
+    /** Radians of mouse-look banked since the last update. */
+    this._lookYaw = 0;
+    this._lookPitch = 0;
+    /** Signed turn rate, −1…1, for the lean and the tail. Derived from
+        the yaw that actually happened, so both modes feed it alike. */
+    this.turnRate = 0;
 
     this.keys = { w: false, a: false, s: false, d: false };
     this._model = new Float32Array(16);
     this._jitter = new Float32Array(2);
   }
 
-  /** True while it is actually being driven — the scene uses this to
-      decide whether WASD belongs to the cat or to the app's shortcuts. */
-  get driving() {
-    return this.keys.w || this.keys.a || this.keys.s || this.keys.d;
-  }
+  /** Total ground speed, whichever direction it is going. */
+  get speed() { return Math.hypot(this.velocity, this.strafeVel); }
 
   onKey(e, down) {
     const k = e.key.toLowerCase();
@@ -259,34 +281,92 @@ export class Cat {
     this.keys.w = this.keys.a = this.keys.s = this.keys.d = false;
   }
 
+  setMode(mode) {
+    if (!CONTROL_MODES.includes(mode) || mode === this.mode) return false;
+    this.mode = mode;
+    // Sideways momentum has nowhere to go once A and D go back to
+    // steering, and leaving it in would slide the cat for half a second
+    // after the switch.
+    this.strafeVel = 0;
+    this._lookYaw = this._lookPitch = 0;
+    return true;
+  }
+
+  /**
+   * Bank mouse-look, in radians, to be spent on the next update.
+   *
+   * Accumulated rather than applied here because the mouse fires far
+   * more often than the frame does — a 1000 Hz mouse would otherwise
+   * turn the cat sixteen times between two pictures of it.
+   */
+  look(dYaw, dPitch) {
+    this._lookYaw += dYaw;
+    this._lookPitch += dPitch;
+  }
+
+  /** Take the banked pitch, in radians. The camera owns pitch, not the cat. */
+  takeLookPitch() {
+    const p = this._lookPitch;
+    this._lookPitch = 0;
+    return p;
+  }
+
   /**
    * Advance locomotion and the pose.
    *
-   * Movement is in the floor plane and always relative to where the cat
-   * is facing, not to the camera: A and D steer rather than strafe. That
-   * is what makes the third-person view feel like driving an animal
-   * instead of dragging a sprite.
+   * Movement is always in the floor plane and always relative to the
+   * cat, never to the camera — what changes between the two modes is
+   * only what A and D mean, and where the heading comes from.
    */
   update(dt, floorY) {
     const d = Math.min(0.05, Math.max(0, dt));
     this.floorY = floorY;
 
     const forward = (this.keys.w ? 1 : 0) - (this.keys.s ? 1 : 0);
-    const steer = (this.keys.a ? 1 : 0) - (this.keys.d ? 1 : 0);
+    const ad = (this.keys.a ? 1 : 0) - (this.keys.d ? 1 : 0);
+    const look = this.mode === 'look';
+    const steer = look ? 0 : ad;
+    const strafe = look ? -ad : 0;   // A is left, and left is −right
 
-    this.velocity += (forward * TOP_SPEED - this.velocity) * (1 - Math.exp(-d * (forward ? ACCEL : DRAG)));
+    const yawBefore = this.yaw;
+
+    if (look) {
+      // Turning right means *decreasing* yaw: the heading (sin, cos)
+      // differentiates to (cos, −sin), which points along the cat's left.
+      this.yaw -= this._lookYaw;
+      this._lookYaw = 0;
+    } else {
+      // Turning is scaled by how fast it is going, with a floor so the
+      // cat can still pivot on the spot — a body that spins at full rate
+      // while stationary looks like a turret.
+      this.yaw += steer * TURN_RATE * d
+        * (0.35 + 0.65 * Math.min(1, Math.abs(this.velocity) / TOP_SPEED));
+    }
+
+    const ease = (v, want, input) => v + (want - v) * (1 - Math.exp(-d * (input ? ACCEL : DRAG)));
+    this.velocity = ease(this.velocity, forward * TOP_SPEED, forward);
+    this.strafeVel = ease(this.strafeVel, strafe * TOP_SPEED * STRAFE_SCALE, strafe);
     if (Math.abs(this.velocity) < 1e-4) this.velocity = 0;
+    if (Math.abs(this.strafeVel) < 1e-4) this.strafeVel = 0;
 
-    // Turning is scaled by how fast it is going, with a floor so the cat
-    // can still pivot on the spot — a body that spins at full rate while
-    // stationary looks like a turret.
-    this.yaw += steer * TURN_RATE * d * (0.35 + 0.65 * Math.min(1, Math.abs(this.velocity) / TOP_SPEED));
+    /* Nose and right-hand side. `right` is cross(facing, up), which for
+       a right-handed frame with Y up puts the cat's right at (−cos, sin)
+       — the same basis the camera builds, so "right" means one thing
+       everywhere in this scene. */
+    const fx = Math.sin(this.yaw), fz = Math.cos(this.yaw);
+    const rx = -fz, rz = fx;
 
-    this.x += Math.sin(this.yaw) * this.velocity * d;
-    this.z += Math.cos(this.yaw) * this.velocity * d;
+    this.x += (fx * this.velocity + rx * this.strafeVel) * d;
+    this.z += (fz * this.velocity + rz * this.strafeVel) * d;
 
-    const speed = Math.min(1, Math.abs(this.velocity) / TOP_SPEED);
-    const pose = this.driver.step(d, speed, steer);
+    // One turn signal for both modes, taken from the yaw that actually
+    // happened rather than from whichever input caused it. The lean and
+    // the tail then behave the same however the cat is being driven.
+    const turned = d > 0 ? (this.yaw - yawBefore) / (TURN_RATE * d) : 0;
+    this.turnRate = Math.max(-1, Math.min(1, turned));
+
+    const speed = Math.min(1, this.speed / TOP_SPEED);
+    const pose = this.driver.step(d, speed, this.turnRate);
     applyPose(this.rig, pose);
     this.rig.update();
 
@@ -302,7 +382,8 @@ export class Cat {
     // but also breathing, a flicking ear, a blink — which lasts about six
     // frames and would otherwise resolve as a smear — or a tail still
     // settling after the body has stopped.
-    this.animating = this.velocity !== 0 || this.rig.changed || this.sway.activity > 2e-3;
+    this.animating = this.speed !== 0 || this.turnRate !== 0
+      || this.rig.changed || this.sway.activity > 2e-3;
 
     modelMatrix(this._model, this.x, floorY + this.footOffset, this.z, this.yaw, this.scale);
     return this;
@@ -314,6 +395,10 @@ export class Cat {
     this.z = 1.6;
     this.yaw = -0.6;
     this.velocity = 0;
+    this.strafeVel = 0;
+    this.turnRate = 0;
+    this._lookYaw = this._lookPitch = 0;
+    this.mode = 'turn';
     this.releaseKeys();
     this.rig.reset();
     this.driver = new Driver();

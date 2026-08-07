@@ -107,6 +107,18 @@ const SHOTS_PLAN = [
     hold: { key: 'w', ms: 2200 },
     poke: '__aether.scene.targetDist = 1.9; return true;' },
 
+  // Mouse-look, sidling. The body is facing where it started and the
+  // whole cat has moved across its own nose — the one thing A and D
+  // cannot do in the default mode.
+  { name: '15-cat-strafe', hash: '#/march?spin=0&scale=1&taa=0.9&camera=follow', settle: 2500,
+    pre: `const c = __aether.scene.cat;
+          c.x = 0.4; c.z = 3.0; c.yaw = 1.57;
+          __aether.scene._setControlMode('look');
+          document.exitPointerLock?.();
+          return true;`,
+    hold: { key: ['d'], ms: 1400 },
+    poke: '__aether.scene.targetDist = 2.6; return true;' },
+
   // Turning hard, photographed a quarter second after the keys are
   // released: the body has stopped rotating and the tail has not. What
   // is visible in this frame is entirely the spring chain unwinding.
@@ -1144,6 +1156,65 @@ async function interact(cdp, base, problems) {
   check('and hands S back when the cat is hidden', released);
   await cdp.eval(`__aether.panel.setValues({ cat: true }); true`);
   await sleep(200);
+
+  /* ── mouse-look ──
+     Y swaps what the mouse and A/D mean. The lock is released straight
+     after switching so these exercise the unlocked fallback: synthetic
+     events do not carry the movementX a captured pointer reports, and a
+     test that silently depended on the lock being granted would pass or
+     fail on the browser's mood. */
+  await key('y', { vk: 89 });
+  const mode = await cdp.eval(`(() => {
+    document.exitPointerLock?.();
+    return __aether.scene.cat.mode;
+  })()`);
+  check('Y switches to mouse-look', mode === 'look', `mode = ${mode}`);
+  await sleep(200);
+
+  const catYaw0 = await cdp.eval(`__aether.scene.cat.yaw`);
+  await mouse('mouseMoved', 440, 450, { buttons: 0 });
+  await sleep(60);
+  await mouse('mouseMoved', 960, 450, { buttons: 0 });
+  await sleep(220);
+  const catYaw1 = await cdp.eval(`__aether.scene.cat.yaw`);
+  check('the mouse turns the cat with no button held',
+    Math.abs(catYaw1 - catYaw0) > 0.2,
+    `yaw ${catYaw0.toFixed(2)} → ${catYaw1.toFixed(2)}`);
+
+  /* Strafing is movement the cat is not facing. Measured as the
+     component across its own nose, which is exactly what "平移" means
+     and what steering would leave at zero. */
+  const strafed = await cdp.eval(`(() => {
+    const c = __aether.scene.cat;
+    c.x = 0; c.z = 0; c.velocity = 0; c.strafeVel = 0;
+    return { yaw: c.yaw };
+  })()`);
+  await hold(['d'], 700);
+  const moved = await cdp.eval(`(() => {
+    const c = __aether.scene.cat;
+    const fx = Math.sin(${strafed.yaw}), fz = Math.cos(${strafed.yaw});
+    return {
+      along: c.x * fx + c.z * fz,          // forward component
+      across: c.x * -fz + c.z * fx,        // along its own right
+      yawDrift: c.yaw - ${strafed.yaw},
+    };
+  })()`);
+  check('A and D strafe instead of steering in mouse-look',
+    Math.abs(moved.across) > 0.3 && Math.abs(moved.across) > Math.abs(moved.along) * 2
+      && Math.abs(moved.yawDrift) < 0.01,
+    `across ${moved.across.toFixed(2)} · along ${moved.along.toFixed(2)} · yaw drift ${moved.yawDrift.toFixed(3)}`);
+
+  await key('y', { vk: 89 });
+  const back = await cdp.eval(`(() => {
+    const c = __aether.scene.cat;
+    c.velocity = 0; c.strafeVel = 0;
+    return { mode: c.mode, yaw: c.yaw };
+  })()`);
+  await hold(['d'], 600);
+  const steered = await cdp.eval(`__aether.scene.cat.yaw`);
+  check('Y switches back, and A/D steers again',
+    back.mode === 'turn' && Math.abs(steered - back.yaw) > 0.1,
+    `mode = ${back.mode}, yaw ${back.yaw.toFixed(2)} → ${steered.toFixed(2)}`);
 
   /* reset puts back everything: parameters, camera and the URL. It used
      to do only half of that, with the other half hidden in a separate
