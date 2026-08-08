@@ -349,6 +349,17 @@ const TURN_RATE = 3.2;   // radians/s, steering into a corner
 const TURN_RATE_COURSE = 6.0;
 const STRAFE_SCALE = 0.85;  // sidling is slower than walking, as it should be
 
+/* How far the head will turn on its own before the body has to help.
+   A cat looks at things by turning its head; the body comes round only
+   when the head runs out of neck. */
+export const HEAD_YAW_MAX = 0.9;
+/* The head snaps onto an aim and lets go of it slowly. Fast in, because
+   the shot leaves at the end of the turn and a head still catching up
+   when it does is a head that was not aiming; slow out, so it drifts
+   back to the gait instead of dropping. */
+const AIM_ATTACK = 0.05;
+const AIM_RELEASE = 0.45;
+
 /**
  * Two ways to drive a cat.
  *
@@ -458,6 +469,13 @@ export class Cat {
     this.floorY = 0;
     this.animating = true;
     this.mode = 'camera';
+    /* Where the head is being pointed, relative to the body, and how
+       much of that is currently applied. Held by whatever is aiming; it
+       lets go on its own once nothing renews it. */
+    this._aimYaw = 0;
+    this._aimPitch = 0;
+    this._aimWeight = 0;
+    this._aimHeld = false;
     /** Radians of mouse-look banked since the last update. */
     this._lookYaw = 0;
     this._lookPitch = 0;
@@ -534,6 +552,19 @@ export class Cat {
     // cat in order to read where its eyes ended up, and a stale matrix
     // would hand them the eyes it had before it turned.
     modelMatrix(this._model, this.x, this.floorY + this.footOffset, this.z, this.yaw, this.scale);
+  }
+
+  /**
+   * Point the head, relative to the body it is on.
+   *
+   * @param {number} yaw    left or right of the body's own heading
+   * @param {number} pitch  in the head bone's sense, where positive is
+   *                        nose-down, so aiming up is negative
+   */
+  setAim(yaw, pitch) {
+    this._aimYaw = Math.max(-HEAD_YAW_MAX, Math.min(HEAD_YAW_MAX, yaw));
+    this._aimPitch = pitch;
+    this._aimHeld = true;
   }
 
   /** Swap the colourway. One buffer upload; the geometry is shared. */
@@ -670,8 +701,19 @@ export class Cat {
     const turned = d > 0 ? (this.yaw - yawBefore) / (TURN_RATE * d) : 0;
     this.turnRate = Math.max(-1, Math.min(1, turned));
 
+    /* The aim fades in while something is holding it and drains away
+       once nothing is, so the head returns to the gait by itself rather
+       than snapping back the instant a shot ends. */
+    const toward = this._aimHeld ? 1 : 0;
+    const rate = this._aimHeld ? AIM_ATTACK : AIM_RELEASE;
+    this._aimWeight += (toward - this._aimWeight) * (1 - Math.exp(-d / rate));
+    this._aimHeld = false;                  // renewed each frame or released
+
     const speed = Math.min(1, this.speed / TOP_SPEED);
     const pose = this.driver.step(d, speed, this.turnRate);
+    pose.aimYaw = this._aimYaw;
+    pose.aimPitch = this._aimPitch;
+    pose.aimWeight = this._aimWeight;
     applyPose(this.rig, pose);
     this.rig.update();
 
@@ -786,6 +828,8 @@ export class Cat {
     this.strafeVel = 0;
     this.turnRate = 0;
     this._lookYaw = this._lookPitch = 0;
+    this._aimYaw = this._aimPitch = this._aimWeight = 0;
+    this._aimHeld = false;
     this.mode = 'camera';
     this.releaseKeys();
     this.rig.reset();

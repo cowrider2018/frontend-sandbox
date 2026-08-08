@@ -1672,17 +1672,55 @@ async function interact(cdp, base, problems) {
     const e = s.laser.origin;
     let tx = -e[0], ty = -e[1], tz = -e[2];      // cluster sits at the origin
     const l = Math.hypot(tx, ty, tz) || 1;
+    /* The *head*, not the body: the neck covers most of the turn now, so
+       the body deliberately stops short of facing the target. */
+    const headYaw = c.yaw + c.rig.rotation[c.rig.bone('head') * 3 + 1];
     return {
       yaw: c.yaw,
       onTarget: (tx / l) * d[0] + (ty / l) * d[1] + (tz / l) * d[2],
-      facing: Math.sin(c.yaw) * (tx / l) + Math.cos(c.yaw) * (tz / l),
+      facing: Math.sin(headYaw) * (tx / l) + Math.cos(headYaw) * (tz / l),
     };
   })()`);
 
-  check('an unlocked click turns the cat to face the target and fires along that line',
+  check('an unlocked click turns the cat onto the target and fires along that line',
     Math.abs(aimedAt.yaw - before) > 0.2 && aimedAt.onTarget > 0.9 && aimedAt.facing > 0.9,
-    `yaw ${before.toFixed(2)} → ${aimedAt.yaw.toFixed(2)}, `
-    + `beam·target ${aimedAt.onTarget.toFixed(3)}, facing·target ${aimedAt.facing.toFixed(3)}`);
+    `body yaw ${before.toFixed(2)} → ${aimedAt.yaw.toFixed(2)}, `
+    + `beam·target ${aimedAt.onTarget.toFixed(3)}, head·target ${aimedAt.facing.toFixed(3)}`);
+
+  /* The head points down the beam, and it is the head that does most of
+     the turning. Both are driven directly rather than through a click,
+     so the angles are exact rather than whatever a cursor happened to
+     pick. */
+  const aimed2 = await cdp.eval(`(() => {
+    const s = __aether.scene, c = s.cat, r = c.rig;
+    const head = r.bone('head');
+    // Hold an aim until the weight has settled, then read the bone.
+    const pitchFor = (dx, dy, dz) => {
+      for (let i = 0; i < 40; i++) { s._aimAlong(dx, dy, dz); c.update(1 / 60, -1.35, s.basis); }
+      return r.rotation[head * 3];
+    };
+    const up = pitchFor(0, 1, 0.3);
+    const down = pitchFor(0, -1, 0.3);
+
+    // A modest turn, well inside what the neck can cover on its own.
+    c.x = 3.4; c.z = 3.4;
+    const want = Math.atan2(-c.x, -c.z);
+    c.yaw = want - 0.55;
+    const before = c.yaw;
+    s._aimShot = { x: 0, y: 0, z: 0, t: 0.15 };
+    for (let i = 0; i < 20; i++) { s._aimTick(1 / 60); c.update(1 / 60, -1.35, s.basis); }
+
+    const wrap = (a) => Math.abs((a + Math.PI * 3) % (Math.PI * 2) - Math.PI);
+    return { up, down, body: wrap(c.yaw - before), head: Math.abs(c._aimYaw) };
+  })()`);
+
+  // Positive rotation on the head bone is nose-down, so up must be less.
+  check('the head pitches to follow the beam',
+    aimed2.up < aimed2.down - 0.6,
+    `head pitch ${aimed2.up.toFixed(2)} aiming up vs ${aimed2.down.toFixed(2)} aiming down`);
+  check('the head leads the turn and the body only follows',
+    aimed2.head > aimed2.body * 2,
+    `head turned ${aimed2.head.toFixed(2)} rad, body ${aimed2.body.toFixed(2)}`);
 
   await cdp.eval(`__aether.clock.paused = false; true`);
   await sleep(300);

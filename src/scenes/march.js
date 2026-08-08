@@ -30,7 +30,7 @@ import {
   BALL_N, RIPPLE_N, RING_MAJOR, RING_MINOR, FLOOR_Y, DISPLACE_AMP,
   CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_LAYERS, CLUSTER_SHADOW, SKY,
 } from './cluster.js';
-import { Cat, CAT_PROXY_GLSL, CAT_CAPS } from './cat/index.js';
+import { Cat, CAT_PROXY_GLSL, CAT_CAPS, HEAD_YAW_MAX } from './cat/index.js';
 import { Laser } from './laser.js';
 
 /* Mouse-look sensitivity. The locked figure is per device pixel and is
@@ -56,6 +56,10 @@ const AIM_TURN = 0.15;
 /* How much more material a beam dissipates than a click. A click dents;
    a beam has to go through, and a hole must be deeper than the wall. */
 const BORE_ERODE = 4.0;
+/* How much the body comes round with the head even when the neck could
+   have covered the whole angle on its own. A cat turning to look does
+   move its shoulders a little; none at all reads as an owl. */
+const BODY_FOLLOW = 0.25;
 
 /* Uploaded in place of the cat's capsules when there is no cat. The
    shader is gated on the count, but a sampler-free uniform array still
@@ -1304,7 +1308,20 @@ class MarchScene {
     // follows the cursor's own ray out into the sky.
     if (!hit) return this._shootAlong(this._pointerRay(pointer, this._ray));
 
-    this._aimShot = { x: hit[0], y: hit[1], z: hit[2], t: AIM_TURN };
+    /* The body's share is settled here, once, not renegotiated every
+       frame. Recomputing it while easing by "the time that is left"
+       makes the body chase a quarter of the *remaining* angle over and
+       over, and it arrives having turned far more than its share. */
+    const wrap = (a) => (a + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+    const cat = this.cat;
+    const need = wrap(Math.atan2(hit[0] - cat.x, hit[2] - cat.z) - cat.yaw);
+    const beyondNeck = need - Math.max(-HEAD_YAW_MAX, Math.min(HEAD_YAW_MAX, need));
+
+    this._aimShot = {
+      x: hit[0], y: hit[1], z: hit[2], t: AIM_TURN,
+      // Where the body will have got to when the head arrives.
+      bodyYaw: cat.yaw + beyondNeck + (need - beyondNeck) * BODY_FOLLOW,
+    };
     return true;
   }
 
@@ -1324,11 +1341,29 @@ class MarchScene {
     if (!this._catView) { this._aimShot = null; return; }
 
     const cat = this.cat;
-    const want = Math.atan2(shot.x - cat.x, shot.z - cat.z);
-    const delta = (want - cat.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+    const wrap = (a) => (a + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+
+    /* Settle the body's share if whoever booked the shot did not. */
+    if (shot.bodyYaw === undefined) {
+      const need = wrap(Math.atan2(shot.x - cat.x, shot.z - cat.z) - cat.yaw);
+      const beyond = need - Math.max(-HEAD_YAW_MAX, Math.min(HEAD_YAW_MAX, need));
+      shot.bodyYaw = cat.yaw + beyond + (need - beyond) * BODY_FOLLOW;
+    }
+
+    /* The head leads and the body follows, which is how an animal looks
+       at something: the neck covers what it can, and the shoulders come
+       round only for the part it cannot — plus a little besides, because
+       a cat that turned nothing but its head would read as an owl.
+
+       The body eases toward the share fixed when the shot was booked, so
+       the fraction of the time left is a fraction of a fixed distance
+       and it arrives exactly as the delay runs out. */
     const step = shot.t > dt ? dt / shot.t : 1;
-    const yaw = cat.yaw + delta * step;
+    const yaw = cat.yaw + wrap(shot.bodyYaw - cat.yaw) * step;
     cat.faceTowards(Math.sin(yaw), Math.cos(yaw));
+
+    // Whatever the body did not take, the neck does.
+    this._aimHead(shot.x, shot.y, shot.z);
 
     shot.t -= dt;
     if (shot.t > 0) return;
@@ -1346,6 +1381,36 @@ class MarchScene {
     this._shootAlong(aim);
   }
 
+  /**
+   * Turn the head onto a world point, leaving the body where it is.
+   *
+   * Pitch is taken from the line the beam will actually travel rather
+   * than from the target's height alone, so a shot fired from a crouched
+   * cat at something just above it still points the nose up the beam.
+   */
+  _aimHead(tx, ty, tz) {
+    const cat = this.cat;
+    cat.eyeWorld(0, this._eyeA);
+    cat.eyeWorld(1, this._eyeB);
+
+    const dx = tx - (this._eyeA[0] + this._eyeB[0]) * 0.5;
+    const dy = ty - (this._eyeA[1] + this._eyeB[1]) * 0.5;
+    const dz = tz - (this._eyeA[2] + this._eyeB[2]) * 0.5;
+    this._aimAlong(dx, dy, dz);
+  }
+
+  /** The same, from a direction rather than a point. */
+  _aimAlong(dx, dy, dz) {
+    const cat = this.cat;
+    const l = Math.hypot(dx, dy, dz) || 1;
+    const wrap = (a) => (a + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+
+    const yaw = wrap(Math.atan2(dx, dz) - cat.yaw);
+    // The head bone's positive X is nose-down, so looking up is negative.
+    const pitch = -Math.asin(Math.max(-1, Math.min(1, dy / l)));
+    cat.setAim(yaw, pitch);
+  }
+
   /** Fire, from wherever the eyes are now, along a unit direction. */
   _shootAlong(dir) {
     if (!this._catView) return false;
@@ -1355,6 +1420,10 @@ class MarchScene {
 
     const aim = this._aim;
     if (aim !== dir) aim.set(dir);
+
+    // Look down the barrel: the head turns to whatever was just fired
+    // along, in either mode, and lets go of it a moment later.
+    this._aimAlong(aim[0], aim[1], aim[2]);
 
     const mid = [(this._eyeA[0] + this._eyeB[0]) * 0.5,
                  (this._eyeA[1] + this._eyeB[1]) * 0.5,

@@ -132,8 +132,8 @@ export class Sway {
     // The head's absolute aim: where the body points, plus where the neck
     // is turned on top of it. Same multipliers `applyPose` uses, or the
     // whiskers would trail a head that is not the one being drawn.
-    this.headYaw.step(yaw + pose.headYaw * 0.85, d);
-    this.headPitch.step(pitch + pose.headPitch * 0.8, d);
+    this.headYaw.step(yaw + pose.headYaw * 0.85 + pose.aimYaw * pose.aimWeight, d);
+    this.headPitch.step(pitch + pose.headPitch * 0.8 + pose.aimPitch * pose.aimWeight, d);
 
     for (let i = 0; i <= SEG; i++) {
       const o = i / SEG;
@@ -187,6 +187,10 @@ export class Driver {
       // those are is settled in `buildCache`.
       hipA: 0, kneeA: 0, shoulderA: 0,
       hipB: 0, kneeB: 0, shoulderB: 0,
+      /* Where the head is being aimed, over and above whatever the gait
+         is doing with it, and how much of that to apply. Written from
+         outside — the driver has no idea anything is being aimed at. */
+      aimYaw: 0, aimPitch: 0, aimWeight: 0,
     };
   }
 
@@ -323,7 +327,13 @@ function buildCache(rig) {
 export function applyPose(rig, p) {
   const B = rig._cache ??= buildCache(rig);
 
-  rig.setRotation(B.head, HEAD_LEAN + p.headPitch * 0.8, p.headYaw * 0.85, p.headTilt);
+  /* The aim rides on top of the gait's own head motion rather than
+     replacing it, so a cat tracking something still breathes and still
+     leans into its corners. */
+  rig.setRotation(B.head,
+    HEAD_LEAN + p.headPitch * 0.8 + p.aimPitch * p.aimWeight,
+    p.headYaw * 0.85 + p.aimYaw * p.aimWeight,
+    p.headTilt);
 
   // The ears carry a rest roll that splays them outward; the pose adds
   // to it rather than replacing it, and mirrored so both flick the same
