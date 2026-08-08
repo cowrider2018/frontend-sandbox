@@ -21,7 +21,7 @@ import { PRECISION } from '../shaders/common.js';
 
 /** How long a shot lives, in seconds. A zap, not a sustained ray. */
 const LIFE = 0.22;
-/** World length of the beam. Depth clipping decides where it really ends. */
+/** Fallback length, if the caller does not say where the beam stops. */
 const REACH = 40.0;
 /** Half-width in NDC, so the beam holds its thickness at any range. */
 const WIDTH = 0.0075;
@@ -146,17 +146,21 @@ export class Laser {
     /** Midpoint of the two eyes: the one axis everything physical uses. */
     this.origin = new Float32Array(3);
     this.dir = new Float32Array([0, 0, 1]);
+    /** Where this shot stops. Measured by the caller against the field,
+        because a depth test hides a beam without ending it. */
+    this.reach = REACH;
   }
 
   get active() { return this.age < LIFE; }
   /** 1 at the instant of firing, 0 when spent. */
   get fade() { return Math.max(0, 1 - this.age / LIFE); }
 
-  fire(eyeA, eyeB, dir) {
+  fire(eyeA, eyeB, dir, reach = REACH) {
     this.eyeA.set(eyeA);
     this.eyeB.set(eyeB);
     for (let i = 0; i < 3; i++) this.origin[i] = (eyeA[i] + eyeB[i]) * 0.5;
     this.dir.set(dir);
+    this.reach = reach;
     this.age = 0;
   }
 
@@ -177,7 +181,7 @@ export class Laser {
       uFwd: camera.fwd,
       uFocal: camera.focal,
       uAspect: camera.aspect,
-      uReach: REACH,
+      uReach: this.reach,
       uWidth: WIDTH,
       uScene: sceneTexture,
       uResolution: resolution,

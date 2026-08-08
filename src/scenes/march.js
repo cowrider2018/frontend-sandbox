@@ -50,6 +50,10 @@ const BLAST_DAMP = 4.2;
 /** How far off the beam's axis a sphere still feels it, and how hard. */
 const BLAST_RADIUS = 1.5;
 const BLAST_FORCE = 7.0;
+/** Seconds between shots while the trigger is held. */
+const FIRE_INTERVAL = 0.13;
+/** How far a beam carries if it never hits anything. */
+const BEAM_REACH = 40.0;
 
 /* Uploaded in place of the cat's capsules when there is no cat. The
    shader is gated on the count, but a sampler-free uniform array still
@@ -589,7 +593,8 @@ export default {
       text: 'WASD 驅動貓在地面上走動。預設「依鏡頭方向」：WASD 是畫面上的前後左右，'
         + '貓會轉向該方向再走過去——按 S 牠就轉過身朝你走來。'
         + '按 Y 切換成「滑鼠轉向」：滑鼠滑動轉身（不用按鍵）、A／D 改成左右平移，'
-        + '**按滑鼠左鍵從眼睛射出雷射**，把星體沿光束軸向外炸開。'
+        + '**按住滑鼠左鍵從眼睛連發雷射**（準心方向），把星體沿光束軸向外炸開；'
+        + '指標未鎖定時改成點擊瞄準——貓會轉身面向游標指到的點再射。'
         + '這個模式會鎖定指標，Esc 放開，點畫布重新鎖定。' },
 
     { group: '呈現' },
@@ -682,6 +687,8 @@ class MarchScene {
     this.laser = new Laser(gl);
     this.shots = 0;
     this._blastDir = new Float32Array(3);
+    this._aim = new Float32Array(3);
+    this._fireCooldown = 0;
     this._eyeA = new Float32Array(3);
     this._eyeB = new Float32Array(3);
 
@@ -741,34 +748,37 @@ class MarchScene {
    * 25 fps a quick click can begin and end between two frames.
    */
   onPointerDown() {
-    /* One press, one shot. The pointer layer can report a press twice —
-       it self-heals a missed `pointerdown` from the first move that
-       arrives with the button already held, and a synthesised click can
-       deliver both — so arming on the press itself would fire twice for
-       one trigger pull. The transition is what a trigger is. */
     const alreadyDown = this._pressed;
     this._pressed = true;
     this._dragDist = 0;
-    if (alreadyDown) return;
+    if (alreadyDown) return;   // the same press, reported twice
 
-    if (this._showCat && this.cat.mode === 'look') {
-      /* Escape drops the lock, and clicking the canvas is the convention
-         for getting it back. The click fires as well as recapturing,
-         rather than being swallowed: the lock can be refused outright —
-         an embedded or automated document may never be granted it — and
-         a trigger that silently does nothing there would contradict the
-         whole point of the mode still working unlocked. */
-      if (!this.locked) this._requestLock();
-      this._pendingShot = true;
-    }
+    /* Escape drops the lock, and clicking the canvas is the convention
+       for getting it back. The click still fires: the lock can be
+       refused outright — an embedded or automated document may never be
+       granted it — and a trigger that silently did nothing there would
+       contradict the mode being built to work unlocked. */
+    if (this._showCat && this.cat.mode === 'look' && !this.locked) this._requestLock();
   }
 
   onPointerUp() {
-    // In mouse-look the click is a trigger, already taken on the way
-    // down; it must not also strike the surface on the way up.
-    const shooting = this._showCat && this.cat?.mode === 'look';
-    if (this._pressed && !shooting && this._dragDist < 0.015) this._pendingBurst = true;
+    /* What a click means on release depends on what the mouse is for.
+     *
+     *   mouse-look   the mouse is the weapon; the trigger is handled by
+     *                the held state, and nothing is owed here
+     *   with a cat   the mouse also orbits, so only a click that did not
+     *                drag counts, and it fires one shot
+     *   no cat       the original behaviour: it strikes the surface
+     */
+    const clicked = this._pressed && this._dragDist < 0.015;
+    const look = this._showCat && this.cat?.mode === 'look';
+
+    if (clicked && !look) {
+      if (this._showCat) this._pendingShot = true;
+      else this._pendingBurst = true;
+    }
     this._pressed = false;
+    this._fireCooldown = 0;   // the next press fires at once
   }
 
   /**
@@ -858,6 +868,7 @@ class MarchScene {
     this.ballOff.fill(0);
     this.ballVel.fill(0);
     this._pendingShot = false;
+    this._fireCooldown = 0;
     // The app has just put every slider back, including the master, so
     // forget where it last fired or it will stamp over them next frame.
     this._lastQuality = null;
@@ -1228,6 +1239,36 @@ class MarchScene {
   /* ── eye beams ──────────────────────────────────────────────────── */
 
   /**
+   * How far a beam gets before it hits something.
+   *
+   * Depth-testing the beam against the scene is not enough on its own:
+   * it hides the beam wherever something is nearer the eye, which is not
+   * the same as stopping it. A beam aimed through a sphere is correctly
+   * hidden inside that sphere and then reappears out the far side,
+   * carrying on into the sky, which reads as passing behind the cluster
+   * rather than striking it.
+   *
+   * So the range is found once, here, by walking the same field the
+   * picking does — and the floor, which is a plane and needs no walking.
+   */
+  _beamReach(ox, oy, oz, dir) {
+    let hit = BEAM_REACH;
+
+    if (dir[1] < -1e-4) {
+      const toFloor = (FLOOR_Y - oy) / dir[1];
+      if (toFloor > 0) hit = Math.min(hit, toFloor);
+    }
+
+    let t = 0.05;
+    for (let i = 0; i < 96 && t < hit; i++) {
+      const d = this._mapCPU(ox + dir[0] * t, oy + dir[1] * t, oz + dir[2] * t);
+      if (d < 0.002) return t;
+      t += Math.max(d * 0.9, 0.01);
+    }
+    return hit;
+  }
+
+  /**
    * Fire, from the eyes, down the crosshair.
    *
    * The aim is the camera's forward vector because in mouse-look that
@@ -1236,12 +1277,56 @@ class MarchScene {
    * the two agree. The same reasoning already decides where a click
    * strikes the surface.
    */
-  _fire() {
+  _fire(pointer) {
     if (!this._showCat) return false;
 
     this.cat.eyeWorld(0, this._eyeA);
     this.cat.eyeWorld(1, this._eyeB);
-    this.laser.fire(this._eyeA, this._eyeB, this.basis.fwd);
+    const ox = (this._eyeA[0] + this._eyeB[0]) * 0.5;
+    const oy = (this._eyeA[1] + this._eyeB[1]) * 0.5;
+    const oz = (this._eyeA[2] + this._eyeB[2]) * 0.5;
+
+    const aim = this._aim;
+    if (this.locked || !pointer) {
+      /* Captured pointer: there is no cursor to read, so the crosshair
+         is the aim and the camera's forward vector is the crosshair.
+         Also the answer when no pointer is supplied at all, which is how
+         a shot fired from code asks for the crosshair. */
+      aim.set(this.basis.fwd);
+    } else {
+      /* Free cursor: aim at whatever it is over. The line runs from the
+         eyes to that point, not from the camera — the cat is doing the
+         shooting, and from anywhere but directly behind it the two are
+         visibly different directions.
+
+         A click on empty sky has nothing to aim at, so the beam simply
+         follows the cursor's own ray out into it. */
+      const hit = this._pick(pointer);
+      if (!hit) {
+        aim.set(this._pointerRay(pointer, this._ray));
+        this.cat.faceTowards(aim[0], aim[2]);
+      } else {
+        const tx = hit[0], ty = hit[1], tz = hit[2];
+
+        // Turn first, then aim: turning moves the eyes, and a line drawn
+        // from where they used to be arrives beside the target.
+        this.cat.faceTowards(tx - ox, tz - oz);
+        this.cat.eyeWorld(0, this._eyeA);
+        this.cat.eyeWorld(1, this._eyeB);
+
+        aim[0] = tx - (this._eyeA[0] + this._eyeB[0]) * 0.5;
+        aim[1] = ty - (this._eyeA[1] + this._eyeB[1]) * 0.5;
+        aim[2] = tz - (this._eyeA[2] + this._eyeB[2]) * 0.5;
+        const l = Math.hypot(aim[0], aim[1], aim[2]) || 1;
+        aim[0] /= l; aim[1] /= l; aim[2] /= l;
+      }
+    }
+
+    const mid = [(this._eyeA[0] + this._eyeB[0]) * 0.5,
+                 (this._eyeA[1] + this._eyeB[1]) * 0.5,
+                 (this._eyeA[2] + this._eyeB[2]) * 0.5];
+    this.laser.fire(this._eyeA, this._eyeB, aim,
+      this._beamReach(mid[0], mid[1], mid[2], aim));
     this.shots++;
     this.flash = 1;
     this._blast();
@@ -1415,10 +1500,22 @@ class MarchScene {
     }
     /* Fired after the spheres are placed for this frame, so the blast is
        measured against where they actually are rather than where they
-       were when the button went down. */
+       were when the button went down.
+
+       In mouse-look the mouse has no other job, so holding the button
+       keeps firing on a cooldown — a beam weapon that needs one click
+       per shot is a beam weapon nobody uses twice. Everywhere else the
+       mouse still orbits, so a shot is one per click and is armed on
+       release, where a drag can already be told from a click. */
+    this._fireCooldown -= dt;
+    const holding = this._pressed && showCat && this.cat.mode === 'look';
+    if (holding && this._fireCooldown <= 0) {
+      this._fire(pointer);
+      this._fireCooldown = FIRE_INTERVAL;
+    }
     if (this._pendingShot) {
       this._pendingShot = false;
-      this._fire();
+      this._fire(pointer);
     }
     this.laser.update(dt);
     if (this.laser.active) this.moving = 1;

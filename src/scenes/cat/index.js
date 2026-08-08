@@ -519,6 +519,23 @@ export class Cat {
     this.keys.w = this.keys.a = this.keys.s = this.keys.d = false;
   }
 
+  /**
+   * Turn to face a direction on the ground, at once.
+   *
+   * Snapped rather than eased on purpose: this is used when the cat
+   * whips round to fire, and the beam leaves in the same instant. Easing
+   * the body would have the shot come from somewhere the animal is not
+   * yet looking, which reads as a mis-aim rather than as weight.
+   */
+  faceTowards(dx, dz) {
+    if (Math.abs(dx) < 1e-6 && Math.abs(dz) < 1e-6) return;
+    this.yaw = Math.atan2(dx, dz);
+    // Rebuild the placement now rather than next frame: callers turn the
+    // cat in order to read where its eyes ended up, and a stale matrix
+    // would hand them the eyes it had before it turned.
+    modelMatrix(this._model, this.x, this.floorY + this.footOffset, this.z, this.yaw, this.scale);
+  }
+
   /** Swap the colourway. One buffer upload; the geometry is shared. */
   setSkin(name) {
     if (name === this.skin || !this.colors.has(name)) return false;
