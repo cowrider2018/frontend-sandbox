@@ -32,6 +32,7 @@ import {
 } from './cluster.js';
 import { Cat, CAT_PROXY_GLSL, CAT_CAPS, HEAD_YAW_MAX } from './cat/index.js';
 import { Laser } from './laser.js';
+import { GroundCover, isCovered } from './ground.js';
 
 /* Mouse-look sensitivity. The locked figure is per device pixel and is
    the usual first-person number; the unlocked one is per canvas width,
@@ -88,6 +89,8 @@ uniform vec3  uCamPos, uRight, uUp, uFwd;
 uniform vec2  uResolution;
 uniform float uFocal;
 uniform float uRough, uFloorMix;
+/** 0 = the reference grid, 1 = soil, because something is growing on it. */
+uniform float uGround;
 uniform float uReflect, uFog, uAO, uShadowSoft;
 
 // Only the marcher draws the wavefront's glow; the field itself, and
@@ -214,12 +217,34 @@ ${SKY}
 
 vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
   if (mat > 1.5) {
+    metal = 0.0;
+
+    /* Soil, once there is a meadow standing on it.
+       The grid is a reference surface — a ruled, faintly polished plane
+       that says where the floor is. Grass growing out of a ruled plane
+       reads as grass growing out of a diagram, and the polish is worse
+       than the ruling: a mirror finish between the blades throws the
+       cluster back up through the sward. So the ground under the cover
+       is rough, dark and mottled, and its job is to be the shadow
+       between the blades rather than a surface anyone looks at. */
+    if (uGround > 0.5) {
+      float broad = snoise(vec3(p.x * 0.42, 3.7, p.z * 0.42)) * 0.5 + 0.5;
+      float fine = snoise(vec3(p.x * 3.10, 8.1, p.z * 3.10)) * 0.5 + 0.5;
+      /* Green, not brown. There is no instance budget that puts a blade
+         over every square centimetre, so what shows between them has to
+         be the same colour as what is standing in it — a dark sward seen
+         from above, not the dirt underneath. Soil-coloured ground turns
+         a thin meadow into stubble on a ploughed field. */
+      vec3 soil = mix(vec3(0.016, 0.030, 0.011), vec3(0.046, 0.086, 0.026), broad);
+      rough = 0.94;
+      return soil * (0.82 + 0.36 * fine);
+    }
+
     // floor: a faint grid that fades out with distance
     vec2 g = abs(fract(p.xz * 0.5) - 0.5);
     float line = 1.0 - smoothstep(0.0, 0.03, min(g.x, g.y));
     float fade = exp(-length(p.xz) * 0.09);
     rough = mix(0.42, 0.12, uFloorMix);
-    metal = 0.0;
     return mix(vec3(0.024, 0.026, 0.032), uTint * 0.6, line * fade * 0.5);
   }
 
@@ -363,13 +388,14 @@ void main() {
 `;
 
 /**
- * Temporal accumulation, and the one place the rasterised cat meets the
- * marched scene.
+ * Temporal accumulation, and the one place the rasterised half of the
+ * scene meets the marched half.
  *
  * Both write the same quantity into alpha — distance travelled from the
  * eye, in world units — so resolving them is a comparison and nothing
  * more. No depth buffer is shared, no matrices are reconciled, and the
- * march did not have to learn that the cat exists. Sky is 1e4 on both
+ * march did not have to learn that there is a cat standing in a meadow
+ * somewhere in front of it. Sky is 1e4 on both
  * sides, so an empty pixel resolves to the scene either way.
  *
  * Written to a ping-pong pair, never in place: sampling a texture that
@@ -382,16 +408,16 @@ in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D uSrc;
 uniform sampler2D uHistory;
-uniform sampler2D uCat;
-uniform float uBlend, uCatOn;
+uniform sampler2D uMesh;
+uniform float uBlend, uMeshOn;
 
 void main() {
   vec4 scene = texture(uSrc, vUv);
   vec3 col = scene.rgb;
 
-  if (uCatOn > 0.5) {
-    vec4 cat = texture(uCat, vUv);
-    if (cat.a < scene.a) col = cat.rgb;
+  if (uMeshOn > 0.5) {
+    vec4 mesh = texture(uMesh, vUv);
+    if (mesh.a < scene.a) col = mesh.rgb;
   }
 
   outColor = vec4(mix(col, texture(uHistory, vUv).rgb, uBlend), 1.0);
@@ -587,6 +613,21 @@ export default {
     { id: 'shadowNoise', type: 'switch', label: '陰影含表面擾動', value: true },
     { id: 'reflectLit', type: 'switch', label: '反射含陰影遮蔽', value: true },
 
+    { group: '地面' },
+    { id: 'ground', type: 'select', label: '地面造型', value: 'grid',
+      options: [
+        { value: 'grid', label: '網格' },
+        { value: 'grass', label: '純草地' },
+        { value: 'meadow', label: '草地與花' },
+      ] },
+    { id: 'cover', type: 'slider', label: '植被密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
+    { id: 'wind', type: 'slider', label: '風', min: 0, max: 1.4, step: 0.01, value: 0.55 },
+    { id: 'hintGround', type: 'hint',
+      text: '草與花是三角形，不在距離場裡——它們和貓畫進同一張深度緩衝，'
+        + '所以貓是站在草裡而不是站在草的圖片上。'
+        + '草皮跟著鏡頭走並對齊格線，每一株的位置由它所在格子的**世界座標**決定，'
+        + '所以格線在滑動、草沒有。風是一個吹過整片地的場，草和花讀的是同一份。' },
+
     { group: '貓' },
     { id: 'cat', type: 'switch', label: '顯示貓', value: true },
     { id: 'skin', type: 'select', label: '花色', value: 'orangin',
@@ -631,10 +672,12 @@ class MarchScene {
     this.rt = new Target(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR });
     this.history = new DoubleTarget(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR });
 
-    /* The cat is the one thing here made of triangles, so it is also the
-       only thing that needs somewhere to sort them. Its target carries a
-       depth attachment; the canvas still does not have one. */
-    this.catRT = new Target(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR, depth: true });
+    /* Where everything made of triangles goes — the cat, and the grass
+       it stands in. One target and one depth attachment between them,
+       so they sort against each other for free and resolve against the
+       march as a single layer. The canvas still has no depth buffer. */
+    this.meshRT = new Target(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR, depth: true });
+    this.ground = new GroundCover(gl);
 
     /* Loaded off the critical path: the scene renders from the first
        frame and the cat joins when its geometry arrives. A failure here
@@ -863,9 +906,10 @@ class MarchScene {
     const w = Math.max(2, Math.round(this.width * scale));
     const h = Math.max(2, Math.round(this.height * scale));
     this.rt.resize(w, h);
-    // The cat is composited per-texel against the march, so it has to be
-    // rendered at exactly the march's resolution — not the canvas's.
-    this.catRT.resize(w, h);
+    // The triangles are composited per-texel against the march, so they
+    // have to be rendered at exactly the march's resolution — not the
+    // canvas's.
+    this.meshRT.resize(w, h);
     this.history.resize(w, h);
     this.history.clear(0, 0, 0, 1);
   }
@@ -878,6 +922,7 @@ class MarchScene {
     this.target.set([0, 0.1, 0]);
     this.camMode = 'orbit';
     this.cat?.reset();
+    this.laser.silence();
     this.history.clear(0, 0, 0, 1);
     this._rippleAge.fill(0);
     this._rippleHost.fill(-2);
@@ -1592,6 +1637,12 @@ class MarchScene {
        the amount that makes it feel loose. */
     const showCat = Boolean(this.cat && state.cat);
     this._showCat = showCat;                    // read by onKey, which has no state
+
+    /* Grass is triangles, not field, so the marcher only has to know
+       that something is growing on its floor — which changes what the
+       floor is made of and nothing else about the march. */
+    const covered = isCovered(state.ground);
+    const raster = showCat || covered;
     /* The weapon belongs to the cat's own view. With the camera locked
        on the cluster you are watching it, not being it, and a click
        there means what it always meant: strike the surface. Read by the
@@ -1665,6 +1716,10 @@ class MarchScene {
     // temporal filter has to be told to let go of it.
     if (rippleActive) this.moving = 1;
 
+    /* Grass in wind never holds still, so the accumulation buffer must
+       not be allowed to believe it does. */
+    if (covered && state.wind > 0.001) this.moving = 1;
+
     BLEND.none(gl);
     this.rt.bind();
     this.march.use({
@@ -1679,6 +1734,7 @@ class MarchScene {
       uDisplace: state.displace,
       uRough: state.rough,
       uFloorMix: 0.6,
+      uGround: covered ? 1 : 0,
       uLightDir: this.lightDir,
       uTint: tint,
       uReflect: state.reflect,
@@ -1716,55 +1772,76 @@ class MarchScene {
     });
     tri.draw();
 
-    /* ── the cat, rasterised ──
+    /* ── the rasterised half ──
        Its own target, its own depth buffer, the same camera basis. The
        alpha it clears to is the same 1e4 the march writes for sky, so an
-       uncovered pixel loses the depth comparison to anything at all. */
-    if (showCat) {
-      this.catRT.bind();
+       uncovered pixel loses the depth comparison to anything at all.
+
+       The cat and the ground cover go into it together and in either
+       order: they are both opaque and they share the depth buffer, which
+       is the whole reason the animal stands in the grass instead of on
+       a picture of it. */
+    if (raster) {
+      this.meshRT.bind();
       gl.clearColor(0, 0, 0, 1e4);
       gl.clearDepth(1);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-      this.cat.draw(
-        {
-          pos: this.basis.pos,
-          right: this.basis.right,
-          up: this.basis.up,
-          fwd: this.basis.fwd,
-          focal: 1.5,
-          aspect: this.catRT.width / Math.max(this.catRT.height, 1),
-          width: this.catRT.width,
-          height: this.catRT.height,
-        },
-        {
-          dir: this.lightDir,
-          tint,
-          fog: 1.0,
-          shadowSoft: state.shadow,
-          // The same budget the marcher spends. A shadow that converges
-          // differently is a differently shaped shadow.
-          shadowSteps: Math.round(state.shadowSteps),
-          shadowNoise: state.shadowNoise ? 1 : 0,
-          // The cluster, exactly as the marcher will see it this frame —
-          // ripples, dissipation and surface noise included, because the
-          // cat marches the same layers it does.
-          time: clock.time,
-          blend: state.blend,
-          ballPos: this.ballPos,
-          balls: this.ballCount,
-          bound: this.bound,
-          ripples: this.ripples,
-          rippleTo: this.rippleTo,
-          rippleOn: rippleActive > 0 ? 1 : 0,
-          rippleAmp: state.rippleAmp,
-          rippleSpeed: state.rippleSpeed,
-          rippleFreq: state.rippleFreq,
-          erode: state.erode,
-          displace: state.displace,
-        },
-        this.frameCount++,
-      );
+      const camera = {
+        pos: this.basis.pos,
+        right: this.basis.right,
+        up: this.basis.up,
+        fwd: this.basis.fwd,
+        focal: 1.5,
+        aspect: this.meshRT.width / Math.max(this.meshRT.height, 1),
+        width: this.meshRT.width,
+        height: this.meshRT.height,
+      };
+
+      /* One description of the light and the field, read by both. Two
+         copies is how the cat ends up standing in a shadow the grass
+         around it never got. */
+      const env = {
+        dir: this.lightDir,
+        tint,
+        fog: 1.0,
+        shadowSoft: state.shadow,
+        // The same budget the marcher spends. A shadow that converges
+        // differently is a differently shaped shadow.
+        shadowSteps: Math.round(state.shadowSteps),
+        shadowNoise: state.shadowNoise ? 1 : 0,
+        // The cluster, exactly as the marcher will see it this frame —
+        // ripples, dissipation and surface noise included, because both
+        // of these march the same layers it does.
+        time: clock.time,
+        blend: state.blend,
+        ballPos: this.ballPos,
+        balls: this.ballCount,
+        bound: this.bound,
+        ripples: this.ripples,
+        rippleTo: this.rippleTo,
+        rippleOn: rippleActive > 0 ? 1 : 0,
+        rippleAmp: state.rippleAmp,
+        rippleSpeed: state.rippleSpeed,
+        rippleFreq: state.rippleFreq,
+        erode: state.erode,
+        displace: state.displace,
+        // And the cat's own outline, so it throws a shadow on the grass
+        // exactly as it throws one on the floor.
+        catCapA: showCat ? this.cat.capA : ZERO_CAPS,
+        catCapB: showCat ? this.cat.capB : ZERO_CAPS,
+        catBound: showCat ? this.cat.capBound : ZERO_BOUND,
+        catCaps: showCat ? this.cat.capCount : 0,
+      };
+
+      const frame = this.frameCount++;
+      if (showCat) this.cat.draw(camera, env, frame);
+      this.ground.draw(camera, env, {
+        style: state.ground,
+        density: state.cover,
+        wind: state.wind,
+        frame,
+      });
     }
 
     // Temporal blend is dialled back while anything moves, or the jitter
@@ -1775,8 +1852,8 @@ class MarchScene {
     this.accum.use({
       uSrc: this.rt.texture,
       uHistory: this.history.read.texture,
-      uCat: this.catRT.texture,
-      uCatOn: showCat ? 1 : 0,
+      uMesh: this.meshRT.texture,
+      uMeshOn: raster ? 1 : 0,
       uBlend: blend,
     });
     tri.draw();
@@ -1830,12 +1907,14 @@ class MarchScene {
   }
 
   readout() {
-    // The scene's own boast is that it has no geometry. That is still
-    // true of the field — the triangles are the cat's, and saying so is
-    // more honest than either claiming zero or lumping them together.
-    const geometry = this._showCat
-      ? `場：0 頂點 · 貓：${this.cat.triangles.toLocaleString()} 三角形`
-      : '0 頂點 · 0 三角形';
+    /* The scene's own boast is that it has no geometry. That is still
+       true of the *field* — the triangles belong to the cat and to the
+       meadow — and naming them separately is more honest than either
+       claiming zero or lumping the three together. */
+    const parts = [];
+    if (this._showCat) parts.push(`貓：${this.cat.triangles.toLocaleString()} 三角形`);
+    if (this.ground.triangles) parts.push(`植被：${this.ground.triangles.toLocaleString()} 三角形`);
+    const geometry = parts.length ? `場：0 頂點 · ${parts.join(' · ')}` : '0 頂點 · 0 三角形';
 
     const out = {
       '渲染尺寸': `${this.rt.width}×${this.rt.height}`,
@@ -1872,7 +1951,8 @@ class MarchScene {
     this.flare.dispose();
     this.laser.dispose();
     this.rt.dispose();
-    this.catRT.dispose();
+    this.meshRT.dispose();
+    this.ground.dispose();
     this.history.dispose();
     this.cat?.dispose();
   }

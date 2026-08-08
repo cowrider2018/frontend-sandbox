@@ -26,11 +26,9 @@ import { PRECISION, CONSTANTS, ROTATE, SIMPLEX3 } from '../../shaders/common.js'
 import {
   CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_LAYERS, CLUSTER_SHADOW, SKY,
 } from '../cluster.js';
+import { RASTER_NEAR as NEAR, RASTER_FAR as FAR } from '../raster.js';
 import { parseCat, Rig, modelMatrix } from './rig.js';
 import { Driver, Sway, applyPose } from './pose.js';
-
-const NEAR = 0.05;
-const FAR = 200.0;
 
 /** Capsules in the shadow proxy. Seven are used; the slot count is fixed. */
 export const CAT_CAPS = 8;

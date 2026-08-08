@@ -210,6 +210,44 @@ const SHOTS_PLAN = [
            s._aimTick(0.2);
            return true;` },
 
+  /* ── the floor's three styles ──
+     The grid is the reference surface and stays the default; these are
+     what the other two look like. Frozen clock, because the wind is a
+     function of time and a shot of a meadow taken at an arbitrary
+     instant is not comparable with the last one. */
+  { name: '22-grass', hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&cat=0',
+    settle: 2500, freeze: 8.0,
+    /* The previous shot fires a beam with the clock stopped, and a beam
+       dies of nothing but time. Frozen, it hangs in the air across every
+       frame that follows it. */
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.06; s.targetDist = 6.5;
+           return true;` },
+
+  /* Down at eye level in the flowers. Low and close is the only angle
+     that shows what the cover actually is: separate blades with their
+     own silhouettes, leaning together, and clumps of flowers with
+     stragglers scattered out of them. */
+  { name: '23-meadow', hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&cat=0&cover=1',
+    settle: 2500, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = -0.02; s.targetDist = 3.2;
+           return true;` },
+
+  /* And the point of sharing a depth buffer: the cat is in the grass,
+     not on it — blades in front of its paws, blades behind them, and
+     its own shadow lying across the sward. */
+  { name: '24-meadow-cat',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&camera=follow&shadow=1&ao=1&light=0.68,0.667',
+    settle: 2500, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const sc = __aether.scene, c = sc.cat;
+           c.x = 3.6; c.z = 3.2; c.yaw = 1.2;
+           sc.targetDist = 2.2; sc.yaw = 2.4; sc.pitch = 0.20;
+           return true;` },
+
   /* The three colourways. They share one set of vertices, one set of
      normals and one element array — only the palette differs — so these
      three frames are the same cat with a different buffer bound. */
@@ -1746,6 +1784,73 @@ async function interact(cdp, base, problems) {
 
   await cdp.eval(`__aether.clock.paused = false; true`);
   await sleep(300);
+
+  /* ── the floor's three styles ──
+     The grid is the default and grows nothing; the other two are the
+     only things in the scene that put triangles on the ground. */
+  await cdp.eval(`__aether.panel.setValues({ ground: 'grid' }, { notify: true }); true`);
+  await sleep(300);
+  const onGrid = await cdp.eval(`({ tri: __aether.scene.ground.triangles,
+    flowers: __aether.scene.ground.flowers })`);
+  check('the grid floor grows nothing',
+    onGrid.tri === 0 && onGrid.flowers === 0,
+    `${onGrid.tri} triangles, ${onGrid.flowers} flowers`);
+
+  await cdp.eval(`__aether.panel.setValues({ ground: 'grass' }, { notify: true }); true`);
+  await sleep(300);
+  const onGrass = await cdp.eval(`({ tri: __aether.scene.ground.triangles,
+    blades: __aether.scene.ground.blades, flowers: __aether.scene.ground.flowers })`);
+  check('grass covers the floor and grows no flowers',
+    onGrass.blades > 1000 && onGrass.tri > 1000 && onGrass.flowers === 0,
+    `${onGrass.blades} blades, ${onGrass.tri} triangles, ${onGrass.flowers} flowers`);
+
+  await cdp.eval(`__aether.panel.setValues({ ground: 'meadow' }, { notify: true }); true`);
+  await sleep(300);
+  const onMeadow = await cdp.eval(`({ blades: __aether.scene.ground.blades,
+    flowers: __aether.scene.ground.flowers })`);
+  check('the meadow keeps the grass and adds flowers to it',
+    onMeadow.blades === onGrass.blades && onMeadow.flowers > 100,
+    `${onMeadow.blades} blades, ${onMeadow.flowers} flower slots`);
+
+  /* The patch follows the camera but is snapped to its own lattice, and
+     that snap is the entire reason a blade keeps its place: the hash is
+     taken from the world coordinate of its cell, so an origin that
+     landed anywhere off the lattice would reseed the whole meadow every
+     frame and the ground would crawl as you walked over it. */
+  const patchBefore = await cdp.eval(`[...__aether.scene.ground._patch]`);
+  await drag([700, 450], [1180, 470]);
+  await sleep(400);
+  const patchAfter = await cdp.eval(`(() => {
+    const g = __aether.scene.ground;
+    const off = (v) => Math.abs(v / g.cell - Math.round(v / g.cell));
+    return { p: [...g._patch], off: Math.max(off(g._patch[0]), off(g._patch[1])) };
+  })()`);
+  check('the patch follows the camera but stays on its own lattice',
+    patchAfter.off < 1e-4
+    && (patchAfter.p[0] !== patchBefore[0] || patchAfter.p[1] !== patchBefore[1]),
+    `origin ${patchBefore.map((v) => v.toFixed(2))} → ${patchAfter.p.map((v) => v.toFixed(2))}, `
+    + `off-lattice by ${patchAfter.off.toExponential(1)}`);
+
+  /* Grass in wind never comes to rest, so the temporal filter must not
+     be allowed to believe the frame has settled. Tested with everything
+     else in the scene held still, or the flag would be true anyway. */
+  await cdp.eval(`__aether.panel.setValues(
+    { spin: false, cat: false, wind: 0 }, { notify: true }); true`);
+  /* Polled rather than slept on. The check just above drags the camera,
+     and the camera eases to a stop over an interval nobody has promised
+     is shorter than any particular sleep — a fixed wait here failed
+     about one run in five, which is worse than no check at all. */
+  let still = 1;
+  for (let i = 0; i < 25 && still !== 0; i++) {
+    await sleep(120);
+    still = await cdp.eval(`__aether.scene.moving`);
+  }
+  await cdp.eval(`__aether.panel.setValues({ wind: 0.8 }, { notify: true }); true`);
+  await sleep(400);
+  const blowing = await cdp.eval(`__aether.scene.moving`);
+  check('wind stops the accumulation buffer from settling',
+    still === 0 && blowing === 1,
+    `moving ${still} with no wind, ${blowing} with wind`);
 
   /* reset puts back everything: parameters, camera and the URL. It used
      to do only half of that, with the other half hidden in a separate

@@ -168,6 +168,10 @@ export class Laser {
     if (this.age < LIFE) this.age = Math.min(LIFE, this.age + dt);
   }
 
+  /** Spend the shot now. What a beam dies of is time, and a paused or
+      reset scene is not going to give it any. */
+  silence() { this.age = LIFE; }
+
   draw(camera, sceneTexture, resolution) {
     if (!this.active) return;
 
