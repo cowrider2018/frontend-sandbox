@@ -31,6 +31,7 @@ import {
   CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_LAYERS, CLUSTER_SHADOW, SKY,
 } from './cluster.js';
 import { Cat, CAT_PROXY_GLSL, CAT_CAPS } from './cat/index.js';
+import { Laser, blastAt } from './laser.js';
 
 /* Mouse-look sensitivity. The locked figure is per device pixel and is
    the usual first-person number; the unlocked one is per canvas width,
@@ -39,6 +40,16 @@ const LOOK_PER_PIXEL = 0.0026;
 const LOOK_PER_SWEEP = 3.4;
 /** Vertical look is the camera's elevation, and rides much shallower. */
 const PITCH_FROM_LOOK = 0.75;
+
+/* Blast response. The spring is what gathers the cluster up again after
+   a shot; without it every hit would leave a permanent dent. Stiff
+   enough to reform in about a second, damped just under critical so it
+   settles rather than ringing. */
+const BLAST_SPRING = 14.0;
+const BLAST_DAMP = 4.2;
+/** How far off the beam's axis a sphere still feels it, and how hard. */
+const BLAST_RADIUS = 1.5;
+const BLAST_FORCE = 7.0;
 
 /* Uploaded in place of the cat's capsules when there is no cat. The
    shader is gated on the count, but a sampler-free uniform array still
@@ -577,7 +588,8 @@ export default {
     { id: 'hintCat', type: 'hint',
       text: 'WASD 驅動貓在地面上走動。預設「依鏡頭方向」：WASD 是畫面上的前後左右，'
         + '貓會轉向該方向再走過去——按 S 牠就轉過身朝你走來。'
-        + '按 Y 切換成「滑鼠轉向」：滑鼠滑動轉身（不用按鍵）、A／D 改成左右平移；'
+        + '按 Y 切換成「滑鼠轉向」：滑鼠滑動轉身（不用按鍵）、A／D 改成左右平移，'
+        + '**按滑鼠左鍵從眼睛射出雷射**，把星體沿光束軸向外炸開。'
         + '這個模式會鎖定指標，Esc 放開，點畫布重新鎖定。' },
 
     { group: '呈現' },
@@ -645,6 +657,10 @@ class MarchScene {
 
     /* ── the cluster, computed here and uploaded ── */
     this.ballPos = new Float32Array(BALL_N * 4);
+    /** Displacement from where the orbit says each sphere should be, and
+        the velocity carrying it. Only a blast ever writes these. */
+    this.ballOff = new Float32Array(BALL_N * 3);
+    this.ballVel = new Float32Array(BALL_N * 3);
     this.ballCount = 6;
     this.blend = 0.32;
     /** xyz = centre, w = radius. The one number every distance derives from. */
@@ -661,6 +677,13 @@ class MarchScene {
     this.flareAmt = new Float32Array(RIPPLE_N);
     this.flash = 0;
     this.bursts = 0;
+
+    /* ── eye beams ── */
+    this.laser = new Laser(gl);
+    this.shots = 0;
+    this._blastDir = new Float32Array(3);
+    this._eyeA = new Float32Array(3);
+    this._eyeB = new Float32Array(3);
 
     /** The master is an action; this remembers where it last fired. */
     this._lastQuality = null;
@@ -718,17 +741,33 @@ class MarchScene {
    * 25 fps a quick click can begin and end between two frames.
    */
   onPointerDown() {
+    /* One press, one shot. The pointer layer can report a press twice —
+       it self-heals a missed `pointerdown` from the first move that
+       arrives with the button already held, and a synthesised click can
+       deliver both — so arming on the press itself would fire twice for
+       one trigger pull. The transition is what a trigger is. */
+    const alreadyDown = this._pressed;
     this._pressed = true;
     this._dragDist = 0;
+    if (alreadyDown) return;
 
-    // Escape drops the lock, and there has to be a way back that is not
-    // "toggle the mode off and on again". Clicking the canvas is the
-    // convention, and it costs the click nothing: the burst still fires.
-    if (this._showCat && this.cat.mode === 'look' && !this.locked) this._requestLock();
+    if (this._showCat && this.cat.mode === 'look') {
+      /* Escape drops the lock, and clicking the canvas is the convention
+         for getting it back. The click fires as well as recapturing,
+         rather than being swallowed: the lock can be refused outright —
+         an embedded or automated document may never be granted it — and
+         a trigger that silently does nothing there would contradict the
+         whole point of the mode still working unlocked. */
+      if (!this.locked) this._requestLock();
+      this._pendingShot = true;
+    }
   }
 
   onPointerUp() {
-    if (this._pressed && this._dragDist < 0.015) this._pendingBurst = true;
+    // In mouse-look the click is a trigger, already taken on the way
+    // down; it must not also strike the surface on the way up.
+    const shooting = this._showCat && this.cat?.mode === 'look';
+    if (this._pressed && !shooting && this._dragDist < 0.015) this._pendingBurst = true;
     this._pressed = false;
   }
 
@@ -815,6 +854,10 @@ class MarchScene {
     this._rippleHost.fill(-2);
     this.flash = 0;
     this.bursts = 0;
+    this.shots = 0;
+    this.ballOff.fill(0);
+    this.ballVel.fill(0);
+    this._pendingShot = false;
     // The app has just put every slider back, including the master, so
     // forget where it last fired or it will stamp over them next frame.
     this._lastQuality = null;
@@ -997,6 +1040,27 @@ class MarchScene {
    * where to give up, how far a shadow ray can still matter. Change the
    * scene's scale and nothing needs re-tuning.
    */
+  /**
+   * Advance the blast displacements.
+   *
+   * The orbits are a closed-form function of time, which leaves nowhere
+   * for a shove to be remembered. So the shove lives beside them: each
+   * sphere carries an offset from where its formula says it should be,
+   * and a velocity carrying that offset.
+   *
+   * The offset is sprung back to zero rather than merely damped. Damping
+   * alone would leave the cluster permanently deformed by every shot
+   * ever fired; a spring means it blows apart and then gathers itself,
+   * and the orbits underneath are never disturbed at all.
+   */
+  _relaxBalls(dt) {
+    const k = BLAST_SPRING, c = BLAST_DAMP;
+    for (let i = 0; i < BALL_N * 3; i++) {
+      this.ballVel[i] += (-k * this.ballOff[i] - c * this.ballVel[i]) * dt;
+      this.ballOff[i] += this.ballVel[i] * dt;
+    }
+  }
+
   _updateBalls(state, time) {
     const t = time * 0.42;
     const n = Math.round(state.balls);
@@ -1009,10 +1073,10 @@ class MarchScene {
 
     for (let i = 0; i < n; i++) {
       const a = i * 2.399963;                       // golden angle
-      const o = i * 4;
-      const x = Math.sin(t * (0.7 + i * 0.11) + a) * (0.62 + 0.1 * Math.sin(i));
-      const y = Math.cos(t * (0.5 + i * 0.09) + a * 1.7) * 0.5;
-      const z = Math.cos(t * (0.62 + i * 0.13) + a * 0.6) * (0.62 + 0.1 * Math.cos(i));
+      const o = i * 4, d = i * 3;
+      const x = Math.sin(t * (0.7 + i * 0.11) + a) * (0.62 + 0.1 * Math.sin(i)) + this.ballOff[d];
+      const y = Math.cos(t * (0.5 + i * 0.09) + a * 1.7) * 0.5 + this.ballOff[d + 1];
+      const z = Math.cos(t * (0.62 + i * 0.13) + a * 0.6) * (0.62 + 0.1 * Math.cos(i)) + this.ballOff[d + 2];
       const r = 0.30 + 0.10 * Math.sin(t * 0.9 + i * 2.1);
       this.ballPos[o + 0] = x;
       this.ballPos[o + 1] = y;
@@ -1161,6 +1225,66 @@ class MarchScene {
     return true;
   }
 
+  /* ── eye beams ──────────────────────────────────────────────────── */
+
+  /**
+   * Fire, from the eyes, down the crosshair.
+   *
+   * The aim is the camera's forward vector because in mouse-look that
+   * *is* where the mouse points: the pointer is captured, there is no
+   * cursor to read, and the mode pins the camera behind the animal so
+   * the two agree. The same reasoning already decides where a click
+   * strikes the surface.
+   */
+  _fire() {
+    if (!this._showCat) return false;
+
+    this.cat.eyeWorld(0, this._eyeA);
+    this.cat.eyeWorld(1, this._eyeB);
+    this.laser.fire(this._eyeA, this._eyeB, this.basis.fwd);
+    this.shots++;
+    this.flash = 1;
+    this._blast();
+    return true;
+  }
+
+  /**
+   * What the shot does to the cluster.
+   *
+   * The energy comes off the beam's axis rather than its muzzle, so it
+   * drives a cylinder opening outward — spheres are thrown clear of the
+   * line, not away from the cat. It is applied once, as an impulse: the
+   * spring in `_relaxBalls` takes it from there.
+   *
+   * Anything it actually hits also gets a ripple, anchored the same way
+   * a click's is, so the surface reacts in the language the scene
+   * already speaks.
+   */
+  _blast() {
+    const { origin, dir } = this.laser;
+    const out = this._blastDir;
+
+    for (let i = 0; i < this.ballCount; i++) {
+      const o = i * 4;
+      const push = blastAt(origin, dir, this.ballPos.subarray(o, o + 3),
+        out, BLAST_RADIUS, BLAST_FORCE);
+      if (push <= 0) continue;
+
+      const d = i * 3;
+      this.ballVel[d] += out[0] * push;
+      this.ballVel[d + 1] += out[1] * push;
+      this.ballVel[d + 2] += out[2] * push;
+
+      // Where the blast crossed this sphere's surface: its centre, moved
+      // back toward the axis by a radius.
+      this._anchorRipple(
+        this.ballPos[o] - out[0] * this.ballPos[o + 3],
+        this.ballPos[o + 1] - out[1] * this.ballPos[o + 3],
+        this.ballPos[o + 2] - out[2] * this.ballPos[o + 3],
+      );
+    }
+  }
+
   _updateRipples(state, dt) {
     let active = 0;
     const out = this._tmpC ??= new Float32Array(3);
@@ -1277,6 +1401,9 @@ class MarchScene {
 
     const tint = TINTS[state.tint] || TINTS.amber;
 
+    // Blast displacements are carried forward before the orbits are
+    // evaluated, since the orbits add to them.
+    this._relaxBalls(dt);
     this._updateBalls(state, clock.time);
 
     if (pointer.down) {
@@ -1286,6 +1413,15 @@ class MarchScene {
       this._pendingBurst = false;
       this._burst(state, pointer);
     }
+    /* Fired after the spheres are placed for this frame, so the blast is
+       measured against where they actually are rather than where they
+       were when the button went down. */
+    if (this._pendingShot) {
+      this._pendingShot = false;
+      this._fire();
+    }
+    this.laser.update(dt);
+    if (this.laser.active) this.moving = 1;
 
     const rippleActive = this._updateRipples(state, dt);
     this.flash *= Math.exp(-dt * 4.5);
@@ -1432,6 +1568,27 @@ class MarchScene {
       empty.drawPoints(RIPPLE_N);
       BLEND.none(gl);
     }
+
+    /* The beams, over the resolved image and additive like the flares.
+       They read the same depth channel, so a beam ends at the surface it
+       strikes instead of being painted across it. */
+    if (this.laser.active) {
+      BLEND.additive(gl);
+      this.laser.draw(
+        {
+          pos: this.basis.pos,
+          right: this.basis.right,
+          up: this.basis.up,
+          fwd: this.basis.fwd,
+          focal: 1.5,
+          aspect: this.width / Math.max(this.height, 1),
+        },
+        this.rt.texture,
+        [this.width, this.height],
+      );
+      empty.drawTriangles(12);   // two beams, two triangles each
+      BLEND.none(gl);
+    }
   }
 
   readout() {
@@ -1457,6 +1614,7 @@ class MarchScene {
       out['貓的速度'] = `${this.cat.speed.toFixed(2)} u/s`;
       // Whether the cursor is captured is not cosmetic — it decides what
       // the mouse does and how far the cat can turn — so it is stated.
+      if (this.shots) out['雷射次數'] = String(this.shots);
       out['操作模式'] = this.cat.mode === 'look'
         ? (this.locked ? '滑鼠轉向 · 已鎖定指標' : '滑鼠轉向 · 未鎖定（點畫布可重新鎖定）')
         : 'WASD 依鏡頭方向';
@@ -1474,6 +1632,7 @@ class MarchScene {
     this.accum.dispose();
     this.resolve.dispose();
     this.flare.dispose();
+    this.laser.dispose();
     this.rt.dispose();
     this.catRT.dispose();
     this.history.dispose();

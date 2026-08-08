@@ -481,6 +481,34 @@ export class Cat {
   /** Total ground speed, whichever direction it is going. */
   get speed() { return Math.hypot(this.velocity, this.strafeVel); }
 
+  /**
+   * Where an eye is, in the world, right now.
+   *
+   * Taken from the posed skeleton rather than from the cat's position
+   * and a guess: the head turns, the body leans and the whole animal
+   * bobs through its stride, and a beam that leaves from where the eye
+   * used to be reads as a mis-aim rather than as motion.
+   *
+   * @param {number} which 0 or 1
+   */
+  eyeWorld(which, out) {
+    const B = this._eyeBones ??= this.rig.names
+      .map((n, i) => (n.startsWith('eye') ? i : -1))
+      .filter((i) => i >= 0);
+    // No eye bones is possible for a colourway without them; the muzzle
+    // is a serviceable place to fire from.
+    const bone = B[which] ?? this.rig.bone('head');
+
+    const m = this.rig.matrices, M = this._model, o = bone * 16;
+    // The eyeball's own centre, pushed out through its bone and then the
+    // cat's placement.
+    const bx = m[o + 12], by = m[o + 13], bz = m[o + 14];
+    out[0] = M[0] * bx + M[4] * by + M[8] * bz + M[12];
+    out[1] = M[1] * bx + M[5] * by + M[9] * bz + M[13];
+    out[2] = M[2] * bx + M[6] * by + M[10] * bz + M[14];
+    return out;
+  }
+
   onKey(e, down) {
     const k = e.key.toLowerCase();
     if (k in this.keys) { this.keys[k] = down; return true; }

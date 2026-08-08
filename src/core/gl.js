@@ -252,6 +252,12 @@ export function createEmptyVAO(gl) {
       gl.bindVertexArray(vao);
       gl.drawArrays(gl.POINTS, 0, count);
     },
+    /** Same trick for shapes a point sprite cannot be: the vertex shader
+        builds each corner from gl_VertexID. */
+    drawTriangles(count) {
+      gl.bindVertexArray(vao);
+      gl.drawArrays(gl.TRIANGLES, 0, count);
+    },
     dispose() { gl.deleteVertexArray(vao); },
   };
 }
