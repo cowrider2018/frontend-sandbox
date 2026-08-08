@@ -53,6 +53,9 @@ const HOST_BORE = -3;
    path pays it — with the pointer captured the cat is already facing
    wherever the crosshair is. */
 const AIM_TURN = 0.15;
+/* How much more material a beam dissipates than a click. A click dents;
+   a beam has to go through, and a hole must be deeper than the wall. */
+const BORE_ERODE = 4.0;
 
 /* Uploaded in place of the cat's capsules when there is no cat. The
    shader is gated on the count, but a sampler-free uniform array still
@@ -86,6 +89,11 @@ uniform float uReflect, uFog, uAO, uShadowSoft;
 // Only the marcher draws the wavefront's glow; the field itself, and
 // every uniform that shapes it, is declared in cluster.js.
 uniform float uRippleGlow;
+/* The strongest dissipation any live impact carries: 1 for clicks, more
+   for a bore. The tracer's step budget is derived from it, so charging
+   the worst case unconditionally would slow every ordinary click down to
+   a beam's pace for nothing. */
+uniform float uErodeMax;
 
 // quality
 uniform int   uSteps, uAoTaps, uReflectSteps;
@@ -143,7 +151,7 @@ float traceCluster(vec3 ro, vec3 rd, int steps, float tMin) {
     // width is fixed, so this term does not grow as the damage opens.
     // Both the dissipation itself and the wave it silences ride the same
     // edge, so both are charged against it.
-    lip += (uErode + uRippleAmp) * 1.5 / ERODE_EDGE;
+    lip += (uErode * uErodeMax + uRippleAmp) * 1.5 / ERODE_EDGE;
   }
   float relax = 0.97 / lip;
 
@@ -686,6 +694,7 @@ class MarchScene {
     this.flareAmt = new Float32Array(RIPPLE_N);
     this.flash = 0;
     this.bursts = 0;
+    this.erodeMax = 0;
 
     /* ── eye beams ── */
     this.laser = new Laser(gl);
@@ -870,6 +879,7 @@ class MarchScene {
     this._rippleHost.fill(-2);
     this.flash = 0;
     this.bursts = 0;
+    this.erodeMax = 0;
     this.shots = 0;
     this._pendingShot = false;
     this._aimShot = null;
@@ -1396,6 +1406,7 @@ class MarchScene {
 
   _updateRipples(state, dt) {
     let active = 0;
+    this.erodeMax = 0;
     const out = this._tmpC ??= new Float32Array(3);
 
     for (let i = 0; i < RIPPLE_N; i++) {
@@ -1427,6 +1438,8 @@ class MarchScene {
         this.rippleTo[q + 0] = this._boreEnd[l + 0];
         this.rippleTo[q + 1] = this._boreEnd[l + 1];
         this.rippleTo[q + 2] = this._boreEnd[l + 2];
+        this.rippleTo[q + 3] = BORE_ERODE;
+        this.erodeMax = Math.max(this.erodeMax, BORE_ERODE);
       } else {
         if (host >= 0) {
           const o = host * 4;
@@ -1444,6 +1457,8 @@ class MarchScene {
         this.rippleTo[q + 0] = this.ripples[q + 0];
         this.rippleTo[q + 1] = this.ripples[q + 1];
         this.rippleTo[q + 2] = this.ripples[q + 2];
+        this.rippleTo[q + 3] = 1;
+        this.erodeMax = Math.max(this.erodeMax, 1);
       }
       this.ripples[q + 3] = next;
 
@@ -1608,6 +1623,7 @@ class MarchScene {
       uRippleFreq: state.rippleFreq,
       uRippleTight: 5.0,
       uRippleGlow: state.flash,
+      uErodeMax: this.erodeMax,
       uErode: state.erode,
 
       uSteps: Math.round(state.steps),

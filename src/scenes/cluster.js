@@ -44,11 +44,10 @@ uniform float uBalls;
 uniform vec4  uBound;
 
 uniform vec4  uRipples[RIPPLE_N]; // xyz = where it started, w = normalised age
-/* xyz = where it ends. An impact is a *segment*, not a point: a click
-   sets both ends the same and behaves exactly as it always did, while a
-   beam sets them to where it entered and left, and the wave then comes
-   off the whole line it burned through. */
-uniform vec4  uRippleTo[RIPPLE_N];
+/* An impact is a *segment*, not a point. A click sets both ends the same
+   and behaves exactly as it always did; a beam sets them to where it
+   entered and left what it passed through. */
+uniform vec4  uRippleTo[RIPPLE_N];   // xyz = far end, w = dissipation strength
 uniform float uRippleOn, uRippleAmp, uRippleSpeed, uRippleFreq, uRippleTight;
 uniform float uErode, uDisplace;
 
@@ -147,19 +146,43 @@ float rippleDist(int i, vec3 p) {
  * breaks the field's Lipschitz bound and the sphere tracer starts
  * overshooting straight through the surface.
  *
- * Around a segment these are cylinders rather than spheres, which is
- * what a beam bored through the cluster should look like.
+ * A point throws a sphere. A beam does not throw anything sideways, so
+ * its wave travels along its own axis instead — see below.
  */
 float ripples(vec3 p) {
   float sum = 0.0;
   for (int i = 0; i < RIPPLE_N; i++) {
     float age = uRipples[i].w;
     if (age <= 0.0) continue;
-    float d = rippleDist(i, p);
-    float front = age * uRippleSpeed;
+
+    vec3 a = uRipples[i].xyz;
+    vec3 ba = uRippleTo[i].xyz - a;
+    float len2 = dot(ba, ba);
+
+    float d, front, confine = 1.0;
+    if (len2 > 1e-6) {
+      /* A bore. The wave runs *down* the channel, not out of its sides.
+         Taking the distance to the segment instead would throw a
+         cylindrical wave outward from the beam, which is how a point
+         impact behaves and is wrong here: nothing about a beam pushes
+         sideways. So the front is measured along the axis and swept
+         from the entry to the exit over the impact's life, and a radial
+         falloff keeps it inside the hole it is travelling through. */
+      float len = sqrt(len2);
+      vec3 dir = ba / len;
+      vec3 rel = p - a;
+      d = dot(rel, dir);
+      front = age * len * uRippleSpeed;
+      confine = exp(-length(rel - dir * d) * 2.5);
+    } else {
+      // A point impact, expanding as a sphere the way it always did.
+      d = length(p - a);
+      front = age * uRippleSpeed;
+    }
+
     // Tight in space around the travelling front, fading in time.
     float env = exp(-abs(d - front) * uRippleTight) * (1.0 - age) * (1.0 - age);
-    sum += sin((d - front) * uRippleFreq) * env;
+    sum += sin((d - front) * uRippleFreq) * env * confine;
   }
   return sum * uRippleAmp;
 }
@@ -213,22 +236,30 @@ float erodeMask(vec3 p) {
     if (r <= 0.0) continue;
 
     float d = rippleDist(i, p);
-    sum += 1.0 - smoothstep(r - ERODE_EDGE, r, d);
+    // Strength rides in the far end's spare component. A click is 1; a
+    // beam is several, because boring is the whole of what it does, and
+    // a hole has to be deeper than the wall it is going through.
+    sum += uRippleTo[i].w * (1.0 - smoothstep(r - ERODE_EDGE, r, d));
   }
-  return min(sum, 1.0);
+  return sum;
 }
 
 float clusterShape(vec3 p) {
   float d = clusterBase(p);
   if (uRippleOn > 0.5) {
+    /* Unclamped for depth, clamped for masking. A beam dissipates more
+       material than any one click can, and that is what perforates a
+       sphere rather than dimpling it — but the wave can only be silenced
+       once, so the mask saturates while the depth does not. */
     float gone = erodeMask(p);
+    float mask = min(gone, 1.0);
 
     // The wave is silenced inside the damage. A travelling sine has
     // negative phases, and a negative phase pushes the surface *outward*
     // — so without this the gap grows its own little lump of material at
     // the centre and carries it out to the rim. Nothing that has been
     // dissipated is left to carry a wave.
-    d += ripples(p) * (1.0 - gone);
+    d += ripples(p) * (1.0 - mask);
 
     // In the shape layer, not the full one: a gap has to be a gap for
     // the shadow and occlusion rays too, or light refuses to come
