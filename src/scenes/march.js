@@ -1292,10 +1292,13 @@ class MarchScene {
    * whether the pointer is captured.
    *
    * Captured, the crosshair is the aim and the camera's forward vector
-   * is the crosshair — nothing to look up and nothing to wait for. Free,
-   * the aim is whatever the cursor is over, and the cat has to bring its
-   * head round to it first. That delay is not a cost to be minimised: a
-   * beam that leaves before the animal has looked reads as a mis-aim.
+   * is the crosshair — nothing to look up, nothing to wait for, and
+   * always somewhere to shoot. Free, the aim is whatever the cursor is
+   * over: the cat has to bring its head round to it first, and a click
+   * on nothing does not fire at all.
+   *
+   * That delay is not a cost to be minimised — a beam that leaves before
+   * the animal has looked reads as a mis-aim.
    */
   _trigger(pointer) {
     if (!this._catView) return false;
@@ -1303,10 +1306,13 @@ class MarchScene {
     // No cursor to read: fire down the crosshair, now.
     if (this.locked || !pointer) return this._shootAlong(this.basis.fwd);
 
+    /* Nothing under the cursor is not a shot. With a free cursor the
+       click *is* the aim, so a click on empty sky has not aimed at
+       anything — firing into it would spend a shot on a slip of the
+       hand. The captured-pointer path has no such case: there the
+       crosshair always points somewhere. */
     const hit = this._pick(pointer);
-    // Nothing under the cursor to turn toward, so the beam simply
-    // follows the cursor's own ray out into the sky.
-    if (!hit) return this._shootAlong(this._pointerRay(pointer, this._ray));
+    if (!hit) return false;
 
     /* The body's share is settled here, once, not renegotiated every
        frame. Recomputing it while easing by "the time that is left"
@@ -1317,8 +1323,14 @@ class MarchScene {
     const need = wrap(Math.atan2(hit[0] - cat.x, hit[2] - cat.z) - cat.yaw);
     const beyondNeck = need - Math.max(-HEAD_YAW_MAX, Math.min(HEAD_YAW_MAX, need));
 
+    /* The wait is the turn, not a toll. A cat already looking at what
+       was clicked has nothing to bring round, and charging it the full
+       delay anyway would make held fire stutter at a target it is
+       staring straight at. */
+    const turn = Math.min(1, Math.abs(need) / HEAD_YAW_MAX);
+
     this._aimShot = {
-      x: hit[0], y: hit[1], z: hit[2], t: AIM_TURN,
+      x: hit[0], y: hit[1], z: hit[2], t: AIM_TURN * turn,
       // Where the body will have got to when the head arrives.
       bodyYaw: cat.yaw + beyondNeck + (need - beyondNeck) * BODY_FOLLOW,
     };

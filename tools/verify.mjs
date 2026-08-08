@@ -1602,11 +1602,15 @@ async function interact(cdp, base, problems) {
      sustained press has to produce several shots — a beam weapon that
      needs one click per shot is one nobody uses twice. */
   await cdp.eval(`__aether.clock.paused = false; true`);
-  await mouse('mouseMoved', 700, 450, { buttons: 0 });
+  /* Held on the cluster itself. Pointer lock is refused in a driven
+     browser, so this exercises the free-cursor path, where a click that
+     hits nothing is not a shot — a fixed pixel would mostly miss. */
+  const held = await cdp.eval(BALL_ON_SCREEN);
+  await mouse('mouseMoved', held[0], held[1], { buttons: 0 });
   await sleep(60);
-  await mouse('mousePressed', 700, 450, { buttons: 1 });
+  await mouse('mousePressed', held[0], held[1], { buttons: 1 });
   await sleep(700);
-  await mouse('mouseReleased', 700, 450, { buttons: 0 });
+  await mouse('mouseReleased', held[0], held[1], { buttons: 0 });
   await sleep(200);
 
   /* What a shot leaves behind is a *line*, not a point: the stretch of
@@ -1672,20 +1676,38 @@ async function interact(cdp, base, problems) {
     const e = s.laser.origin;
     let tx = -e[0], ty = -e[1], tz = -e[2];      // cluster sits at the origin
     const l = Math.hypot(tx, ty, tz) || 1;
-    /* The *head*, not the body: the neck covers most of the turn now, so
-       the body deliberately stops short of facing the target. */
+    /* The head against the *beam*, not against the cluster's centre: the
+       shot aimed at the surface point the cursor picked, which from this
+       range sits a good ten degrees off centre. And the head, not the
+       body — the neck covers most of the turn, so the body deliberately
+       stops short. */
     const headYaw = c.yaw + c.rig.rotation[c.rig.bone('head') * 3 + 1];
+    const flat = Math.hypot(d[0], d[2]) || 1;
     return {
       yaw: c.yaw,
       onTarget: (tx / l) * d[0] + (ty / l) * d[1] + (tz / l) * d[2],
-      facing: Math.sin(headYaw) * (tx / l) + Math.cos(headYaw) * (tz / l),
+      facing: Math.sin(headYaw) * (d[0] / flat) + Math.cos(headYaw) * (d[2] / flat),
     };
   })()`);
 
   check('an unlocked click turns the cat onto the target and fires along that line',
     Math.abs(aimedAt.yaw - before) > 0.2 && aimedAt.onTarget > 0.9 && aimedAt.facing > 0.9,
     `body yaw ${before.toFixed(2)} → ${aimedAt.yaw.toFixed(2)}, `
-    + `beam·target ${aimedAt.onTarget.toFixed(3)}, head·target ${aimedAt.facing.toFixed(3)}`);
+    + `beam·target ${aimedAt.onTarget.toFixed(3)}, head·beam ${aimedAt.facing.toFixed(3)}`);
+
+  /* A click on empty sky is not a shot. With a free cursor the click is
+     the aim, so aiming at nothing has to cost nothing — the corner of
+     the floor, well clear of the cluster, stands in for a slip. */
+  const beforeMiss = await cdp.eval(`__aether.scene.shots`);
+  await mouse('mouseMoved', 180, 140, { buttons: 0 });
+  await sleep(120);
+  await mouse('mousePressed', 180, 140, { buttons: 1 });
+  await sleep(80);
+  await mouse('mouseReleased', 180, 140, { buttons: 0 });
+  await sleep(400);
+  const afterMiss = await cdp.eval(`__aether.scene.shots`);
+  check('a click that hits nothing does not fire', afterMiss === beforeMiss,
+    `shots ${beforeMiss} → ${afterMiss}`);
 
   /* The head points down the beam, and it is the head that does most of
      the turning. Both are driven directly rather than through a click,
