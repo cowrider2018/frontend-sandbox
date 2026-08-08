@@ -846,6 +846,7 @@ export class Cat {
       uBalls: env.balls,
       uBound: env.bound,
       uRipples: env.ripples,
+      uRippleTo: env.rippleTo,
       uRippleOn: env.rippleOn,
       uRippleAmp: env.rippleAmp,
       uRippleSpeed: env.rippleSpeed,

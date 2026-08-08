@@ -43,7 +43,12 @@ uniform float uBalls;
 /** xyz = centre, w = radius. Everything the cluster can reach. */
 uniform vec4  uBound;
 
-uniform vec4  uRipples[RIPPLE_N]; // xyz = impact point, w = normalised age
+uniform vec4  uRipples[RIPPLE_N]; // xyz = where it started, w = normalised age
+/* xyz = where it ends. An impact is a *segment*, not a point: a click
+   sets both ends the same and behaves exactly as it always did, while a
+   beam sets them to where it entered and left, and the wave then comes
+   off the whole line it burned through. */
+uniform vec4  uRippleTo[RIPPLE_N];
 uniform float uRippleOn, uRippleAmp, uRippleSpeed, uRippleFreq, uRippleTight;
 uniform float uErode, uDisplace;
 
@@ -118,6 +123,22 @@ float clusterBase(vec3 p) {
  */
 export const CLUSTER_LAYERS = /* glsl */`
 /**
+ * Distance from a point to an impact.
+ *
+ * The impact is a segment. A zero-length one is a point, and the clamp
+ * makes that fall out for free rather than needing its own branch — so
+ * a click and a beam run the identical code.
+ */
+float rippleDist(int i, vec3 p) {
+  vec3 a = uRipples[i].xyz;
+  vec3 ba = uRippleTo[i].xyz - a;
+  vec3 pa = p - a;
+  float bb = dot(ba, ba);
+  float h = bb > 1e-8 ? clamp(dot(pa, ba) / bb, 0.0, 1.0) : 0.0;
+  return length(pa - ba * h);
+}
+
+/**
  * Expanding rings from each recorded impact.
  *
  * Displacing a distance field is not the same as displacing a mesh:
@@ -125,13 +146,16 @@ export const CLUSTER_LAYERS = /* glsl */`
  * added to the distance itself. Keep the amplitude small — a large one
  * breaks the field's Lipschitz bound and the sphere tracer starts
  * overshooting straight through the surface.
+ *
+ * Around a segment these are cylinders rather than spheres, which is
+ * what a beam bored through the cluster should look like.
  */
 float ripples(vec3 p) {
   float sum = 0.0;
   for (int i = 0; i < RIPPLE_N; i++) {
     float age = uRipples[i].w;
     if (age <= 0.0) continue;
-    float d = length(p - uRipples[i].xyz);
+    float d = rippleDist(i, p);
     float front = age * uRippleSpeed;
     // Tight in space around the travelling front, fading in time.
     float env = exp(-abs(d - front) * uRippleTight) * (1.0 - age) * (1.0 - age);
@@ -188,7 +212,7 @@ float erodeMask(vec3 p) {
     float r = reach * sin(PI * pow(age, 0.62));
     if (r <= 0.0) continue;
 
-    float d = length(p - uRipples[i].xyz);
+    float d = rippleDist(i, p);
     sum += 1.0 - smoothstep(r - ERODE_EDGE, r, d);
   }
   return min(sum, 1.0);

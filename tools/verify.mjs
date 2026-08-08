@@ -152,7 +152,7 @@ const SHOTS_PLAN = [
   /* Clock frozen, or the shot is over before the shutter opens: a beam
      lives 0.22 s and the runner waits 1.4 s after poking. Frozen, the
      beam holds at full brightness and the blast is stepped by hand. */
-  { name: '20-cat-laser', hash: '#/march?spin=0&scale=1&taa=0.35&camera=follow&shadow=1',
+  { name: '20-cat-laser', hash: '#/march?spin=0&scale=1&taa=0.35&camera=follow&shadow=1&erode=0.3',
     settle: 2200, freeze: 8.0,
     pre: `const s = __aether.scene, c = s.cat;
           c.x = 0; c.z = 4.2; c.yaw = Math.PI;      // stood off, facing the cluster
@@ -169,12 +169,11 @@ const SHOTS_PLAN = [
        across the line instead. The beam keeps the direction it was fired
        with; only the camera moves. */
     poke: `const s = __aether.scene;
-           s._fire();
+           s._shootAlong(s.basis.fwd);
            s._setControlMode('camera');            // release the pinned yaw
            __aether.panel.setValues({ camera: 'orbit' });
+           s.center.set([0, 0, 0]); s.target.set([0, 0.1, 0]);
            s.yaw = 1.65; s.pitch = 0.30; s.targetDist = 7.5;
-           // A beat, so the spheres have visibly moved when the shutter opens.
-           for (let i = 0; i < 14; i++) s._relaxBalls(1 / 60);
            return true;` },
 
   /* The same weapon with the pointer free. The aim comes from the
@@ -182,15 +181,33 @@ const SHOTS_PLAN = [
      from its eyes to that point — which, unlike a shot down the
      crosshair, is not along the view axis and so needs no camera trick
      to photograph. */
-  { name: '21-cat-aimed', hash: '#/march?spin=0&scale=1&taa=0.35&shadow=1',
+  { name: '21-cat-aimed', hash: '#/march?spin=0&scale=1&taa=0.35&shadow=1&camera=follow&erode=0.3',
     settle: 2200, freeze: 8.0,
-    poke: `const s = __aether.scene, c = s.cat;
-           c.x = 3.4; c.z = 3.4; c.yaw = 2.6;      // stood aside, facing away
-           s.yaw = 0.85; s.pitch = 0.34; s.targetDist = 9;
-           s._setControlMode('camera');
-           document.exitPointerLock?.();
-           s._fire({ x: 0.5, y: 0.43 });           // a click on the cluster
-           for (let i = 0; i < 12; i++) s._relaxBalls(1 / 60);
+    /* Staged first, fired second. Aiming reads the camera basis, and
+       that is only rebuilt on the next frame — setting the camera and
+       firing in one breath aims down the camera that was there before. */
+    pre: `const s = __aether.scene, c = s.cat;
+          c.x = 3.4; c.z = 3.4; c.yaw = 2.6;       // stood aside, facing away
+          s._setControlMode('camera');
+          document.exitPointerLock?.();
+          s.yaw = 0.55; s.pitch = 0.34; s.targetDist = 8;
+          return true;`,
+    hold: { key: [], ms: 900 },                    // let the camera arrive
+    /* Aim by projecting the cluster's centre back to a cursor position,
+       rather than guessing a pixel: a guess that lands beside it falls
+       through to the cursor's own ray and fires off into the sky. */
+    poke: `const s = __aether.scene, b = s.basis, focal = 1.5;
+           const rel = [-b.pos[0], -b.pos[1], -b.pos[2]];
+           const vx = rel[0]*b.right[0] + rel[1]*b.right[1] + rel[2]*b.right[2];
+           const vy = rel[0]*b.up[0]    + rel[1]*b.up[1]    + rel[2]*b.up[2];
+           const vz = rel[0]*b.fwd[0]   + rel[1]*b.fwd[1]   + rel[2]*b.fwd[2];
+           const aspect = innerWidth / innerHeight;
+           s._trigger({
+             x: (vx * focal / aspect / vz) * 0.5 + 0.5,
+             y: 0.5 - (vy * focal / vz) * 0.5,
+           });
+           // The clock is frozen, so the turn is stepped by hand.
+           s._aimTick(0.2);
            return true;` },
 
   /* The three colourways. They share one set of vertices, one set of
@@ -1051,10 +1068,10 @@ async function interact(cdp, base, problems) {
   await sleep(600);
   check('intro dismisses', await cdp.eval(`document.body.classList.contains('intro-done')`));
 
-  /* Clicking the surface bursts it — with the cat hidden, which is now
-     the condition for that behaviour. With a cat on the floor the click
-     is a trigger instead, and the surface is struck by the beam. */
-  await cdp.eval(`__aether.panel.setValues({ spin: false, cat: false }, { notify: true }); true`);
+  /* Clicking the surface bursts it. The locked-on-the-cluster camera is
+     not the cat's view, so a click there still means what it always
+     meant, cat on the floor or not. */
+  await cdp.eval(`__aether.panel.setValues({ spin: false }, { notify: true }); true`);
   await sleep(500);
   const bursts0 = await cdp.eval(`__aether.scene.bursts`);
 
@@ -1074,8 +1091,6 @@ async function interact(cdp, base, problems) {
   check('a click strikes the surface', burst.bursts > bursts0,
     `${bursts0} → ${burst.bursts} impacts, flash ${burst.flash}`);
   check('the impact leaves a ripple', burst.ripples > 0, `${burst.ripples} active`);
-  await cdp.eval(`__aether.panel.setValues({ cat: true }, { notify: true }); true`);
-  await sleep(400);
 
   // The ripple has to ride its host: everything here orbits, and a centre
   // frozen in world space slides off the surface it belongs to.
@@ -1483,108 +1498,6 @@ async function interact(cdp, base, problems) {
   await cdp.eval(`__aether.clock.paused = false; true`);
   await sleep(300);
 
-  /* ── eye beams ──
-     A left click in mouse-look fires, and the shot drives the cluster
-     apart along its axis. Both halves are asserted: that the trigger
-     reaches the scene at all, and that what it delivers is radial —
-     spheres thrown clear of the line rather than shoved down it. */
-  await cdp.eval(`location.hash = '#/march?spin=0&scale=0.5&taa=0&balls=6'; true`);
-  await sleep(1200);
-  const aimed = await cdp.eval(`(() => {
-    const s = __aether.scene, c = s.cat;
-    __aether.clock.paused = true; __aether.clock.time = 8;
-    s._setControlMode('look');
-    document.exitPointerLock?.();
-    c.x = 0; c.z = 4.2; c.yaw = Math.PI;
-    s.yaw = 0; s.pitch = -0.15; s.targetDist = 2.4;
-    s.ballOff.fill(0); s.ballVel.fill(0);
-    return s.shots;
-  })()`);
-  await sleep(600);
-
-  /* Hold the trigger. Mouse-look repeats on a cooldown, so a single
-     sustained press has to produce several shots — a beam weapon that
-     needs one click per shot is one nobody uses twice. */
-  await cdp.eval(`__aether.clock.paused = false; true`);
-  await mouse('mouseMoved', 700, 450, { buttons: 0 });
-  await sleep(60);
-  await mouse('mousePressed', 700, 450, { buttons: 1 });
-  await sleep(700);
-  await mouse('mouseReleased', 700, 450, { buttons: 0 });
-  await sleep(200);
-
-  const blast = await cdp.eval(`(() => {
-    const s = __aether.scene;
-    const d = s.laser.dir;
-    let along = 0, across = 0;
-    for (let i = 0; i < s.ballCount; i++) {
-      const o = i * 3;
-      const v = [s.ballVel[o], s.ballVel[o + 1], s.ballVel[o + 2]];
-      const a = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
-      along += Math.abs(a);
-      across += Math.hypot(v[0] - d[0] * a, v[1] - d[1] * a, v[2] - d[2] * a);
-    }
-    return { shots: s.shots, along, across };
-  })()`);
-
-  check('holding the trigger in mouse-look fires repeatedly',
-    blast.shots >= aimed + 3, `shots ${aimed} → ${blast.shots} while held for 0.7 s`);
-  check('the shot drives the cluster outward from the beam axis',
-    blast.across > 0.5 && blast.across > blast.along * 2,
-    `speed across the axis ${blast.across.toFixed(2)} vs along it ${blast.along.toFixed(2)}`);
-
-  /* With the pointer free the aim comes from the cursor, not the
-     crosshair: the cat turns to face what was clicked and the beam runs
-     from its eyes to that point. Asserted against the cluster's actual
-     position rather than against the camera, since from anywhere but
-     directly behind the animal the two are different directions. */
-  await cdp.eval(`(() => {
-    const s = __aether.scene, c = s.cat;
-    s._setControlMode('camera');
-    __aether.panel.setValues({ camera: 'orbit' });
-    __aether.clock.paused = true; __aether.clock.time = 8;
-    c.x = 3.4; c.z = 3.4; c.yaw = 2.6;        // stood aside, facing away
-    s.yaw = 0.85; s.pitch = 0.30; s.targetDist = 9;
-    s.ballOff.fill(0); s.ballVel.fill(0);
-    return true;
-  })()`);
-  await sleep(700);
-
-  const before = await cdp.eval(`__aether.scene.cat.yaw`);
-  const onBall = await cdp.eval(BALL_ON_SCREEN);
-  await mouse('mouseMoved', onBall[0], onBall[1], { buttons: 0 });
-  await sleep(120);
-  await mouse('mousePressed', onBall[0], onBall[1], { buttons: 1 });
-  await sleep(80);
-  await mouse('mouseReleased', onBall[0], onBall[1], { buttons: 0 });
-  await sleep(400);
-
-  const aimedAt = await cdp.eval(`(() => {
-    const s = __aether.scene, c = s.cat, d = s.laser.dir;
-    // Where the beam left from, and the line from there to the cluster.
-    const e = s.laser.origin;
-    let tx = -e[0], ty = -e[1], tz = -e[2];      // cluster sits at the origin
-    const l = Math.hypot(tx, ty, tz) || 1;
-    return {
-      yaw: c.yaw,
-      onTarget: (tx / l) * d[0] + (ty / l) * d[1] + (tz / l) * d[2],
-      facing: Math.sin(c.yaw) * (tx / l) + Math.cos(c.yaw) * (tz / l),
-    };
-  })()`);
-
-  check('an unlocked click turns the cat to face the target and fires along that line',
-    Math.abs(aimedAt.yaw - before) > 0.2 && aimedAt.onTarget > 0.9 && aimedAt.facing > 0.9,
-    `yaw ${before.toFixed(2)} → ${aimedAt.yaw.toFixed(2)}, `
-    + `beam·target ${aimedAt.onTarget.toFixed(3)}, facing·target ${aimedAt.facing.toFixed(3)}`);
-
-  await cdp.eval(`(() => {
-    const s = __aether.scene;
-    s.ballOff.fill(0); s.ballVel.fill(0);
-    __aether.clock.paused = false;
-    return true;
-  })()`);
-  await sleep(300);
-
   /* WASD overlaps the app's own shortcuts, so the scene may only claim
      them while there is something to steer. */
   await cdp.eval(`(() => { __aether.scene.cat.velocity = 0; return true; })()`);
@@ -1666,6 +1579,113 @@ async function interact(cdp, base, problems) {
   check('Y switches back, and D turns the cat toward screen-right',
     back.mode === 'camera' && steered.align > 0.9,
     `mode = ${back.mode}, facing·screen-right = ${steered.align.toFixed(3)}`);
+
+  /* ── eye beams ──
+     A left click in mouse-look fires, and the shot drives the cluster
+     apart along its axis. Both halves are asserted: that the trigger
+     reaches the scene at all, and that what it delivers is radial —
+     spheres thrown clear of the line rather than shoved down it. */
+  await cdp.eval(`location.hash = '#/march?spin=0&scale=0.5&taa=0&balls=6&camera=follow'; true`);
+  await sleep(1200);
+  const aimed = await cdp.eval(`(() => {
+    const s = __aether.scene, c = s.cat;
+    __aether.clock.paused = true; __aether.clock.time = 8;
+    s._setControlMode('look');
+    document.exitPointerLock?.();
+    c.x = 0; c.z = 4.2; c.yaw = Math.PI;
+    s.yaw = 0; s.pitch = -0.15; s.targetDist = 2.4;
+    return s.shots;
+  })()`);
+  await sleep(600);
+
+  /* Hold the trigger. Mouse-look repeats on a cooldown, so a single
+     sustained press has to produce several shots — a beam weapon that
+     needs one click per shot is one nobody uses twice. */
+  await cdp.eval(`__aether.clock.paused = false; true`);
+  await mouse('mouseMoved', 700, 450, { buttons: 0 });
+  await sleep(60);
+  await mouse('mousePressed', 700, 450, { buttons: 1 });
+  await sleep(700);
+  await mouse('mouseReleased', 700, 450, { buttons: 0 });
+  await sleep(200);
+
+  /* What a shot leaves behind is a *line*, not a point: the stretch of
+     beam that was inside the cluster. Measured as the longest live
+     impact segment, and where its middle sits relative to the cluster. */
+  const blast = await cdp.eval(`(() => {
+    const s = __aether.scene;
+    let span = 0, midFromCentre = 1e9;
+    for (let i = 0; i < 4; i++) {
+      if (s.ripples[i * 4 + 3] <= 0) continue;
+      const q = i * 4;
+      const len = Math.hypot(
+        s.rippleTo[q] - s.ripples[q],
+        s.rippleTo[q + 1] - s.ripples[q + 1],
+        s.rippleTo[q + 2] - s.ripples[q + 2]);
+      if (len <= span) continue;
+      span = len;
+      midFromCentre = Math.hypot(
+        (s.ripples[q] + s.rippleTo[q]) / 2,
+        (s.ripples[q + 1] + s.rippleTo[q + 1]) / 2,
+        (s.ripples[q + 2] + s.rippleTo[q + 2]) / 2);
+    }
+    return { shots: s.shots, span, midFromCentre, bound: s.bound[3] };
+  })()`);
+
+  check('holding the trigger in mouse-look fires repeatedly',
+    blast.shots >= aimed + 3, `shots ${aimed} → ${blast.shots} while held for 0.7 s`);
+  check('the shot bores a line through the cluster, not a crater on it',
+    blast.span > 1.0 && blast.midFromCentre < blast.bound,
+    `impact spans ${blast.span.toFixed(2)} units, `
+    + `its middle ${blast.midFromCentre.toFixed(2)} from the centre of a ${blast.bound.toFixed(2)} cluster`);
+
+  /* With the pointer free the aim comes from the cursor, not the
+     crosshair: the cat turns to face what was clicked and the beam runs
+     from its eyes to that point. Asserted against the cluster's actual
+     position rather than against the camera, since from anywhere but
+     directly behind the animal the two are different directions. */
+  await cdp.eval(`(() => {
+    const s = __aether.scene, c = s.cat;
+    s._setControlMode('camera');
+    __aether.panel.setValues({ camera: 'follow' });
+    // The clock has to run: an aimed shot waits on the cat's head, and
+    // a frozen clock is a head that never arrives.
+    __aether.clock.paused = false;
+    c.x = 3.4; c.z = 3.4; c.yaw = 2.6;        // stood aside, facing away
+    s.yaw = 0.85; s.pitch = 0.30; s.targetDist = 9;
+    return true;
+  })()`);
+  await sleep(700);
+
+  const before = await cdp.eval(`__aether.scene.cat.yaw`);
+  const onBall = await cdp.eval(BALL_ON_SCREEN);
+  await mouse('mouseMoved', onBall[0], onBall[1], { buttons: 0 });
+  await sleep(120);
+  await mouse('mousePressed', onBall[0], onBall[1], { buttons: 1 });
+  await sleep(80);
+  await mouse('mouseReleased', onBall[0], onBall[1], { buttons: 0 });
+  await sleep(400);
+
+  const aimedAt = await cdp.eval(`(() => {
+    const s = __aether.scene, c = s.cat, d = s.laser.dir;
+    // Where the beam left from, and the line from there to the cluster.
+    const e = s.laser.origin;
+    let tx = -e[0], ty = -e[1], tz = -e[2];      // cluster sits at the origin
+    const l = Math.hypot(tx, ty, tz) || 1;
+    return {
+      yaw: c.yaw,
+      onTarget: (tx / l) * d[0] + (ty / l) * d[1] + (tz / l) * d[2],
+      facing: Math.sin(c.yaw) * (tx / l) + Math.cos(c.yaw) * (tz / l),
+    };
+  })()`);
+
+  check('an unlocked click turns the cat to face the target and fires along that line',
+    Math.abs(aimedAt.yaw - before) > 0.2 && aimedAt.onTarget > 0.9 && aimedAt.facing > 0.9,
+    `yaw ${before.toFixed(2)} → ${aimedAt.yaw.toFixed(2)}, `
+    + `beam·target ${aimedAt.onTarget.toFixed(3)}, facing·target ${aimedAt.facing.toFixed(3)}`);
+
+  await cdp.eval(`__aether.clock.paused = false; true`);
+  await sleep(300);
 
   /* reset puts back everything: parameters, camera and the URL. It used
      to do only half of that, with the other half hidden in a separate

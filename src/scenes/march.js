@@ -31,7 +31,7 @@ import {
   CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_LAYERS, CLUSTER_SHADOW, SKY,
 } from './cluster.js';
 import { Cat, CAT_PROXY_GLSL, CAT_CAPS } from './cat/index.js';
-import { Laser, blastAt } from './laser.js';
+import { Laser } from './laser.js';
 
 /* Mouse-look sensitivity. The locked figure is per device pixel and is
    the usual first-person number; the unlocked one is per canvas width,
@@ -41,19 +41,18 @@ const LOOK_PER_SWEEP = 3.4;
 /** Vertical look is the camera's elevation, and rides much shallower. */
 const PITCH_FROM_LOOK = 0.75;
 
-/* Blast response. The spring is what gathers the cluster up again after
-   a shot; without it every hit would leave a permanent dent. Stiff
-   enough to reform in about a second, damped just under critical so it
-   settles rather than ringing. */
-const BLAST_SPRING = 14.0;
-const BLAST_DAMP = 4.2;
-/** How far off the beam's axis a sphere still feels it, and how hard. */
-const BLAST_RADIUS = 1.5;
-const BLAST_FORCE = 7.0;
 /** Seconds between shots while the trigger is held. */
 const FIRE_INTERVAL = 0.13;
 /** How far a beam carries if it never hits anything. */
 const BEAM_REACH = 40.0;
+/** A ripple that is a line through space, owned by no body. */
+const HOST_BORE = -3;
+/* How long the cat takes to bring its head round before an aimed shot.
+   Not latency to be minimised: a beam that leaves before the animal has
+   looked reads as a mis-aim rather than as a reflex. Only the free-cursor
+   path pays it — with the pointer captured the cat is already facing
+   wherever the crosshair is. */
+const AIM_TURN = 0.15;
 
 /* Uploaded in place of the cat's capsules when there is no cat. The
    shader is gated on the count, but a sampler-free uniform array still
@@ -593,7 +592,7 @@ export default {
       text: 'WASD 驅動貓在地面上走動。預設「依鏡頭方向」：WASD 是畫面上的前後左右，'
         + '貓會轉向該方向再走過去——按 S 牠就轉過身朝你走來。'
         + '按 Y 切換成「滑鼠轉向」：滑鼠滑動轉身（不用按鍵）、A／D 改成左右平移，'
-        + '**按住滑鼠左鍵從眼睛連發雷射**（準心方向），把星體沿光束軸向外炸開；'
+        + '**按住滑鼠左鍵從眼睛連發雷射**（準心方向），一路打穿星體；'
         + '指標未鎖定時改成點擊瞄準——貓會轉身面向游標指到的點再射。'
         + '這個模式會鎖定指標，Esc 放開，點畫布重新鎖定。' },
 
@@ -631,6 +630,7 @@ class MarchScene {
     this.cat = null;
     this.catError = null;
     this._showCat = false;
+    this._catView = false;
     Cat.load(gl, new URL('./cat/cat.bin', import.meta.url).href)
       .then((cat) => { this.cat = cat; })
       .catch((err) => { this.catError = err; console.error('cat failed to load', err); });
@@ -662,10 +662,6 @@ class MarchScene {
 
     /* ── the cluster, computed here and uploaded ── */
     this.ballPos = new Float32Array(BALL_N * 4);
-    /** Displacement from where the orbit says each sphere should be, and
-        the velocity carrying it. Only a blast ever writes these. */
-    this.ballOff = new Float32Array(BALL_N * 3);
-    this.ballVel = new Float32Array(BALL_N * 3);
     this.ballCount = 6;
     this.blend = 0.32;
     /** xyz = centre, w = radius. The one number every distance derives from. */
@@ -673,7 +669,15 @@ class MarchScene {
 
     /* ── impacts ── */
     this.ripples = new Float32Array(RIPPLE_N * 4);         // world xyz + age
-    this._rippleHost = new Int32Array(RIPPLE_N).fill(-2);  // ball index, -1 = ring
+    /** The impact's other end. Equal to the first for a click; the far
+        side of the crossing for a beam. */
+    this.rippleTo = new Float32Array(RIPPLE_N * 4);
+    /** ball index · -1 ring · -2 unused · HOST_BORE a line through space */
+    this._rippleHost = new Int32Array(RIPPLE_N).fill(-2);
+    /** Length of the impact. Zero for a click; the crossing for a beam. */
+    this._rippleLen = new Float32Array(RIPPLE_N);
+    /** The bore's far end, in world space, since nothing carries it. */
+    this._boreEnd = new Float32Array(RIPPLE_N * 3);
     this._rippleLocal = new Float32Array(RIPPLE_N * 3);    // unit dir, or ring-local point
     this._rippleAge = new Float32Array(RIPPLE_N);
     this._rippleNext = 0;
@@ -686,9 +690,11 @@ class MarchScene {
     /* ── eye beams ── */
     this.laser = new Laser(gl);
     this.shots = 0;
-    this._blastDir = new Float32Array(3);
+
     this._aim = new Float32Array(3);
     this._fireCooldown = 0;
+    /** A shot waiting on the cat's head to come round. */
+    this._aimShot = null;
     this._eyeA = new Float32Array(3);
     this._eyeB = new Float32Array(3);
 
@@ -758,7 +764,7 @@ class MarchScene {
        refused outright — an embedded or automated document may never be
        granted it — and a trigger that silently did nothing there would
        contradict the mode being built to work unlocked. */
-    if (this._showCat && this.cat.mode === 'look' && !this.locked) this._requestLock();
+    if (this._catView && this.cat.mode === 'look' && !this.locked) this._requestLock();
   }
 
   onPointerUp() {
@@ -771,10 +777,10 @@ class MarchScene {
      *   no cat       the original behaviour: it strikes the surface
      */
     const clicked = this._pressed && this._dragDist < 0.015;
-    const look = this._showCat && this.cat?.mode === 'look';
+    const look = this._catView && this.cat?.mode === 'look';
 
     if (clicked && !look) {
-      if (this._showCat) this._pendingShot = true;
+      if (this._catView) this._pendingShot = true;
       else this._pendingBurst = true;
     }
     this._pressed = false;
@@ -865,9 +871,8 @@ class MarchScene {
     this.flash = 0;
     this.bursts = 0;
     this.shots = 0;
-    this.ballOff.fill(0);
-    this.ballVel.fill(0);
     this._pendingShot = false;
+    this._aimShot = null;
     this._fireCooldown = 0;
     // The app has just put every slider back, including the master, so
     // forget where it last fired or it will stamp over them next frame.
@@ -1051,27 +1056,6 @@ class MarchScene {
    * where to give up, how far a shadow ray can still matter. Change the
    * scene's scale and nothing needs re-tuning.
    */
-  /**
-   * Advance the blast displacements.
-   *
-   * The orbits are a closed-form function of time, which leaves nowhere
-   * for a shove to be remembered. So the shove lives beside them: each
-   * sphere carries an offset from where its formula says it should be,
-   * and a velocity carrying that offset.
-   *
-   * The offset is sprung back to zero rather than merely damped. Damping
-   * alone would leave the cluster permanently deformed by every shot
-   * ever fired; a spring means it blows apart and then gathers itself,
-   * and the orbits underneath are never disturbed at all.
-   */
-  _relaxBalls(dt) {
-    const k = BLAST_SPRING, c = BLAST_DAMP;
-    for (let i = 0; i < BALL_N * 3; i++) {
-      this.ballVel[i] += (-k * this.ballOff[i] - c * this.ballVel[i]) * dt;
-      this.ballOff[i] += this.ballVel[i] * dt;
-    }
-  }
-
   _updateBalls(state, time) {
     const t = time * 0.42;
     const n = Math.round(state.balls);
@@ -1084,10 +1068,10 @@ class MarchScene {
 
     for (let i = 0; i < n; i++) {
       const a = i * 2.399963;                       // golden angle
-      const o = i * 4, d = i * 3;
-      const x = Math.sin(t * (0.7 + i * 0.11) + a) * (0.62 + 0.1 * Math.sin(i)) + this.ballOff[d];
-      const y = Math.cos(t * (0.5 + i * 0.09) + a * 1.7) * 0.5 + this.ballOff[d + 1];
-      const z = Math.cos(t * (0.62 + i * 0.13) + a * 0.6) * (0.62 + 0.1 * Math.cos(i)) + this.ballOff[d + 2];
+      const o = i * 4;
+      const x = Math.sin(t * (0.7 + i * 0.11) + a) * (0.62 + 0.1 * Math.sin(i));
+      const y = Math.cos(t * (0.5 + i * 0.09) + a * 1.7) * 0.5;
+      const z = Math.cos(t * (0.62 + i * 0.13) + a * 0.6) * (0.62 + 0.1 * Math.cos(i));
       const r = 0.30 + 0.10 * Math.sin(t * 0.9 + i * 2.1);
       this.ballPos[o + 0] = x;
       this.ballPos[o + 1] = y;
@@ -1208,6 +1192,9 @@ class MarchScene {
     this._rippleNext = (this._rippleNext + 1) % RIPPLE_N;
     this._rippleHost[i] = host;
     this._rippleAge[i] = 1e-4;
+    // A click is a segment of zero length, which the shader handles with
+    // the same code a beam uses.
+    this._rippleLen[i] = 0;
 
     const l = i * 3;
     if (host >= 0) {
@@ -1227,6 +1214,27 @@ class MarchScene {
     }
   }
 
+  /**
+   * Record a bore: an impact that is a line rather than a point.
+   *
+   * Pinned in world space, unlike a click's. A click belongs to the
+   * sphere it landed on and has to ride it as it orbits; a bore runs
+   * through whatever happened to be in the way, so no one body owns it
+   * and there is nothing to ride.
+   */
+  _anchorBore(ax, ay, az, bx, by, bz) {
+    const i = this._rippleNext;
+    this._rippleNext = (this._rippleNext + 1) % RIPPLE_N;
+
+    this._rippleHost[i] = HOST_BORE;
+    this._rippleAge[i] = 1e-4;
+    this._rippleLen[i] = Math.hypot(bx - ax, by - ay, bz - az);
+
+    const l = i * 3;
+    this._rippleLocal[l] = ax; this._rippleLocal[l + 1] = ay; this._rippleLocal[l + 2] = az;
+    this._boreEnd[l] = bx; this._boreEnd[l + 1] = by; this._boreEnd[l + 2] = bz;
+  }
+
   _burst(state, pointer) {
     const p = this._pick(pointer);
     if (!p) return false;
@@ -1239,33 +1247,19 @@ class MarchScene {
   /* ── eye beams ──────────────────────────────────────────────────── */
 
   /**
-   * How far a beam gets before it hits something.
+   * How far a beam carries.
    *
-   * Depth-testing the beam against the scene is not enough on its own:
-   * it hides the beam wherever something is nearer the eye, which is not
-   * the same as stopping it. A beam aimed through a sphere is correctly
-   * hidden inside that sphere and then reappears out the far side,
-   * carrying on into the sky, which reads as passing behind the cluster
-   * rather than striking it.
-   *
-   * So the range is found once, here, by walking the same field the
-   * picking does — and the floor, which is a plane and needs no walking.
+   * It is not stopped by the cluster: this beam bores, so it goes
+   * through and out the far side, and the channel it opens is what lets
+   * it be seen doing so. The only thing that ends it is the floor, which
+   * is a plane and needs no searching.
    */
   _beamReach(ox, oy, oz, dir) {
-    let hit = BEAM_REACH;
-
     if (dir[1] < -1e-4) {
       const toFloor = (FLOOR_Y - oy) / dir[1];
-      if (toFloor > 0) hit = Math.min(hit, toFloor);
+      if (toFloor > 0) return Math.min(BEAM_REACH, toFloor);
     }
-
-    let t = 0.05;
-    for (let i = 0; i < 96 && t < hit; i++) {
-      const d = this._mapCPU(ox + dir[0] * t, oy + dir[1] * t, oz + dir[2] * t);
-      if (d < 0.002) return t;
-      t += Math.max(d * 0.9, 0.01);
-    }
-    return hit;
+    return BEAM_REACH;
   }
 
   /**
@@ -1277,50 +1271,80 @@ class MarchScene {
    * the two agree. The same reasoning already decides where a click
    * strikes the surface.
    */
-  _fire(pointer) {
-    if (!this._showCat) return false;
+  /**
+   * Pull the trigger.
+   *
+   * Where the shot goes, and whether it goes at once, both depend on
+   * whether the pointer is captured.
+   *
+   * Captured, the crosshair is the aim and the camera's forward vector
+   * is the crosshair — nothing to look up and nothing to wait for. Free,
+   * the aim is whatever the cursor is over, and the cat has to bring its
+   * head round to it first. That delay is not a cost to be minimised: a
+   * beam that leaves before the animal has looked reads as a mis-aim.
+   */
+  _trigger(pointer) {
+    if (!this._catView) return false;
+
+    // No cursor to read: fire down the crosshair, now.
+    if (this.locked || !pointer) return this._shootAlong(this.basis.fwd);
+
+    const hit = this._pick(pointer);
+    // Nothing under the cursor to turn toward, so the beam simply
+    // follows the cursor's own ray out into the sky.
+    if (!hit) return this._shootAlong(this._pointerRay(pointer, this._ray));
+
+    this._aimShot = { x: hit[0], y: hit[1], z: hit[2], t: AIM_TURN };
+    return true;
+  }
+
+  /**
+   * Bring the head round toward a scheduled shot, and take it on arrival.
+   *
+   * The turn is spread over exactly the time left rather than run at a
+   * fixed rate, so it lands on the target as the delay expires however
+   * far it had to come.
+   *
+   * Runs after the cat's own update so that, if the player is steering
+   * at the same time, the aim owns the moment it was given.
+   */
+  _aimTick(dt) {
+    const shot = this._aimShot;
+    if (!shot) return;
+    if (!this._catView) { this._aimShot = null; return; }
+
+    const cat = this.cat;
+    const want = Math.atan2(shot.x - cat.x, shot.z - cat.z);
+    const delta = (want - cat.yaw + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+    const step = shot.t > dt ? dt / shot.t : 1;
+    const yaw = cat.yaw + delta * step;
+    cat.faceTowards(Math.sin(yaw), Math.cos(yaw));
+
+    shot.t -= dt;
+    if (shot.t > 0) return;
+    this._aimShot = null;
+
+    // Aim from where the eyes ended up, not from where they started.
+    this.cat.eyeWorld(0, this._eyeA);
+    this.cat.eyeWorld(1, this._eyeB);
+    const aim = this._aim;
+    aim[0] = shot.x - (this._eyeA[0] + this._eyeB[0]) * 0.5;
+    aim[1] = shot.y - (this._eyeA[1] + this._eyeB[1]) * 0.5;
+    aim[2] = shot.z - (this._eyeA[2] + this._eyeB[2]) * 0.5;
+    const l = Math.hypot(aim[0], aim[1], aim[2]) || 1;
+    aim[0] /= l; aim[1] /= l; aim[2] /= l;
+    this._shootAlong(aim);
+  }
+
+  /** Fire, from wherever the eyes are now, along a unit direction. */
+  _shootAlong(dir) {
+    if (!this._catView) return false;
 
     this.cat.eyeWorld(0, this._eyeA);
     this.cat.eyeWorld(1, this._eyeB);
-    const ox = (this._eyeA[0] + this._eyeB[0]) * 0.5;
-    const oy = (this._eyeA[1] + this._eyeB[1]) * 0.5;
-    const oz = (this._eyeA[2] + this._eyeB[2]) * 0.5;
 
     const aim = this._aim;
-    if (this.locked || !pointer) {
-      /* Captured pointer: there is no cursor to read, so the crosshair
-         is the aim and the camera's forward vector is the crosshair.
-         Also the answer when no pointer is supplied at all, which is how
-         a shot fired from code asks for the crosshair. */
-      aim.set(this.basis.fwd);
-    } else {
-      /* Free cursor: aim at whatever it is over. The line runs from the
-         eyes to that point, not from the camera — the cat is doing the
-         shooting, and from anywhere but directly behind it the two are
-         visibly different directions.
-
-         A click on empty sky has nothing to aim at, so the beam simply
-         follows the cursor's own ray out into it. */
-      const hit = this._pick(pointer);
-      if (!hit) {
-        aim.set(this._pointerRay(pointer, this._ray));
-        this.cat.faceTowards(aim[0], aim[2]);
-      } else {
-        const tx = hit[0], ty = hit[1], tz = hit[2];
-
-        // Turn first, then aim: turning moves the eyes, and a line drawn
-        // from where they used to be arrives beside the target.
-        this.cat.faceTowards(tx - ox, tz - oz);
-        this.cat.eyeWorld(0, this._eyeA);
-        this.cat.eyeWorld(1, this._eyeB);
-
-        aim[0] = tx - (this._eyeA[0] + this._eyeB[0]) * 0.5;
-        aim[1] = ty - (this._eyeA[1] + this._eyeB[1]) * 0.5;
-        aim[2] = tz - (this._eyeA[2] + this._eyeB[2]) * 0.5;
-        const l = Math.hypot(aim[0], aim[1], aim[2]) || 1;
-        aim[0] /= l; aim[1] /= l; aim[2] /= l;
-      }
-    }
+    if (aim !== dir) aim.set(dir);
 
     const mid = [(this._eyeA[0] + this._eyeB[0]) * 0.5,
                  (this._eyeA[1] + this._eyeB[1]) * 0.5,
@@ -1329,45 +1353,45 @@ class MarchScene {
       this._beamReach(mid[0], mid[1], mid[2], aim));
     this.shots++;
     this.flash = 1;
-    this._blast();
+    this._bore(mid, aim);
     return true;
   }
 
   /**
-   * What the shot does to the cluster.
+   * What the shot does to the cluster: it bores through it.
    *
-   * The energy comes off the beam's axis rather than its muzzle, so it
-   * drives a cylinder opening outward — spheres are thrown clear of the
-   * line, not away from the cat. It is applied once, as an impulse: the
-   * spring in `_relaxBalls` takes it from there.
+   * A click leaves a point impact and the wave comes off that point as a
+   * sphere. A beam leaves a *segment* — everything it passed through —
+   * and the same wave comes off it as a cylinder, so what opens is a
+   * channel the length of the crossing rather than a crater where it
+   * happened to land first.
    *
-   * Anything it actually hits also gets a ripple, anchored the same way
-   * a click's is, so the surface reacts in the language the scene
-   * already speaks.
+   * The segment is the beam clipped to the cluster's bounding sphere,
+   * which is the only stretch of it that can be inside anything. It is
+   * pinned in world space rather than anchored to a sphere the way a
+   * click is: the bore runs through whatever was in the way, and no one
+   * body owns it.
    */
-  _blast() {
-    const { origin, dir } = this.laser;
-    const out = this._blastDir;
+  _bore(origin, dir) {
+    const cx = origin[0] - this.bound[0];
+    const cy = origin[1] - this.bound[1];
+    const cz = origin[2] - this.bound[2];
 
-    for (let i = 0; i < this.ballCount; i++) {
-      const o = i * 4;
-      const push = blastAt(origin, dir, this.ballPos.subarray(o, o + 3),
-        out, BLAST_RADIUS, BLAST_FORCE);
-      if (push <= 0) continue;
+    const b = cx * dir[0] + cy * dir[1] + cz * dir[2];
+    const c = cx * cx + cy * cy + cz * cz - this.bound[3] * this.bound[3];
+    const h = b * b - c;
+    if (h < 0) return false;                 // the shot missed entirely
 
-      const d = i * 3;
-      this.ballVel[d] += out[0] * push;
-      this.ballVel[d + 1] += out[1] * push;
-      this.ballVel[d + 2] += out[2] * push;
+    const root = Math.sqrt(h);
+    const enter = Math.max(-b - root, 0);    // never behind the eyes
+    const leave = -b + root;
+    if (leave <= enter) return false;
 
-      // Where the blast crossed this sphere's surface: its centre, moved
-      // back toward the axis by a radius.
-      this._anchorRipple(
-        this.ballPos[o] - out[0] * this.ballPos[o + 3],
-        this.ballPos[o + 1] - out[1] * this.ballPos[o + 3],
-        this.ballPos[o + 2] - out[2] * this.ballPos[o + 3],
-      );
-    }
+    this._anchorBore(
+      origin[0] + dir[0] * enter, origin[1] + dir[1] * enter, origin[2] + dir[2] * enter,
+      origin[0] + dir[0] * leave, origin[1] + dir[1] * leave, origin[2] + dir[2] * leave,
+    );
+    return true;
   }
 
   _updateRipples(state, dt) {
@@ -1394,27 +1418,42 @@ class MarchScene {
       }
       this._rippleAge[i] = next;
 
-      const l = i * 3;
-      if (host >= 0) {
-        const o = host * 4;
-        const r = this.ballPos[o + 3];
-        this.ripples[i * 4 + 0] = this.ballPos[o + 0] + this._rippleLocal[l + 0] * r;
-        this.ripples[i * 4 + 1] = this.ballPos[o + 1] + this._rippleLocal[l + 1] * r;
-        this.ripples[i * 4 + 2] = this.ballPos[o + 2] + this._rippleLocal[l + 2] * r;
+      const l = i * 3, q = i * 4;
+      if (host === HOST_BORE) {
+        // Both ends already in world space, and nothing to ride.
+        this.ripples[q + 0] = this._rippleLocal[l + 0];
+        this.ripples[q + 1] = this._rippleLocal[l + 1];
+        this.ripples[q + 2] = this._rippleLocal[l + 2];
+        this.rippleTo[q + 0] = this._boreEnd[l + 0];
+        this.rippleTo[q + 1] = this._boreEnd[l + 1];
+        this.rippleTo[q + 2] = this._boreEnd[l + 2];
       } else {
-        this._ringToWorld(this._rippleLocal[l], this._rippleLocal[l + 1], this._rippleLocal[l + 2], out);
-        this.ripples[i * 4 + 0] = out[0];
-        this.ripples[i * 4 + 1] = out[1];
-        this.ripples[i * 4 + 2] = out[2];
+        if (host >= 0) {
+          const o = host * 4;
+          const r = this.ballPos[o + 3];
+          this.ripples[q + 0] = this.ballPos[o + 0] + this._rippleLocal[l + 0] * r;
+          this.ripples[q + 1] = this.ballPos[o + 1] + this._rippleLocal[l + 1] * r;
+          this.ripples[q + 2] = this.ballPos[o + 2] + this._rippleLocal[l + 2] * r;
+        } else {
+          this._ringToWorld(this._rippleLocal[l], this._rippleLocal[l + 1], this._rippleLocal[l + 2], out);
+          this.ripples[q + 0] = out[0];
+          this.ripples[q + 1] = out[1];
+          this.ripples[q + 2] = out[2];
+        }
+        // A point impact is a segment with both ends in the same place.
+        this.rippleTo[q + 0] = this.ripples[q + 0];
+        this.rippleTo[q + 1] = this.ripples[q + 1];
+        this.rippleTo[q + 2] = this.ripples[q + 2];
       }
-      this.ripples[i * 4 + 3] = next;
+      this.ripples[q + 3] = next;
 
-      // The flare grows briefly, then goes out well before the ripple does.
-      const g = i * 4;
-      this.flarePts[g + 0] = this.ripples[i * 4 + 0];
-      this.flarePts[g + 1] = this.ripples[i * 4 + 1];
-      this.flarePts[g + 2] = this.ripples[i * 4 + 2];
-      this.flarePts[g + 3] = 0.10 + next * 0.35;
+      /* The flare grows briefly, then goes out well before the ripple
+         does. A bore has no single point to flare at, so it lights the
+         middle of what it crossed. */
+      this.flarePts[q + 0] = (this.ripples[q + 0] + this.rippleTo[q + 0]) * 0.5;
+      this.flarePts[q + 1] = (this.ripples[q + 1] + this.rippleTo[q + 1]) * 0.5;
+      this.flarePts[q + 2] = (this.ripples[q + 2] + this.rippleTo[q + 2]) * 0.5;
+      this.flarePts[q + 3] = 0.10 + next * 0.35 + this._rippleLen[i] * 0.25;
       this.flareAmt[i] = Math.max(0, 1 - next * 3.2) * state.flash;
 
       active++;
@@ -1457,6 +1496,11 @@ class MarchScene {
        the amount that makes it feel loose. */
     const showCat = Boolean(this.cat && state.cat);
     this._showCat = showCat;                    // read by onKey, which has no state
+    /* The weapon belongs to the cat's own view. With the camera locked
+       on the cluster you are watching it, not being it, and a click
+       there means what it always meant: strike the surface. Read by the
+       pointer handlers, which have no state either. */
+    this._catView = showCat && state.camera === 'follow';
     if (showCat) {
       // Changing the colourway invalidates the accumulated history the
       // same way moving does — the pixels change without the cat having.
@@ -1486,9 +1530,6 @@ class MarchScene {
 
     const tint = TINTS[state.tint] || TINTS.amber;
 
-    // Blast displacements are carried forward before the orbits are
-    // evaluated, since the orbits add to them.
-    this._relaxBalls(dt);
     this._updateBalls(state, clock.time);
 
     if (pointer.down) {
@@ -1508,15 +1549,16 @@ class MarchScene {
        mouse still orbits, so a shot is one per click and is armed on
        release, where a drag can already be told from a click. */
     this._fireCooldown -= dt;
-    const holding = this._pressed && showCat && this.cat.mode === 'look';
+    const holding = this._pressed && this._catView && this.cat.mode === 'look';
     if (holding && this._fireCooldown <= 0) {
-      this._fire(pointer);
+      this._trigger(pointer);
       this._fireCooldown = FIRE_INTERVAL;
     }
     if (this._pendingShot) {
       this._pendingShot = false;
-      this._fire(pointer);
+      this._trigger(pointer);
     }
+    this._aimTick(dt);
     this.laser.update(dt);
     if (this.laser.active) this.moving = 1;
 
@@ -1559,6 +1601,7 @@ class MarchScene {
       uCatCaps: showCat ? this.cat.capCount : 0,
 
       uRipples: this.ripples,
+      uRippleTo: this.rippleTo,
       uRippleOn: rippleActive > 0 ? 1 : 0,
       uRippleAmp: state.rippleAmp,
       uRippleSpeed: state.rippleSpeed,
@@ -1615,6 +1658,7 @@ class MarchScene {
           balls: this.ballCount,
           bound: this.bound,
           ripples: this.ripples,
+          rippleTo: this.rippleTo,
           rippleOn: rippleActive > 0 ? 1 : 0,
           rippleAmp: state.rippleAmp,
           rippleSpeed: state.rippleSpeed,
