@@ -26,6 +26,7 @@ import { PRECISION, CONSTANTS, ROTATE, SIMPLEX3 } from '../../shaders/common.js'
 import {
   CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_LAYERS, CLUSTER_SHADOW, SKY,
 } from '../cluster.js';
+import { CANOPY_SHADE_GLSL } from '../canopy.js';
 import { RASTER_NEAR as NEAR, RASTER_FAR as FAR } from '../raster.js';
 import { parseCat, Rig, modelMatrix } from './rig.js';
 import { Driver, Sway, applyPose } from './pose.js';
@@ -246,6 +247,7 @@ ${CLUSTER_FIELD}
 ${CLUSTER_LAYERS}
 ${CLUSTER_SHADOW}
 ${SKY}
+${CANOPY_SHADE_GLSL}
 
 in vec3 vNormal;
 in vec3 vColor;
@@ -313,6 +315,8 @@ void main() {
     if (ndl > 0.0 && uShadowSoft > 0.0) {
       sh = clusterShadow(vWorld + n * 0.01, l, mix(6.0, 26.0, uShadowSoft));
     }
+    // And whatever is growing over its head.
+    sh = min(sh, canopyShade(vWorld));
 
     // Grazing sheen instead of a specular lobe, gated on the lit side so
     // it rims the coat rather than glowing all the way round it.
@@ -898,6 +902,9 @@ export class Cat {
       uDisplace: env.displace,
 
       uUnlit: 0,
+
+      // The wood overhead, so the animal walks into its shade.
+      ...env.canopy,
     });
 
     gl.bindVertexArray(this.vao);

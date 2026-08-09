@@ -236,6 +236,65 @@ const SHOTS_PLAN = [
            s.yaw = 0.85; s.pitch = -0.02; s.targetDist = 3.2;
            return true;` },
 
+  /* A wood. Grown on the CPU into world chunks, expanded on the GPU:
+     the trunk's lobed cross-section, branches thinning by Da Vinci's
+     rule, and leaves whose silhouettes are drawn from a two-parameter
+     family so no two are the same shape. */
+  { name: '26-trees',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&trees=1&cat=0&coverRadius=30',
+    settle: 3000, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.10; s.targetDist = 12;
+           return true;` },
+
+  /* Close in under a canopy, where the leaf shapes and the bark are
+     actually resolvable — and with the cat standing in it for scale.
+     The locked camera always orbits the origin, so the only way to frame
+     something else is to put the cat there and follow it. */
+  { name: '27-tree-close',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&trees=1&camera=follow&shadow=1',
+    settle: 3000, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene, c = s.cat;
+           let best = null, bd = 1e9;
+           for (const k of s.trees.canopies) {
+             const d = Math.hypot(k[0], k[2]);
+             if (d < bd) { bd = d; best = k; }
+           }
+           if (best) {
+             c.x = best[0] + 1.6; c.z = best[2] + 1.2;
+             c.yaw = Math.atan2(best[0] - c.x, best[2] - c.z);
+           }
+           s.yaw = 0.8; s.pitch = 0.30; s.targetDist = 4.2;
+           return true;` },
+
+  /* The wood's own shadow, with the sun low enough to throw it a long
+     way across the meadow. This is a real projected shadow — the trees
+     are drawn a second time from the sun into a depth map — so what
+     should be on the ground is the canopy's actual outline, gappy, and
+     not a blob under each trunk. */
+  { name: '28-tree-shadow',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&trees=1&shadow=1&camera=follow&light=0.68,0.34',
+    settle: 3000, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene, c = s.cat;
+           // Stand the cat a few metres downsun of the nearest tree, which
+           // is where its shadow lands.
+           let best = null, bd = 1e9;
+           for (const k of s.trees.canopies) {
+             const d = Math.hypot(k[0], k[2]);
+             if (d < bd) { bd = d; best = k; }
+           }
+           if (best) {
+             const l = s.lightDir;
+             const drop = best[1] / Math.max(l[1], 0.2);
+             c.x = best[0] - l[0] * drop; c.z = best[2] - l[2] * drop;
+             c.yaw = Math.atan2(best[0] - c.x, best[2] - c.z);
+           }
+           s.yaw = 1.3; s.pitch = 0.42; s.targetDist = 7;
+           return true;` },
+
   /* Reach wound out to the end of its travel: grass to the fog, and the
      rim nowhere to be seen. The near cells are the same size they are at
      every other setting — what bought the distance is rings, not bigger
@@ -1905,6 +1964,60 @@ async function interact(cdp, base, problems) {
 
   await cdp.eval(`__aether.panel.setValues({ coverRadius: 15 }, { notify: true }); true`);
   await sleep(200);
+
+  /* ── the wood ──
+     Grown into world chunks, and its shadow drawn from the sun into a
+     depth map. Both are things a screenshot is bad at confirming, so
+     both are asked directly. */
+  await cdp.eval(`__aether.panel.setValues(
+    { trees: true, ground: 'grass', wind: 0, spin: false, cat: false },
+    { notify: true }); true`);
+  await sleep(700);
+  const wood = await cdp.eval(`(() => {
+    const t = __aether.scene.trees;
+    const c = t.mapCoverage();
+    return { trees: t.trees, segs: t.segments, leaves: t.leaves,
+             grown: t.grown, packs: t.packs, renders: t.mapRenders,
+             covered: c.covered, top: c.top, err: c.err, half: c.half };
+  })()`);
+
+  check('a wood grows, in chunks, out of nothing but a hash',
+    wood.trees > 8 && wood.segs > 500 && wood.leaves > 2000 && wood.grown > 8,
+    `${wood.trees} trees from ${wood.grown} chunks — `
+    + `${wood.segs} branch segments, ${wood.leaves} leaves`);
+
+  /* The map has to actually have canopy in it. A shadow term that
+     silently reads an empty texture returns "lit" everywhere and looks
+     exactly like a shadow that is merely subtle. */
+  check('the sun sees the canopy',
+    wood.covered > 0.01 && wood.top > 0,
+    `${(wood.covered * 100).toFixed(1)}% of the map is canopy, `
+    + `highest ${wood.top.toFixed(2)} along the light`
+    + ` (readback ${wood.half ? 'half' : 'float'}, gl error ${wood.err})`);
+
+  const rendersBefore = wood.renders;
+  await sleep(900);
+  const rendersAfter = await cdp.eval(`__aether.scene.trees.mapRenders`);
+  check('a still wood in calm air redraws its shadow map no more',
+    rendersAfter === rendersBefore,
+    `${rendersBefore} renders → ${rendersAfter} over ~0.9 s`);
+
+  const grownBefore = await cdp.eval(`__aether.scene.trees.grown`);
+  await drag([700, 450], [1150, 470]);
+  await sleep(500);
+  const afterWalk = await cdp.eval(`({ grown: __aether.scene.trees.grown,
+    trees: __aether.scene.trees.trees })`);
+  check('turning the view regrows nothing already grown',
+    afterWalk.grown === grownBefore,
+    `${grownBefore} chunks grown, still ${afterWalk.grown} after a full drag`);
+
+  await cdp.eval(`__aether.panel.setValues({ trees: false }, { notify: true }); true`);
+  await sleep(300);
+  const felled = await cdp.eval(`({ tri: __aether.scene.trees.triangles,
+    on: __aether.scene.trees.uniforms().uCanopyOn })`);
+  check('switching the wood off takes its shadow with it',
+    felled.tri === 0 && felled.on === 0,
+    `${felled.tri} triangles, canopy term ${felled.on}`);
 
   /* Grass in wind never comes to rest, so the temporal filter must not
      be allowed to believe the frame has settled. Tested with everything

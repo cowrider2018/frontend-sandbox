@@ -43,7 +43,7 @@ import {
   CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_LAYERS, CLUSTER_SHADOW, SKY,
 } from './cluster.js';
 import { CAT_PROXY_GLSL } from './cat/index.js';
-import { RASTER_NEAR, RASTER_FAR } from './raster.js';
+import { PLANT_COMMON, FRAG_PLANT } from './plant.js';
 
 /* ── the grid ─────────────────────────────────────────────────────
    How far the cover reaches is a control, because the two things people
@@ -137,67 +137,19 @@ const BLADE_H = 0.32;
 /* ── shared shader ────────────────────────────────────────────────── */
 
 /**
- * Everything both the blades and the flowers need.
+ * What the blades and the flowers need on top of what every plant needs.
  *
- * Requires PI, rot2, snoise, hash33, the cluster field and SKY — the
- * same set the cat's fragment shader pulls in, and for the same reason:
- * whatever grows here is lit by the scene's sun, through the scene's
- * own shadow function, or it will not look like it is standing in the
- * same place as everything else.
+ * The lighting, the fog, the projection, the wind and the depth
+ * convention all live in plant.js, because the trees read exactly the
+ * same ones and two copies of "how this scene lights a leaf" is how a
+ * meadow and a wood end up looking like two photographs.
  */
 const GROUND_COMMON = /* glsl */`
-#define NEAR ${RASTER_NEAR.toFixed(4)}
-#define FAR ${RASTER_FAR.toFixed(1)}
+${PLANT_COMMON}
+
 #define PETALS ${PETALS}
 #define BLADE_W ${BLADE_W.toFixed(4)}
 #define BLADE_H ${BLADE_H.toFixed(4)}
-
-uniform vec3  uCamPos, uRight, uUp, uFwd;
-uniform float uFocal, uAspect;
-uniform vec2  uJitter;
-
-/** Where the cover is centred. Each ring snaps this to its own cell
-    size for itself, which is what keeps the hashes still. */
-uniform vec2  uViewer;
-/** Where the cover fades out. The flowers are handed a shorter one. */
-uniform float uRadius;
-uniform float uWind;
-uniform float uFog;
-
-out vec3 vColor;
-out vec3 vRound;
-out float vDist;
-
-/** The cat's projection, term for term: the two share a depth buffer. */
-vec4 rasterise(vec3 world) {
-  vec3 rel = world - uCamPos;
-  vec3 view = vec3(dot(rel, uRight), dot(rel, uUp), dot(rel, uFwd));
-  float z = view.z * (FAR + NEAR) / (FAR - NEAR) - 2.0 * FAR * NEAR / (FAR - NEAR);
-  return vec4(view.x * uFocal / uAspect + uJitter.x * view.z,
-              view.y * uFocal + uJitter.y * view.z,
-              z, view.z);
-}
-
-/* Which way the weather is going. Fixed, because a wind that wanders is
-   a wind nobody can read: what makes a gust legible is seeing it arrive
-   from the same side every time. */
-const vec2 WIND_DIR = vec2(0.8829, 0.4696);
-
-/**
- * The wind, as a scalar field over the ground.
- *
- * Two waves travelling along the same heading at different rates: a
- * slow, long one that is the gust crossing the meadow, and a short fast
- * one that is the chop inside it. Sampled at the plant's *base*, so a
- * whole clump leans together and the far side of the field is still
- * standing up when the near side has already been flattened.
- */
-float gust(vec2 p) {
-  float d = dot(p, WIND_DIR);
-  float slow = sin(d * 0.32 - uTime * 1.10);
-  float chop = sin(d * 1.55 - uTime * 2.85 + 1.7);
-  return 0.5 + 0.5 * (slow * 0.66 + chop * 0.34);
-}
 
 /**
  * A point on a bending stalk, and the direction the stalk is heading
@@ -218,74 +170,6 @@ vec3 stalk(vec3 base, float len, float f, vec2 dir, float bend, out vec3 tangent
   float g = 2.0 * a;
   tangent = normalize(vec3(dir.x * (s + c * g), c - s * g, dir.y * (s + c * g)));
   return base + vec3(dir.x * s, c, dir.y * s) * (len * f);
-}
-
-/**
- * How much of the sun reaches a point, through the cluster and the cat.
- *
- * Cheap almost everywhere despite the march: the ray leaves the
- * cluster's bounding sphere immediately unless it is actually headed
- * into it, so the overwhelming majority of blades pay three dot products
- * and stop. Only the ones standing in the shadow do the walk.
- */
-float sunlight(vec3 p, float soft) {
-  if (soft <= 0.0) return 1.0;
-  float k = mix(6.0, 26.0, soft);
-  return min(clusterShadow(p, uLightDir, k), catShadow(p, uLightDir, k));
-}
-
-/* Light through a leaf. Grass is one cell thick and glows when the sun
-   is behind it, and that backlight is most of what separates a meadow
-   from a carpet of green spikes. */
-const float TRANSMIT = 0.85;
-
-/**
- * How far a blade's normal is turned back toward straight up.
- *
- * Not a cheat for its own sake. A blade standing vertically has a
- * horizontal normal, so with the sun anywhere overhead half the meadow
- * faces away from it and goes black — which is exactly what the first
- * version looked like, a field of charred spikes. The eye does not read
- * a lawn as a million vertical planes; it reads it as a *surface* with
- * texture on it, and that surface faces up. Biasing toward the ground
- * normal is what puts the sward back and leaves the blade shape as
- * variation across it rather than as the whole signal.
- */
-const float SWARD_BIAS = 1.15;
-
-/**
- * Finish a plant vertex: fog it, and publish its depth.
- *
- * Fogged here rather than per fragment, which is not the usual place for
- * it. The grass covers the bottom half of the screen several blades
- * deep, so a horizon term with a 220th power in it was being evaluated a
- * dozen times per pixel to shade something a few pixels tall. Across a
- * blade the answer does not measurably change.
- */
-void emit(vec3 world, vec3 col) {
-  vec3 toEye = uCamPos - world;
-  float dist = length(toEye);
-  vColor = mix(col, sky(-toEye / dist), 1.0 - exp(-dist * uFog * 0.045));
-  vDist = dist;
-  gl_Position = rasterise(world);
-}
-
-/**
- * The scene's shading, minus the specular lobe.
- *
- * Occlusion multiplies the direct term as well as the ambient one,
- * which is not what a single blade in free air would do. It is what a
- * blade in a *sward* does: the bottom third of it is buried in the
- * neighbours, and lighting each stalk as though it stood alone is what
- * makes cheap grass read as a field of green needles.
- */
-vec3 shadeBlade(vec3 n, vec3 albedo, float sun, float occ, float transmit) {
-  vec3 l = uLightDir;
-  float ndl = max(dot(n, l), 0.0);
-  float back = max(-dot(n, l), 0.0);
-  back = back * back * transmit;
-  return albedo * (uTint * 2.4 * (ndl + back) * sun * occ
-                 + vec3(0.16, 0.19, 0.24) * occ);
 }
 `;
 
@@ -589,30 +473,6 @@ void main() {
 }
 `;
 
-/* ── one fragment shader for both ─────────────────────────────────── */
-
-const FRAG_COVER = /* glsl */`
-${PRECISION}
-
-in vec3 vColor;
-in vec3 vRound;
-in float vDist;
-out vec4 outColor;
-
-/* Deliberately almost empty. The meadow is drawn several blades deep
-   over the bottom half of the screen, so anything in here is paid for
-   many times per pixel to shade something a few pixels tall — the
-   lighting and the fog are both settled per vertex instead. */
-void main() {
-  // Square geometry, round flower. One varying and one compare beats
-  // spending a triangle fan on something four pixels across.
-  if (vRound.z > 0.5 && dot(vRound.xy, vRound.xy) > 1.0) discard;
-
-  // Alpha is the scene's depth channel, in world units from the eye.
-  outColor = vec4(vColor, vDist);
-}
-`;
-
 /* ── the object ───────────────────────────────────────────────────── */
 
 /** Floor styles, in the order the picker offers them. */
@@ -661,8 +521,8 @@ const PETAL_COLOURS = [
 export class GroundCover {
   constructor(gl) {
     this.gl = gl;
-    this.grass = new Program(gl, VERT_GRASS, FRAG_COVER, { name: 'ground/grass' });
-    this.flower = new Program(gl, VERT_FLOWER, FRAG_COVER, { name: 'ground/flower' });
+    this.grass = new Program(gl, VERT_GRASS, FRAG_PLANT, { name: 'ground/grass' });
+    this.flower = new Program(gl, VERT_FLOWER, FRAG_PLANT, { name: 'ground/flower' });
 
     /* Nothing is fetched per vertex for the grass, but something has to
        be bound: a leftover attribute array from another draw would be
@@ -870,6 +730,9 @@ export class GroundCover {
       uCatCapB: env.catCapB,
       uCatBound: env.catBound,
       uCatCaps: env.catCaps,
+
+      // And the wood, so a blade standing under a tree is in its shade.
+      ...env.canopy,
     };
 
     gl.enable(gl.DEPTH_TEST);

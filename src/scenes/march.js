@@ -33,6 +33,8 @@ import {
 import { Cat, CAT_PROXY_GLSL, CAT_CAPS, HEAD_YAW_MAX } from './cat/index.js';
 import { Laser } from './laser.js';
 import { GroundCover, isCovered } from './ground.js';
+import { Trees } from './trees.js';
+import { CANOPY_SHADE_GLSL } from './canopy.js';
 
 /* Mouse-look sensitivity. The locked figure is per device pixel and is
    the usual first-person number; the unlocked one is per canvas width,
@@ -214,6 +216,7 @@ float ambientOcclusion(vec3 p, vec3 n) {
 /* ═══ shading ═════════════════════════════════════════════════════ */
 
 ${SKY}
+${CANOPY_SHADE_GLSL}
 
 vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
   if (mat > 1.5) {
@@ -316,6 +319,11 @@ vec3 shadeDirect(vec3 ro, vec3 rd, float t, float mat, bool lit,
   if (lit && uShadowSoft > 0.0 && ndl > 0.0) {
     sh = softShadow(p + n * 0.004, l, mix(6.0, 26.0, uShadowSoft));
   }
+  /* And the wood. A texture fetch rather than another primitive in
+     softShadow, which is inlined twice — once for the primary ray and
+     once for the reflection bounce — and is the function that blew the
+     instruction limit the last time something was added to it. */
+  if (lit) sh = min(sh, canopyShade(p));
   float occ = (lit && uAO > 0.0) ? mix(1.0, ambientOcclusion(p, n), uAO) : 1.0;
 
   // Blinn-Phong with a roughness-derived exponent: not physically based,
@@ -622,6 +630,8 @@ export default {
       ] },
     { id: 'cover', type: 'slider', label: '植被密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
     { id: 'coverRadius', type: 'slider', label: '植被視距', min: 8, max: 120, step: 1, value: 15 },
+    { id: 'trees', type: 'switch', label: '樹木', value: false },
+    { id: 'treeDensity', type: 'slider', label: '樹木密度', min: 0.1, max: 1, step: 0.01, value: 0.6 },
     { id: 'wind', type: 'slider', label: '風', min: 0, max: 1.4, step: 0.01, value: 0.55 },
     { id: 'hintGround', type: 'hint',
       text: '草與花是三角形，不在距離場裡——它們和貓畫進同一張深度緩衝，'
@@ -682,6 +692,7 @@ class MarchScene {
        march as a single layer. The canvas still has no depth buffer. */
     this.meshRT = new Target(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR, depth: true });
     this.ground = new GroundCover(gl);
+    this.trees = new Trees(gl);
 
     /* Loaded off the critical path: the scene renders from the first
        frame and the cat joins when its geometry arrives. A failure here
@@ -701,6 +712,7 @@ class MarchScene {
     /* What the camera orbits, and what it looks at. They are not the
        same point — the locked view circles the origin but aims a little
        above it — and in follow mode both chase the cat. */
+    this._treeJitter = new Float32Array(2);
     this.center = new Float32Array([0, 0, 0]);
     this.target = new Float32Array([0, 0.1, 0]);
     this.camMode = 'orbit';
@@ -1646,7 +1658,8 @@ class MarchScene {
        that something is growing on its floor — which changes what the
        floor is made of and nothing else about the march. */
     const covered = isCovered(state.ground);
-    const raster = showCat || covered;
+    const wooded = Boolean(state.trees);
+    const raster = showCat || covered || wooded;
     /* The weapon belongs to the cat's own view. With the camera locked
        on the cluster you are watching it, not being it, and a click
        there means what it always meant: strike the surface. Read by the
@@ -1722,7 +1735,18 @@ class MarchScene {
 
     /* Grass in wind never holds still, so the accumulation buffer must
        not be allowed to believe it does. */
-    if (covered && state.wind > 0.001) this.moving = 1;
+    if ((covered || wooded) && state.wind > 0.001) this.moving = 1;
+
+    /* The wood is grown and its shadow map drawn before anything is
+       shaded, because everything that follows reads it: the floor here,
+       the grass and the cat in the next pass, and the leaves themselves.
+       It binds its own target, so the march has to bind the scene's
+       again afterwards. */
+    this.trees.prepare(this.basis.pos, this.lightDir, clock.time, {
+      on: wooded,
+      density: state.treeDensity,
+      wind: state.wind,
+    });
 
     BLEND.none(gl);
     this.rt.bind();
@@ -1755,6 +1779,8 @@ class MarchScene {
       uCatCapB: showCat ? this.cat.capB : ZERO_CAPS,
       uCatBound: showCat ? this.cat.capBound : ZERO_BOUND,
       uCatCaps: showCat ? this.cat.capCount : 0,
+
+      ...this.trees.uniforms(),
 
       uRipples: this.ripples,
       uRippleTo: this.rippleTo,
@@ -1836,6 +1862,8 @@ class MarchScene {
         catCapB: showCat ? this.cat.capB : ZERO_CAPS,
         catBound: showCat ? this.cat.capBound : ZERO_BOUND,
         catCaps: showCat ? this.cat.capCount : 0,
+        // The wood's shadow, for everything drawn into this target.
+        canopy: this.trees.uniforms(),
       };
 
       const frame = this.frameCount++;
@@ -1846,6 +1874,17 @@ class MarchScene {
         radius: state.coverRadius,
         wind: state.wind,
         frame,
+      });
+      /* The same subpixel offset the cat and the grass use. Everything in
+         this target is resolved by one temporal filter, so everything in
+         it has to be jittered by the same amount or the filter converges
+         on one and smears the others. */
+      this._treeJitter[0] = Math.sin(frame * 2.39996) / camera.width;
+      this._treeJitter[1] = Math.sin(frame * 4.10000 + 1.7) / camera.height;
+      this.trees.draw(camera, env, {
+        on: wooded,
+        wind: state.wind,
+        jitter: this._treeJitter,
       });
     }
 
@@ -1919,6 +1958,9 @@ class MarchScene {
     const parts = [];
     if (this._showCat) parts.push(`貓：${this.cat.triangles.toLocaleString()} 三角形`);
     if (this.ground.triangles) parts.push(`植被：${this.ground.triangles.toLocaleString()} 三角形`);
+    if (this.trees.triangles) {
+      parts.push(`樹：${this.trees.trees} 棵 / ${this.trees.triangles.toLocaleString()} 三角形`);
+    }
     const geometry = parts.length ? `場：0 頂點 · ${parts.join(' · ')}` : '0 頂點 · 0 三角形';
 
     const out = {
@@ -1958,6 +2000,7 @@ class MarchScene {
     this.rt.dispose();
     this.meshRT.dispose();
     this.ground.dispose();
+    this.trees.dispose();
     this.history.dispose();
     this.cat?.dispose();
   }
