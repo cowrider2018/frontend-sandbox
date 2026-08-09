@@ -123,16 +123,21 @@ const CLUMP_CELL = 4.0;
 /* Flowers stop well short of where the grass does. A blade at the rim
    still counts, because what it contributes there is the *colour* of
    the far field; a flower head at that range is under a pixel and
-   contributes a speck. */
+   contributes a speck.
+
+   The ratio is the unified part — one reach control moves the grass, the
+   flowers and the wood together — and the ceiling is where the ratio
+   stops being worth honouring. Clump cells are a fixed four metres, so
+   flower count grows with the square of the reach, and past this the
+   sowing buffer fills before the circle does. */
 const FLOWER_REACH = 0.62;
-/** And never further than this, however far the grass goes. */
-const FLOWER_MAX = 34.0;
+const FLOWER_MAX = 60.0;
 /** How many clump cells in the patch actually grow one. */
 const CLUMP_CHANCE = 0.62;
 /** Flower slots per clump at full density; the thinning eats about 30%. */
 const MAX_PER_CLUMP = 30;
 /** Ceiling on the placement buffer. Comfortably above the widest reach. */
-const MAX_FLOWERS = 6144;
+const MAX_FLOWERS = 12288;
 /** Floats per flower in that buffer; see the attribute layout below. */
 const FLOWER_STRIDE = 11;
 
@@ -501,11 +506,11 @@ void main() {
 /* ── the object ───────────────────────────────────────────────────── */
 
 /** Floor styles, in the order the picker offers them. */
-export const GROUND_STYLES = ['grid', 'grass', 'meadow'];
+export const GROUND_STYLES = ['grid', 'grass'];
 
 /** True when this style wants soil under it instead of the grid. */
 export function isCovered(style) {
-  return style === 'grass' || style === 'meadow';
+  return style === 'grass';
 }
 
 /* ── sowing ───────────────────────────────────────────────────────
@@ -525,6 +530,23 @@ export function isCovered(style) {
    no way to say it. */
 
 /** One deterministic value in [0,1) from a cell and a salt. */
+/** Cell offsets out to a span, ordered by distance. Cached: the span
+    changes only when the reach does. */
+const ORDERS = new Map();
+function cellOrder(span) {
+  let o = ORDERS.get(span);
+  if (o) return o;
+  const cells = [];
+  for (let dz = -span; dz <= span; dz++) {
+    for (let dx = -span; dx <= span; dx++) cells.push([dx, dz]);
+  }
+  cells.sort((a, b) => (a[0] * a[0] + a[1] * a[1]) - (b[0] * b[0] + b[1] * b[1]));
+  o = new Int32Array(cells.length * 2);
+  cells.forEach(([dx, dz], i) => { o[i * 2] = dx; o[i * 2 + 1] = dz; });
+  ORDERS.set(span, o);
+  return o;
+}
+
 function seed(ix, iz, k) {
   let h = Math.imul(ix | 0, 0x27d4eb2d) ^ Math.imul(iz | 0, 0x165667b1)
         ^ Math.imul(k | 0, 0x9e3779b1);
@@ -588,6 +610,9 @@ export class GroundCover {
     this.sowings = 0;
     this.blades = 0;
     this.flowers = 0;
+    /** How far each kind actually reaches. One control sets all three;
+        each keeps its own ratio and its own ceiling. */
+    this.flowerRadius = 0;
     this.triangles = 0;
   }
 
@@ -606,10 +631,15 @@ export class GroundCover {
     const iz0 = Math.round(originZ / clumpCell);
     const limit = (reach + clumpCell) * (reach + clumpCell);
 
+    /* Nearest cell first. The buffer has a ceiling, and if it fills, what
+       should be lost is the far side of the field in every direction —
+       not, as a row-major scan would give, everything past one line. */
+    const order = cellOrder(span);
+
     let n = 0;
-    for (let dz = -span; dz <= span && n < MAX_FLOWERS; dz++) {
-      for (let dx = -span; dx <= span && n < MAX_FLOWERS; dx++) {
-        const ix = ix0 + dx, iz = iz0 + dz;
+    for (let o = 0; o < order.length && n < MAX_FLOWERS; o += 2) {
+      {
+        const ix = ix0 + order[o], iz = iz0 + order[o + 1];
         if (seed(ix, iz, 1) > CLUMP_CHANCE) continue;   // no clump here
 
         const cx = (ix + seed(ix, iz, 2) * 0.72 + 0.14) * clumpCell;
@@ -671,7 +701,7 @@ export class GroundCover {
    *
    * @param {object} camera  pos/right/up/fwd/focal/aspect/width/height
    * @param {object} env     the scene's light and its cluster field
-   * @param {object} opts    style, density, wind, radius, frame
+   * @param {object} opts    style, density, flowers, wind, radius, frame
    */
   draw(camera, env, opts) {
     if (!isCovered(opts.style)) { this.blades = 0; this.flowers = 0; this.triangles = 0; return; }
@@ -806,7 +836,7 @@ export class GroundCover {
       this.triangles += perRing * (verts - 2);
     }
 
-    if (opts.style === 'meadow') {
+    if (opts.flowers) {
       /* Fixed, like ring 0's cell and for the same reason: winding the
          reach out must not thin the flowers underfoot.
 
@@ -816,7 +846,9 @@ export class GroundCover {
          nothing to buy. */
       const clumpCell = CLUMP_CELL;
       const reach = Math.min(radius * FLOWER_REACH, FLOWER_MAX);
-      const perClump = Math.max(4, Math.round(density * MAX_PER_CLUMP));
+      this.flowerRadius = reach;
+      const perClump = Math.max(4, Math.round(
+        Math.max(0, Math.min(1, opts.flowerDensity)) * MAX_PER_CLUMP));
 
       /* Sown when — and only when — the answer would differ. The origin
          moves a whole clump cell at a time, so walking a straight line

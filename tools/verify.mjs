@@ -229,7 +229,7 @@ const SHOTS_PLAN = [
      that shows what the cover actually is: separate blades with their
      own silhouettes, leaning together, and clumps of flowers with
      stragglers scattered out of them. */
-  { name: '23-meadow', hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&cat=0&cover=1',
+  { name: '23-meadow', hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&cat=0&cover=1',
     settle: 2500, freeze: 8.0,
     pre: '__aether.scene.laser.silence(); return true;',
     poke: `const s = __aether.scene;
@@ -241,7 +241,7 @@ const SHOTS_PLAN = [
      rule, and leaves whose silhouettes are drawn from a two-parameter
      family so no two are the same shape. */
   { name: '26-trees',
-    hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&trees=1&cat=0&coverRadius=30',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0&coverRadius=30',
     settle: 3000, freeze: 8.0,
     pre: '__aether.scene.laser.silence(); return true;',
     poke: `const s = __aether.scene;
@@ -253,7 +253,7 @@ const SHOTS_PLAN = [
      The locked camera always orbits the origin, so the only way to frame
      something else is to put the cat there and follow it. */
   { name: '27-tree-close',
-    hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&trees=1&camera=follow&shadow=1',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&camera=follow&shadow=1',
     settle: 3000, freeze: 8.0,
     pre: '__aether.scene.laser.silence(); return true;',
     poke: `const s = __aether.scene, c = s.cat;
@@ -299,7 +299,7 @@ const SHOTS_PLAN = [
      at 66 units, which is what made the world feel small; the master
      opens it and drags the cover's reach along behind it. */
   { name: '29-open-horizon',
-    hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&trees=1&cat=0&visibility=200',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0&visibility=200',
     settle: 3000, freeze: 8.0,
     pre: '__aether.scene.laser.silence(); return true;',
     poke: `const s = __aether.scene;
@@ -323,7 +323,7 @@ const SHOTS_PLAN = [
      not on it — blades in front of its paws, blades behind them, and
      its own shadow lying across the sward. */
   { name: '24-meadow-cat',
-    hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&camera=follow&shadow=1&ao=1&light=0.68,0.667',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&camera=follow&shadow=1&ao=1&light=0.68,0.667',
     settle: 2500, freeze: 8.0,
     pre: '__aether.scene.laser.silence(); return true;',
     poke: `const sc = __aether.scene, c = sc.cat;
@@ -1060,9 +1060,9 @@ const BENCH_CASES = [
      differences are the costs. */
   { name: 'grass',       hash: '#/march?spin=0&taa=0&scale=1&ground=grass' },
   { name: 'grass far',   hash: '#/march?spin=0&taa=0&scale=1&ground=grass&coverRadius=120' },
-  { name: 'meadow',      hash: '#/march?spin=0&taa=0&scale=1&ground=meadow&cover=1' },
+  { name: 'flowers',     hash: '#/march?spin=0&taa=0&scale=1&ground=grass&flowers=1&cover=1' },
   { name: 'wood',        hash: '#/march?spin=0&taa=0&scale=1&ground=grass&trees=1' },
-  { name: 'wood+meadow', hash: '#/march?spin=0&taa=0&scale=1&ground=meadow&cover=1&trees=1' },
+  { name: 'everything',  hash: '#/march?spin=0&taa=0&scale=1&ground=grass&flowers=1&cover=1&trees=1' },
 ];
 
 async function bench(cdp) {
@@ -1888,7 +1888,8 @@ async function interact(cdp, base, problems) {
     onGrid.tri === 0 && onGrid.flowers === 0,
     `${onGrid.tri} triangles, ${onGrid.flowers} flowers`);
 
-  await cdp.eval(`__aether.panel.setValues({ ground: 'grass' }, { notify: true }); true`);
+  await cdp.eval(`__aether.panel.setValues(
+    { ground: 'grass', flowers: false }, { notify: true }); true`);
   await sleep(300);
   const onGrass = await cdp.eval(`({ tri: __aether.scene.ground.triangles,
     blades: __aether.scene.ground.blades, flowers: __aether.scene.ground.flowers })`);
@@ -1896,13 +1897,16 @@ async function interact(cdp, base, problems) {
     onGrass.blades > 1000 && onGrass.tri > 1000 && onGrass.flowers === 0,
     `${onGrass.blades} blades, ${onGrass.tri} triangles, ${onGrass.flowers} flowers`);
 
-  await cdp.eval(`__aether.panel.setValues({ ground: 'meadow' }, { notify: true }); true`);
+  /* Flowers are their own switch now rather than a third floor style,
+     so turning them on must add flowers and change nothing about the
+     grass they are standing in. */
+  await cdp.eval(`__aether.panel.setValues({ flowers: true }, { notify: true }); true`);
   await sleep(300);
   const onMeadow = await cdp.eval(`({ blades: __aether.scene.ground.blades,
     flowers: __aether.scene.ground.flowers })`);
-  check('the meadow keeps the grass and adds flowers to it',
+  check('the flower switch adds flowers and leaves the grass alone',
     onMeadow.blades === onGrass.blades && onMeadow.flowers > 100,
-    `${onMeadow.blades} blades, ${onMeadow.flowers} flower slots`);
+    `${onMeadow.blades} blades either way, ${onMeadow.flowers} flowers`);
 
   /* The patch follows the camera but is snapped to its own lattice, and
      that snap is the entire reason a blade keeps its place: the hash is
@@ -1990,7 +1994,7 @@ async function interact(cdp, base, problems) {
      depth map. Both are things a screenshot is bad at confirming, so
      both are asked directly. */
   await cdp.eval(`__aether.panel.setValues(
-    { trees: true, ground: 'grass', wind: 0, spin: false, cat: false },
+    { trees: true, ground: 'grass', flowers: false, wind: 0, spin: false, cat: false },
     { notify: true }); true`);
   await sleep(700);
   const wood = await cdp.eval(`(() => {
@@ -2057,6 +2061,26 @@ async function interact(cdp, base, problems) {
   check('visibility drives the cover reach with it',
     wide.reach === 162 && Math.abs(wide.radius - 162) < 1,
     `visibility 180 → reach ${wide.reach}u, ${wide.rings} rings`);
+
+  /* One reach, three consumers. Each keeps its own ratio and its own
+     ceiling — flowers stop at 60, because their clump grid is a fixed
+     four metres and their count grows with the square of the reach;
+     trees stop at 90, where branch segments, which have no level of
+     detail, would start to fill their buffer. */
+  await cdp.eval(`__aether.panel.setValues(
+    { flowers: true, trees: true }, { notify: true }); true`);
+  await sleep(700);
+  const reaches = await cdp.eval(`({ grass: __aether.scene.ground.radius,
+    flowers: __aether.scene.ground.flowerRadius, trees: __aether.scene.trees.reach })`);
+  check('one reach carries the grass, the flowers and the wood',
+    Math.abs(reaches.grass - 162) < 1
+    && Math.abs(reaches.flowers - 60) < 0.5
+    && Math.abs(reaches.trees - 90) < 0.5,
+    `grass ${reaches.grass.toFixed(0)}u, flowers ${reaches.flowers.toFixed(0)}u, `
+    + `trees ${reaches.trees.toFixed(0)}u`);
+  await cdp.eval(`__aether.panel.setValues(
+    { flowers: false, trees: false }, { notify: true }); true`);
+  await sleep(200);
 
   await cdp.eval(`__aether.panel.setValues({ coverRadius: 30 }, { notify: true }); true`);
   await sleep(400);

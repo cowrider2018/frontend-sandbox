@@ -63,14 +63,23 @@ const TREE_CHANCE = 0.34;
    also happens to be the most natural-looking thing a wood can do. */
 const CLEAR_R = 6.0;
 
-/** How far trees are grown. Past the fog, so none is ever seen arriving. */
-const REACH = 60.0;
+/* How far trees are grown, as a share of the cover's reach and a
+   ceiling of its own — the same bargain the flowers make, so that one
+   control moves all three together.
+
+   Trees earn a longer reach than flowers because they are the one thing
+   here tall enough to break the horizon: a treeline is what says how far
+   away the far side is. The ceiling is where branch segments, which have
+   no level of detail, start to fill their buffer. */
+const TREE_REACH = 0.75;
+const TREE_REACH_MIN = 16.0;
+const TREE_REACH_MAX = 90.0;
 
 /* Ceilings on the two instance buffers. Sized for the reach above with
    room to spare; growth stops when they are full rather than reallocating
    mid-frame. */
-const MAX_SEGMENTS = 22000;
-const MAX_LEAVES = 64000;
+const MAX_SEGMENTS = 26000;
+const MAX_LEAVES = 72000;
 
 /** Floats per record. See the attribute layouts in the shaders. */
 const SEG_STRIDE = 20;
@@ -750,7 +759,7 @@ export class Trees {
     this.leaves = 0;
     this.triangles = 0;
     this.chunk = CHUNK;
-    this.reach = REACH;
+    this.reach = TREE_REACH_MIN;
     this._density = -1;
     this._viewer = new Float32Array(2);
     /** Canopies of the live trees, for whatever wants to cast their
@@ -979,10 +988,10 @@ export class Trees {
   }
 
   /** Make sure every chunk within reach exists, then pack the live ones. */
-  _ensure(cx, cz, density) {
+  _ensure(cx, cz, density, reach) {
     /* One chunk of margin past the reach, so the far edge of what has
        been grown is always beyond the far edge of what can be seen. */
-    const span = Math.ceil((REACH + CHUNK) / CHUNK);
+    const span = Math.ceil((reach + CHUNK) / CHUNK);
     const ix0 = Math.floor(cx / CHUNK);
     const iz0 = Math.floor(cz / CHUNK);
     /* Keyed on the levels as well as the chunks. The chunk set changes
@@ -991,7 +1000,7 @@ export class Trees {
        quantised to a few metres. A repack is a memcpy — cheap enough to
        do four times as often as growing, and far cheaper than a draw
        call per chunk, which was the alternative. */
-    const key = `${ix0}|${iz0}|${density.toFixed(3)}`
+    const key = `${ix0}|${iz0}|${density.toFixed(3)}|${reach.toFixed(1)}`
       + `|${Math.round(cx / LOD_STEP)}|${Math.round(cz / LOD_STEP)}`;
     if (key === this._key) return;
     this._key = key;
@@ -1000,7 +1009,7 @@ export class Trees {
     if (this._density !== density) { this.cache.clear(); this._density = density; }
 
     const live = [];
-    const limit = (REACH + CHUNK) * (REACH + CHUNK);
+    const limit = (reach + CHUNK) * (reach + CHUNK);
     for (let dz = -span; dz <= span; dz++) {
       for (let dx = -span; dx <= span; dx++) {
         const ix = ix0 + dx, iz = iz0 + dz;
@@ -1094,7 +1103,10 @@ export class Trees {
       this._uniforms.uCanopyOn = 0;
       return;
     }
-    this._ensure(camPos[0], camPos[2], Math.max(0.05, Math.min(1, opts.density)));
+    this.reach = Math.max(TREE_REACH_MIN,
+      Math.min(TREE_REACH_MAX, opts.radius * TREE_REACH));
+    this._ensure(camPos[0], camPos[2],
+      Math.max(0.05, Math.min(1, opts.density)), this.reach);
     if (!this.segments) { this.triangles = 0; this._uniforms.uCanopyOn = 0; return; }
 
     this._renderMap(this.gl, lightDir, camPos, time, opts.wind);
@@ -1118,7 +1130,7 @@ export class Trees {
       uAspect: camera.aspect,
       uJitter: opts.jitter,
       uViewer: this._viewer,
-      uRadius: REACH,
+      uRadius: this.reach,
       uWind: opts.wind,
       uFog: env.fog,
 

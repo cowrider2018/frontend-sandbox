@@ -632,13 +632,14 @@ export default {
     { id: 'ground', type: 'select', label: '地面造型', value: 'grid',
       options: [
         { value: 'grid', label: '網格' },
-        { value: 'grass', label: '純草地' },
-        { value: 'meadow', label: '草地與花' },
+        { value: 'grass', label: '草地' },
       ] },
-    { id: 'cover', type: 'slider', label: '植被密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
+    { id: 'cover', type: 'slider', label: '草的密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
+    { id: 'flowers', type: 'switch', label: '花', value: false },
+    { id: 'flowerDensity', type: 'slider', label: '花的密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
     { id: 'coverRadius', type: 'slider', label: '植被視距', min: 8, max: 200, step: 1, value: 15 },
-    { id: 'trees', type: 'switch', label: '樹木', value: false },
-    { id: 'treeDensity', type: 'slider', label: '樹木密度', min: 0.1, max: 1, step: 0.01, value: 0.6 },
+    { id: 'trees', type: 'switch', label: '樹', value: false },
+    { id: 'treeDensity', type: 'slider', label: '樹的密度', min: 0.1, max: 1, step: 0.01, value: 0.6 },
     { id: 'wind', type: 'slider', label: '風', min: 0, max: 1.4, step: 0.01, value: 0.55 },
     { id: 'hintGround', type: 'hint',
       text: '草與花是三角形，不在距離場裡——它們和貓畫進同一張深度緩衝，'
@@ -647,7 +648,10 @@ export default {
         + '所以格線在滑動、草沒有。風是一個吹過整片地的場，草和花讀的是同一份。'
         + '「視距」拉遠是一望無際的草原，拉近把幀數還回來。它加的是**面積不是尺寸**：'
         + '近處那一圈的格寬永遠不變，遠的距離是往外加一圈比一圈粗的環買來的，'
-        + '所以腳邊的草在任何設定下都長得一樣，成本則隨環數（約是視距的對數）成長。' },
+        + '所以腳邊的草在任何設定下都長得一樣，成本則隨環數（約是視距的對數）成長。'
+        + '**草、花、樹共用這一個視距**，各自帶自己的比例與上限：'
+        + '花是 0.62 倍（封頂 60），樹是 0.75 倍（封頂 90）——'
+        + '樹看得比花遠，因為樹是這裡唯一高到能構成天際線的東西，遠處那道樹線就是「多遠」本身。' },
 
     { group: '貓' },
     { id: 'cat', type: 'switch', label: '顯示貓', value: true },
@@ -1784,6 +1788,7 @@ class MarchScene {
     this.trees.prepare(this.basis.pos, this.lightDir, clock.time, {
       on: wooded,
       density: state.treeDensity,
+      radius: state.coverRadius,
       wind: state.wind,
     });
 
@@ -1910,6 +1915,8 @@ class MarchScene {
       this.ground.draw(camera, env, {
         style: state.ground,
         density: state.cover,
+        flowers: Boolean(state.flowers),
+        flowerDensity: state.flowerDensity,
         radius: state.coverRadius,
         wind: state.wind,
         frame,
