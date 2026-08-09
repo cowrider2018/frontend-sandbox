@@ -295,6 +295,17 @@ const SHOTS_PLAN = [
            s.yaw = 1.3; s.pitch = 0.42; s.targetDist = 7;
            return true;` },
 
+  /* The horizon pushed right out. Fog used to be a constant that closed
+     at 66 units, which is what made the world feel small; the master
+     opens it and drags the cover's reach along behind it. */
+  { name: '29-open-horizon',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=meadow&trees=1&cat=0&visibility=200',
+    settle: 3000, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.09; s.targetDist = 14;
+           return true;` },
+
   /* Reach wound out to the end of its travel: grass to the fog, and the
      rim nowhere to be seen. The near cells are the same size they are at
      every other setting — what bought the distance is rings, not bigger
@@ -1043,6 +1054,15 @@ const BENCH_CASES = [
   { name: 'no-noise',    hash: '#/march?spin=0&taa=0&scale=1&displace=0' },
   { name: 'no-reflect',  hash: '#/march?spin=0&taa=0&scale=1&reflect=0' },
   { name: 'bare',        hash: '#/march?spin=0&taa=0&scale=1&displace=0&reflect=0&shadow=0&ao=0' },
+
+  /* What is growing on the floor, which is now where most of the frame
+     goes. Each of these is the one above it plus one thing, so the
+     differences are the costs. */
+  { name: 'grass',       hash: '#/march?spin=0&taa=0&scale=1&ground=grass' },
+  { name: 'grass far',   hash: '#/march?spin=0&taa=0&scale=1&ground=grass&coverRadius=120' },
+  { name: 'meadow',      hash: '#/march?spin=0&taa=0&scale=1&ground=meadow&cover=1' },
+  { name: 'wood',        hash: '#/march?spin=0&taa=0&scale=1&ground=grass&trees=1' },
+  { name: 'wood+meadow', hash: '#/march?spin=0&taa=0&scale=1&ground=meadow&cover=1&trees=1' },
 ];
 
 async function bench(cdp) {
@@ -1977,6 +1997,7 @@ async function interact(cdp, base, problems) {
     const t = __aether.scene.trees;
     const c = t.mapCoverage();
     return { trees: t.trees, segs: t.segments, leaves: t.leaves,
+             leavesGrown: t.leavesGrown,
              grown: t.grown, packs: t.packs, renders: t.mapRenders,
              covered: c.covered, top: c.top, err: c.err, half: c.half };
   })()`);
@@ -1984,7 +2005,8 @@ async function interact(cdp, base, problems) {
   check('a wood grows, in chunks, out of nothing but a hash',
     wood.trees > 8 && wood.segs > 500 && wood.leaves > 2000 && wood.grown > 8,
     `${wood.trees} trees from ${wood.grown} chunks — `
-    + `${wood.segs} branch segments, ${wood.leaves} leaves`);
+    + `${wood.segs} branch segments, ${wood.leaves} of ${wood.leavesGrown} leaves drawn `
+    + `(${(100 - wood.leaves / wood.leavesGrown * 100).toFixed(0)}% dropped by distance)`);
 
   /* The map has to actually have canopy in it. A shadow term that
      silently reads an empty texture returns "lit" everywhere and looks
@@ -2002,14 +2024,19 @@ async function interact(cdp, base, problems) {
     rendersAfter === rendersBefore,
     `${rendersBefore} renders → ${rendersAfter} over ~0.9 s`);
 
+  /* A chunk is grown on a cache miss and never again, so this counter
+     only climbs for ground that has genuinely come into range. Swinging
+     the camera right round may bring a little in; regrowing what is
+     already there would send it up by dozens. */
   const grownBefore = await cdp.eval(`__aether.scene.trees.grown`);
   await drag([700, 450], [1150, 470]);
   await sleep(500);
   const afterWalk = await cdp.eval(`({ grown: __aether.scene.trees.grown,
-    trees: __aether.scene.trees.trees })`);
-  check('turning the view regrows nothing already grown',
-    afterWalk.grown === grownBefore,
-    `${grownBefore} chunks grown, still ${afterWalk.grown} after a full drag`);
+    cached: __aether.scene.trees.cache.size })`);
+  check('turning the view grows only ground that was not there before',
+    afterWalk.grown - grownBefore <= 8 && afterWalk.grown <= afterWalk.cached,
+    `${grownBefore} chunks grown → ${afterWalk.grown} after a full drag, `
+    + `${afterWalk.cached} held`);
 
   await cdp.eval(`__aether.panel.setValues({ trees: false }, { notify: true }); true`);
   await sleep(300);
@@ -2018,6 +2045,30 @@ async function interact(cdp, base, problems) {
   check('switching the wood off takes its shadow with it',
     felled.tri === 0 && felled.on === 0,
     `${felled.tri} triangles, canopy term ${felled.on}`);
+
+  /* Visibility is a master, in the same sense the quality slider is: it
+     writes into the reach and then goes stale, so the reach stays yours
+     afterwards. Locking the two together would forbid thick fog with a
+     long reach, which is both cheap and worth having. */
+  await cdp.eval(`__aether.panel.setValues({ visibility: 180 }, { notify: true }); true`);
+  await sleep(400);
+  const wide = await cdp.eval(`({ reach: __aether.state.coverRadius,
+    radius: __aether.scene.ground.radius, rings: __aether.scene.ground.rings })`);
+  check('visibility drives the cover reach with it',
+    wide.reach === 162 && Math.abs(wide.radius - 162) < 1,
+    `visibility 180 → reach ${wide.reach}u, ${wide.rings} rings`);
+
+  await cdp.eval(`__aether.panel.setValues({ coverRadius: 30 }, { notify: true }); true`);
+  await sleep(400);
+  const overridden = await cdp.eval(`({ reach: __aether.state.coverRadius,
+    vis: __aether.state.visibility })`);
+  check('and then lets go of it',
+    overridden.reach === 30 && overridden.vis === 180,
+    `reach pulled back to ${overridden.reach}u with visibility still ${overridden.vis}u`);
+
+  await cdp.eval(`__aether.panel.setValues(
+    { visibility: 66, coverRadius: 15 }, { notify: true }); true`);
+  await sleep(300);
 
   /* Grass in wind never comes to rest, so the temporal filter must not
      be allowed to believe the frame has settled. Tested with everything

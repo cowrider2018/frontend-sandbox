@@ -76,6 +76,33 @@ const MAX_LEAVES = 64000;
 const SEG_STRIDE = 20;
 const LEAF_STRIDE = 16;
 
+/* Leaf level of detail.
+
+   A tree fifty metres away was carrying the same four hundred leaves as
+   one at arm's length, and at that range the whole canopy is thirty
+   pixels. What is dropped is the *count*; what compensates is the size
+   of the survivors, so the canopy keeps its coverage and only loses a
+   detail nobody can resolve. Fewer and larger is invisible past twenty
+   metres and it is most of the leaf budget.
+
+   Both halves have to agree, so both read these: the CPU packs a prefix
+   of each chunk's leaves, and the vertex shader scales what is left by
+   the inverse square root of the same fraction — which is exactly what
+   holds the covered area constant. */
+const LEAF_LOD_NEAR = 14.0;
+const LEAF_LOD_SPAN = 42.0;
+const LEAF_LOD_MIN = 0.22;
+/** Ceiling on the compensation. 1/sqrt(0.22) is 2.13; this is kinder. */
+const LEAF_LOD_GROW = 1.9;
+
+/** How far the viewer moves before the levels are recomputed. */
+const LOD_STEP = 4.0;
+
+/** The fraction of a chunk's leaves worth drawing at this range. */
+function leafLod(d) {
+  return Math.min(1, Math.max(LEAF_LOD_MIN, 1 - (d - LEAF_LOD_NEAR) / LEAF_LOD_SPAN));
+}
+
 /** Sides around a branch tube, and the strip that wraps it. */
 const SIDES = 5;
 const SEG_VERTS = 2 * (SIDES + 1);
@@ -166,6 +193,18 @@ function unit(v) {
 function transport(f, d) {
   const k = dot3(f, d);
   return unit([f[0] - d[0] * k, f[1] - d[1] * k, f[2] - d[2] * k]);
+}
+
+/** Fisher-Yates over whole leaf records. */
+function shuffleLeaves(buf, n, rnd) {
+  const tmp = new Float32Array(LEAF_STRIDE);
+  for (let i = n - 1; i > 0; i--) {
+    const j = (rnd() * (i + 1)) | 0;
+    if (i === j) continue;
+    tmp.set(buf.subarray(i * LEAF_STRIDE, (i + 1) * LEAF_STRIDE));
+    buf.copyWithin(i * LEAF_STRIDE, j * LEAF_STRIDE, (j + 1) * LEAF_STRIDE);
+    buf.set(tmp, j * LEAF_STRIDE);
+  }
 }
 
 /* ── growing one tree ─────────────────────────────────────────────── */
@@ -469,6 +508,11 @@ void branchVertex(out vec3 p, out vec3 n, out vec3 anchor) {
 `;
 
 const LEAF_GEOM = /* glsl */`
+#define LEAF_LOD_NEAR ${LEAF_LOD_NEAR.toFixed(2)}
+#define LEAF_LOD_SPAN ${LEAF_LOD_SPAN.toFixed(2)}
+#define LEAF_LOD_MIN ${LEAF_LOD_MIN.toFixed(3)}
+#define LEAF_LOD_GROW ${LEAF_LOD_GROW.toFixed(2)}
+
 layout(location = 0) in vec4 aLeaf;  // xyz = where it joins the twig, w = size
 layout(location = 1) in vec4 aDir;   // xyz = the leaf's own axis, w = roll
 layout(location = 2) in vec4 aFlex;  // x = flex, y = phase, zw = tree base
@@ -505,7 +549,14 @@ void leafVertex(out vec3 p, out vec3 n, out float along) {
   float lat = tip ? 0.0 : (float(gl_VertexID & 1) * 2.0 - 1.0);
   along = row / 4.0;
 
-  float len = aLeaf.w;
+  /* Grown to cover for the ones that were dropped. The CPU packed a
+     fraction of this chunk's leaves by exactly this curve, and covered
+     area goes as count times size squared — so scaling by the inverse
+     square root of the fraction holds the canopy's density constant
+     while the leaf count falls away with distance. */
+  float lod = clamp(1.0 - (distance(uCamPos, aLeaf.xyz) - LEAF_LOD_NEAR) / LEAF_LOD_SPAN,
+                    LEAF_LOD_MIN, 1.0);
+  float len = aLeaf.w * clamp(inversesqrt(lod), 1.0, LEAF_LOD_GROW);
   vec3 F = normalize(aDir.xyz);
 
   // A frame for the blade, rolled about its own axis so leaves on one
@@ -614,6 +665,11 @@ ${TREE_SWAY}
 
 uniform vec3  uCanopyX, uCanopyY, uCanopyC, uLightDir;
 uniform float uCanopyExtent, uCanopyDepth;
+/* The *camera's* position, in the sun's pass. Not a mistake: the leaf
+   levels are chosen by distance from the eye, and the shadow has to be
+   cast by the geometry the eye is actually being shown. A map drawn
+   from full-detail leaves would shade a canopy that is not there. */
+uniform vec3  uCamPos;
 
 out float vAxis;
 
@@ -776,7 +832,8 @@ export class Trees {
    * fraction of a texel each frame and every shadow edge in the scene
    * crawls.
    */
-  _renderMap(gl, light, cx, cz, time, wind) {
+  _renderMap(gl, light, camPos, time, wind) {
+    const cx = camPos[0], cz = camPos[2];
     // A frame perpendicular to the light. The reference axis is swapped
     // near the poles, where the obvious one is parallel to the light and
     // the cross product collapses.
@@ -817,6 +874,7 @@ export class Trees {
       uCanopyExtent: CANOPY_EXTENT,
       uCanopyDepth: CANOPY_EXTENT * 2,
       uLightDir: light,
+      uCamPos: camPos,
       uTime: time,
       uWind: wind,
     };
@@ -902,12 +960,20 @@ export class Trees {
       }
     }
 
+    /* Shuffled, so that taking the first half of a chunk's leaves takes
+       half of every tree in it rather than all of the first two and none
+       of the rest. Deterministic, from the chunk's own cell, so a chunk
+       dropped and regrown comes back identical. */
+    shuffleLeaves(out.leaves, out.leafN, rngFor(ix, iz, 977));
+
     this.grown++;
     return {
       segs: out.segs.subarray(0, out.segN * SEG_STRIDE),
       leaves: out.leaves.subarray(0, out.leafN * LEAF_STRIDE),
       segN: out.segN,
       leafN: out.leafN,
+      cx: (ix + 0.5) * CHUNK,
+      cz: (iz + 0.5) * CHUNK,
       canopies,
     };
   }
@@ -919,7 +985,14 @@ export class Trees {
     const span = Math.ceil((REACH + CHUNK) / CHUNK);
     const ix0 = Math.floor(cx / CHUNK);
     const iz0 = Math.floor(cz / CHUNK);
-    const key = `${ix0}|${iz0}|${density.toFixed(3)}`;
+    /* Keyed on the levels as well as the chunks. The chunk set changes
+       every sixteen metres; how much of each chunk is worth drawing
+       changes rather sooner than that, so the viewer goes into the key
+       quantised to a few metres. A repack is a memcpy — cheap enough to
+       do four times as often as growing, and far cheaper than a draw
+       call per chunk, which was the alternative. */
+    const key = `${ix0}|${iz0}|${density.toFixed(3)}`
+      + `|${Math.round(cx / LOD_STEP)}|${Math.round(cz / LOD_STEP)}`;
     if (key === this._key) return;
     this._key = key;
 
@@ -958,13 +1031,13 @@ export class Trees {
       }
     }
 
-    this._pack(live);
+    this._pack(live, cx, cz);
   }
 
   /** Concatenate the live chunks into the two instance buffers. */
-  _pack(live) {
+  _pack(live, vx, vz) {
     const gl = this.gl;
-    let segN = 0, leafN = 0, trees = 0;
+    let segN = 0, leafN = 0, trees = 0, grown = 0;
     const canopies = [];
 
     for (const c of live) {
@@ -972,9 +1045,15 @@ export class Trees {
         this._segs.set(c.segs, segN * SEG_STRIDE);
         segN += c.segN;
       }
-      if (leafN + c.leafN <= MAX_LEAVES) {
-        this._leaves.set(c.leaves, leafN * LEAF_STRIDE);
-        leafN += c.leafN;
+      /* Only as much of this chunk's leaves as its distance earns. They
+         were shuffled when the chunk was grown, so a prefix is a fair
+         sample across every tree in it. */
+      const d = Math.hypot(c.cx - vx, c.cz - vz);
+      const want = Math.min(c.leafN, Math.ceil(c.leafN * leafLod(d)));
+      grown += c.leafN;
+      if (leafN + want <= MAX_LEAVES) {
+        this._leaves.set(c.leaves.subarray(0, want * LEAF_STRIDE), leafN * LEAF_STRIDE);
+        leafN += want;
       }
       trees += c.canopies.length;
       for (const k of c.canopies) canopies.push(k);
@@ -988,6 +1067,9 @@ export class Trees {
 
     this.segments = segN;
     this.leaves = leafN;
+    /** What the wood would have cost without the levels. Reported so the
+        saving is visible rather than merely believed. */
+    this.leavesGrown = grown;
     this.trees = trees;
     this.canopies = canopies;
     this.packs++;
@@ -1015,7 +1097,7 @@ export class Trees {
     this._ensure(camPos[0], camPos[2], Math.max(0.05, Math.min(1, opts.density)));
     if (!this.segments) { this.triangles = 0; this._uniforms.uCanopyOn = 0; return; }
 
-    this._renderMap(this.gl, lightDir, camPos[0], camPos[2], time, opts.wind);
+    this._renderMap(this.gl, lightDir, camPos, time, opts.wind);
     this._uniforms.uCanopy = this.map.texture;
     this._uniforms.uCanopyOn = 1;
   }

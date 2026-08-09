@@ -73,12 +73,23 @@ const MAX_RINGS = 5;
 
 /** Reach, in world units, at each end of the control. */
 export const RADIUS_MIN = 8.0;
-export const RADIUS_MAX = 120.0;
+export const RADIUS_MAX = 200.0;
 
 /** Blades per cell at full density. One instance each. */
 const MAX_LAYERS = 6;
 /** Vertices in a blade: three quads narrowing to a single tip vertex. */
 const BLADE_VERTS = 7;
+/** And out past the first rings, one triangle. */
+const BLADE_VERTS_FAR = 3;
+
+/* How many rings still ask what the sun can see.
+
+   Ring 2 begins twenty-odd metres out, where the fog has already taken
+   most of a blade's colour and where its shadow is a fraction of a
+   pixel. Every blade out there was paying a bounding-sphere test against
+   the cluster and five texture fetches against the canopy, several
+   hundred thousand times a frame, for something nobody can resolve. */
+const SHADOW_RINGS = 2;
 
 /**
  * How many rings a reach needs, and how much coarser each is than the
@@ -194,6 +205,11 @@ uniform float uShadowSoft;
    that is the whole point of the scheme. */
 uniform int   uGrid, uLayers, uRings;
 uniform float uCell, uRingStep;
+/* Which ring this draw is, and how many vertices it is spending on a
+   blade. Both were derived per instance when every ring went out in one
+   call; they are per-draw now, which is what lets the far rings be
+   cheaper rather than merely smaller. */
+uniform int   uRing, uBladeVerts;
 
 /* Root, tip, and the colour of a blade that has given up. Authored
    linear, like everything downstream of here. */
@@ -210,11 +226,9 @@ void main() {
   vDist = 0.0;
 
   int cells = uGrid * uGrid;
-  int perRing = cells * uLayers;
-  int ring = gl_InstanceID / perRing;
-  int rest = gl_InstanceID - ring * perRing;
-  int cell = rest % cells;
-  int layer = rest / cells;
+  int ring = uRing;
+  int cell = gl_InstanceID % cells;
+  int layer = gl_InstanceID / cells;
 
   vec2 ci = vec2(float(cell % uGrid), float(cell / uGrid)) - float(uGrid) * 0.5;
 
@@ -266,12 +280,23 @@ void main() {
 
   float height = BLADE_H * mix(0.55, 1.20, h1.z) * rim;
 
-  // Three quads and a point: rows 0..2 have a left and a right vertex,
-  // the seventh vertex is the tip and sits on the centreline.
+  /* Near, a blade is three quads and a point: rows 0..2 carry a left and
+     a right vertex and the seventh sits on the centreline at the tip.
+
+     Far, it is one triangle — two roots and a tip. That loses the bend
+     along its length, which is the whole of what a blade's silhouette
+     is, and past twenty metres a blade is two pixels tall and has no
+     silhouette to lose. */
   int vid = gl_VertexID;
-  bool tip = vid >= 6;
-  float row = tip ? 3.0 : float(vid / 2);
-  float side = tip ? 0.0 : (float(vid & 1) * 2.0 - 1.0);
+  float row, side;
+  if (uBladeVerts <= 3) {
+    row  = vid == 2 ? 3.0 : 0.0;
+    side = vid == 2 ? 0.0 : float(vid) * 2.0 - 1.0;
+  } else {
+    bool tip = vid >= 6;
+    row  = tip ? 3.0 : float(vid / 2);
+    side = tip ? 0.0 : float(vid & 1) * 2.0 - 1.0;
+  }
   float f = row / 3.0;
 
   // Which way the blade leans of its own accord, and how far.
@@ -555,6 +580,8 @@ export class GroundCover {
     this._jitter = new Float32Array(2);
     /** Where the sown buffer was centred, and what it was sown for. */
     this._sowKey = null;
+    /** Reused, so a per-ring draw allocates nothing. */
+    this._ring = { uRing: 0, uBladeVerts: BLADE_VERTS, uShadowSoft: 0, uCanopyOn: 0 };
     /** How many times the flowers have been re-sown. Watched by the tests:
         a number that climbs while the camera stands still is the bug this
         replaced. */
@@ -743,14 +770,41 @@ export class GroundCover {
     gl.disable(gl.CULL_FACE);
 
     gl.bindVertexArray(this.grassVao);
-    /* Every ring gets a full square of instances; the ones over the hole
-       park themselves in four instructions. Trimming them out would mean
-       a per-ring index offset for a saving on the cheapest invocations
-       in the pass. */
-    this.blades = GRID * GRID * layers * rings;
+
+    /* A draw per ring rather than one for all of them. Rings differ in
+       what they can afford to be — how many vertices a blade is worth
+       out there, and whether it is worth asking about shadow at all —
+       and none of that can vary inside a single draw. Five calls buys
+       the whole of it.
+
+       Every ring still gets a full square of instances; the ones over
+       the hole park themselves in four instructions. */
+    const perRing = GRID * GRID * layers;
+    this.blades = perRing * rings;
+    this.triangles = 0;
+
+    /* Everything that does not vary between rings goes up once. Handing
+       the whole set to each draw is the obvious way to write this loop
+       and it measured *slower* than the single draw it replaced: the
+       common block carries the cluster's spheres, four impacts, eight cat
+       capsules and the camera, and re-uploading all of it five times a
+       frame cost more than the vertices the rings were saving. */
     this.grass.use(common);
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, BLADE_VERTS, this.blades);
-    this.triangles = this.blades * (BLADE_VERTS - 2);
+    const canopyOn = common.uCanopyOn || 0;
+    for (let r = 0; r < rings; r++) {
+      const verts = r === 0 ? BLADE_VERTS : BLADE_VERTS_FAR;
+      const lit = r < SHADOW_RINGS;
+      this._ring.uRing = r;
+      this._ring.uBladeVerts = verts;
+      // Both shadow terms read a zero as "ask nothing" and return in one
+      // compare, so switching them off needs no branch in the shader and
+      // no second program.
+      this._ring.uShadowSoft = lit ? env.shadowSoft : 0;
+      this._ring.uCanopyOn = lit ? canopyOn : 0;
+      this.grass.use(this._ring);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, verts, perRing);
+      this.triangles += perRing * (verts - 2);
+    }
 
     if (opts.style === 'meadow') {
       /* Fixed, like ring 0's cell and for the same reason: winding the
@@ -777,8 +831,10 @@ export class GroundCover {
 
       if (this.flowers) {
         gl.bindVertexArray(this.flowerVao);
-        // Its own, shorter reach — see FLOWER_REACH.
-        this.flower.use({ ...common, uRadius: reach });
+        /* Its own, shorter reach — see FLOWER_REACH — and its own shadow
+         terms, because the loop above left the last ring's stripped ones
+           bound, and every flower is well inside where shadow still shows. */
+        this.flower.use({ ...common, uRadius: reach, uShadowSoft: env.shadowSoft });
         gl.drawArraysInstanced(gl.TRIANGLES, 0, FLOWER_VERTS, this.flowers);
         this.triangles += this.flowers * (FLOWER_VERTS / 3);
       }

@@ -622,6 +622,13 @@ export default {
     { id: 'reflectLit', type: 'switch', label: '反射含陰影遮蔽', value: true },
 
     { group: '地面' },
+    { id: 'visibility', type: 'slider', label: '能見度', min: 40, max: 220, step: 1, value: 66, unit: 'u' },
+    { id: 'hintVis', type: 'hint',
+      text: '**能見度**是主控：它同時定霧的濃度**並寫入**下面的「植被視距」，'
+        + '之後那支滑桿仍然是你的（跟「總體品質」與它下面七項的關係一樣）。'
+        + '兩者刻意不鎖死——同一個霧濃度需要的視距會隨鏡頭高度與俯角改變，'
+        + '而且霧是氛圍、視距是預算，鎖在一起就禁掉了「濃霧＋遠視距」這個又便宜又好看的組合。'
+        + '真正的約束只是單向的：**視距要 ≥ 霧關閉的距離**，否則會看見世界的邊緣。' },
     { id: 'ground', type: 'select', label: '地面造型', value: 'grid',
       options: [
         { value: 'grid', label: '網格' },
@@ -629,7 +636,7 @@ export default {
         { value: 'meadow', label: '草地與花' },
       ] },
     { id: 'cover', type: 'slider', label: '植被密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
-    { id: 'coverRadius', type: 'slider', label: '植被視距', min: 8, max: 120, step: 1, value: 15 },
+    { id: 'coverRadius', type: 'slider', label: '植被視距', min: 8, max: 200, step: 1, value: 15 },
     { id: 'trees', type: 'switch', label: '樹木', value: false },
     { id: 'treeDensity', type: 'slider', label: '樹木密度', min: 0.1, max: 1, step: 0.01, value: 0.6 },
     { id: 'wind', type: 'slider', label: '風', min: 0, max: 1.4, step: 0.01, value: 0.55 },
@@ -770,8 +777,9 @@ class MarchScene {
     this._eyeA = new Float32Array(3);
     this._eyeB = new Float32Array(3);
 
-    /** The master is an action; this remembers where it last fired. */
+    /** The masters are actions; these remember where each last fired. */
     this._lastQuality = null;
+    this._lastVis = null;
 
     /* ── click vs drag ── */
     this._pressed = false;
@@ -949,9 +957,10 @@ class MarchScene {
     this._pendingShot = false;
     this._aimShot = null;
     this._fireCooldown = 0;
-    // The app has just put every slider back, including the master, so
-    // forget where it last fired or it will stamp over them next frame.
+    // The app has just put every slider back, including the masters, so
+    // forget where they last fired or they will stamp over them next frame.
     this._lastQuality = null;
+    this._lastVis = null;
   }
 
   /* ── camera ───────────────────────────────────────────────────── */
@@ -1631,6 +1640,30 @@ class MarchScene {
    * and by then the derived values are already in the panel's state, so
    * they land in the URL with it.
    */
+  /**
+   * The visibility master.
+   *
+   * Fog was a constant, and the constant put the horizon at 66 units,
+   * which is what made the world feel small. It is a control now, and it
+   * carries the cover's reach along with it — the two are not the same
+   * quantity, but they have a one-way constraint: reach shorter than the
+   * fog's own distance means you can see the edge of the grass.
+   *
+   * Written into the reach slider rather than read from here, exactly as
+   * the quality master writes into its seven. The reach stays yours
+   * afterwards, and this simply goes stale, which is the point: a
+   * deliberately hazy scene with a long reach is a legitimate thing to
+   * want and a locked pair would forbid it.
+   */
+  _applyVisibility(state) {
+    if (this._lastVis === null) { this._lastVis = state.visibility; return; }
+    if (state.visibility === this._lastVis) return;
+    this._lastVis = state.visibility;
+    this.ctx.setParams({
+      coverRadius: Math.round(clamp(state.visibility * 0.9, 8, 200)),
+    });
+  }
+
   _applyQuality(state) {
     if (this._lastQuality === null) { this._lastQuality = state.quality; return; }
     if (state.quality === this._lastQuality) return;
@@ -1643,7 +1676,13 @@ class MarchScene {
   frame({ state, clock, pointer }) {
     const { gl, tri, empty } = this.ctx;
     this._applyQuality(state);
+    this._applyVisibility(state);
     this._applyScale(Number(state.scale));
+
+    /* Fog thick enough that the requested distance is where it closes.
+       The term is 1 - exp(-t·uFog·0.045); putting 95% of it at t = V
+       means uFog·0.045·V = 3. */
+    const fog = 3 / (0.045 * Math.max(state.visibility, 1));
 
     const dt = Math.min(clock.dt, 1 / 30);
 
@@ -1766,7 +1805,7 @@ class MarchScene {
       uLightDir: this.lightDir,
       uTint: tint,
       uReflect: state.reflect,
-      uFog: 1.0,
+      uFog: fog,
       uAO: state.ao,
       uShadowSoft: state.shadow,
 
@@ -1834,7 +1873,7 @@ class MarchScene {
       const env = {
         dir: this.lightDir,
         tint,
-        fog: 1.0,
+        fog,
         shadowSoft: state.shadow,
         // The same budget the marcher spends. A shadow that converges
         // differently is a differently shaped shadow.
