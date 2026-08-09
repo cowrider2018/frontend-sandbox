@@ -1908,6 +1908,25 @@ async function interact(cdp, base, problems) {
     onMeadow.blades === onGrass.blades && onMeadow.flowers > 100,
     `${onMeadow.blades} blades either way, ${onMeadow.flowers} flowers`);
 
+  /* Two flower controls, two different pictures. Halving how many clumps
+     there are and halving how full each one is both take flowers away,
+     but they are not the same field, and a single slider could never say
+     which of the two it was doing. */
+  const flowerAt = async (clumps, density) => {
+    await cdp.eval(`__aether.panel.setValues(
+      { flowerClumps: ${clumps}, flowerDensity: ${density} }, { notify: true }); true`);
+    await sleep(350);
+    return cdp.eval(`__aether.scene.ground.flowers`);
+  };
+  const bothFull = await flowerAt(1.0, 1.0);
+  const fewClumps = await flowerAt(0.3, 1.0);
+  const thinClumps = await flowerAt(1.0, 0.2);
+  check('the two flower controls pull on different things',
+    fewClumps < bothFull * 0.55 && thinClumps < bothFull * 0.55
+    && Math.abs(fewClumps - thinClumps) > bothFull * 0.05,
+    `all ${bothFull} · few clumps ${fewClumps} · thin clumps ${thinClumps}`);
+  await flowerAt(0.62, 0.7);
+
   /* The patch follows the camera but is snapped to its own lattice, and
      that snap is the entire reason a blade keeps its place: the hash is
      taken from the world coordinate of its cell, so an origin that

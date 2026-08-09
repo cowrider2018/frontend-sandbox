@@ -132,7 +132,12 @@ const CLUMP_CELL = 4.0;
    sowing buffer fills before the circle does. */
 const FLOWER_REACH = 0.62;
 const FLOWER_MAX = 60.0;
-/** How many clump cells in the patch actually grow one. */
+/* How many clump cells grow one, and how many flowers a clump gets.
+   Two controls rather than one, because they are two different pictures:
+   a few dense clusters in bare grass, or flowers scattered thinly right
+   across the field. One slider can reach either but never says which of
+   the two it is doing, and the halfway settings of the pair are the ones
+   worth having. */
 const CLUMP_CHANCE = 0.62;
 /** Flower slots per clump at full density; the thinning eats about 30%. */
 const MAX_PER_CLUMP = 30;
@@ -621,7 +626,7 @@ export class GroundCover {
    * origin, and upload it. Called only when that origin, the clump size
    * or the density changes.
    */
-  _sow(originX, originZ, clumpCell, perClump, reach) {
+  _sow(originX, originZ, clumpCell, perClump, reach, chance) {
     const buf = this._sown;
     /* One cell of margin past the reach: the fade is measured from where
        the eye is now, which can be half a cell beyond the origin this was
@@ -640,7 +645,7 @@ export class GroundCover {
     for (let o = 0; o < order.length && n < MAX_FLOWERS; o += 2) {
       {
         const ix = ix0 + order[o], iz = iz0 + order[o + 1];
-        if (seed(ix, iz, 1) > CLUMP_CHANCE) continue;   // no clump here
+        if (seed(ix, iz, 1) > chance) continue;         // no clump here
 
         const cx = (ix + seed(ix, iz, 2) * 0.72 + 0.14) * clumpCell;
         const cz = (iz + seed(ix, iz, 3) * 0.72 + 0.14) * clumpCell;
@@ -702,6 +707,7 @@ export class GroundCover {
    * @param {object} camera  pos/right/up/fwd/focal/aspect/width/height
    * @param {object} env     the scene's light and its cluster field
    * @param {object} opts    style, density, flowers, wind, radius, frame
+   *                          — see draw() in march.js for the full set
    */
   draw(camera, env, opts) {
     if (!isCovered(opts.style)) { this.blades = 0; this.flowers = 0; this.triangles = 0; return; }
@@ -847,17 +853,19 @@ export class GroundCover {
       const clumpCell = CLUMP_CELL;
       const reach = Math.min(radius * FLOWER_REACH, FLOWER_MAX);
       this.flowerRadius = reach;
-      const perClump = Math.max(4, Math.round(
+      const perClump = Math.max(3, Math.round(
         Math.max(0, Math.min(1, opts.flowerDensity)) * MAX_PER_CLUMP));
+      const chance = Math.max(0, Math.min(1, opts.flowerClumps));
 
       /* Sown when — and only when — the answer would differ. The origin
          moves a whole clump cell at a time, so walking a straight line
          re-sows every few metres and standing still never does. */
       const ox = Math.round(this._patch[0] / clumpCell) * clumpCell;
       const oz = Math.round(this._patch[1] / clumpCell) * clumpCell;
-      const key = `${ox}|${oz}|${clumpCell.toFixed(4)}|${perClump}|${reach.toFixed(3)}`;
+      const key = `${ox}|${oz}|${clumpCell.toFixed(4)}|${perClump}`
+        + `|${chance.toFixed(3)}|${reach.toFixed(3)}`;
       if (key !== this._sowKey) {
-        this.flowers = this._sow(ox, oz, clumpCell, perClump, reach);
+        this.flowers = this._sow(ox, oz, clumpCell, perClump, reach, chance);
         this._sowKey = key;
       }
 
