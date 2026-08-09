@@ -50,31 +50,56 @@ import { RASTER_NEAR, RASTER_FAR } from './raster.js';
    want from it pull opposite ways: an unbroken plain out to the fog, or
    the frame rate back.
 
-   The cell size is not held constant across that range. Fixed cells make
-   the instance count grow with the square of the reach, and doubling the
-   view distance for four times the cost is not a trade anyone would take
-   twice. Growing the cell as the square root of the reach makes the cost
-   grow *linearly* instead, and it thins the far field rather than the
-   near one — which is the right place to lose blades, since that is
-   where they are smallest on screen. */
-const RADIUS_REF = 16.0;
-const CELL_REF = 0.5;
+   It is a control over *how much ground is covered*, and emphatically
+   not over how big the plants are. One grid whose cells grow with the
+   reach was the obvious way to keep the cost down and it is the wrong
+   thing entirely: scaling the cells scales the whole pattern, so
+   winding the reach out thins the grass at your feet. What you asked
+   for was more field, and what you got was the same field enlarged.
+
+   So the near cells never change size. Reach is bought by adding
+   *rings* around them: concentric square bands, each one coarser than
+   the one inside it, each with a hole cut out where the finer ring has
+   already covered the ground. Ring 0 is the same lawn at every setting.
+   The cost then grows with the number of rings — roughly the log of the
+   reach — rather than with its square, and what thins out is the far
+   field, which is where blades are smallest on screen anyway. */
+const CELL = 0.5;
+/** Cells across one ring. Ring 0 therefore covers GRID*CELL square. */
+const GRID = 64;
+/** Half-extent of the innermost ring: the reach one ring alone can give. */
+const HALF0 = GRID * CELL * 0.5;
+const MAX_RINGS = 5;
 
 /** Reach, in world units, at each end of the control. */
-export const RADIUS_MIN = 7.0;
-export const RADIUS_MAX = 44.0;
+export const RADIUS_MIN = 8.0;
+export const RADIUS_MAX = 120.0;
 
 /** Blades per cell at full density. One instance each. */
 const MAX_LAYERS = 6;
 /** Vertices in a blade: three quads narrowing to a single tip vertex. */
 const BLADE_VERTS = 7;
 
-/** Cell size, and how many cells across, for a given reach. */
-function grassGrid(radius) {
-  const cell = CELL_REF * Math.sqrt(radius / RADIUS_REF);
-  // Even, so the grid is symmetric about its centre.
-  const grid = Math.max(8, Math.round((radius * 2) / cell / 2) * 2);
-  return { cell, grid };
+/**
+ * How many rings a reach needs, and how much coarser each is than the
+ * one inside it.
+ *
+ * The step is solved rather than fixed at two, so the outermost ring
+ * lands on the requested reach instead of overshooting to the next
+ * power of two — which keeps the control continuous. The square is
+ * sized a little past the fade circle so the corners cannot come up
+ * short of it once the origin is snapped.
+ */
+function coverPlan(reach) {
+  const r = Math.max(RADIUS_MIN, Math.min(RADIUS_MAX, reach));
+  // One ring can serve any reach that fits inside it, and that is the
+  // cheapest the cover ever gets.
+  if (r <= HALF0 - CELL) return { rings: 1, step: 1, radius: r };
+
+  const want = r * 1.10;
+  const rings = Math.min(MAX_RINGS, Math.max(2, Math.ceil(Math.log2(want / HALF0)) + 1));
+  const step = Math.pow(want / HALF0, 1 / (rings - 1));
+  return { rings, step, radius: r };
 }
 
 /* ── flowers ──────────────────────────────────────────────────────
@@ -82,13 +107,15 @@ function grassGrid(radius) {
    one or it does not, and the flowers inside it thin out toward its rim,
    so what comes out is a dense middle with singles scattered round it
    rather than a disc with an edge. */
-const CLUMP_CELL_REF = 4.0;
+const CLUMP_CELL = 4.0;
 
 /* Flowers stop well short of where the grass does. A blade at the rim
    still counts, because what it contributes there is the *colour* of
    the far field; a flower head at that range is under a pixel and
    contributes a speck. */
 const FLOWER_REACH = 0.62;
+/** And never further than this, however far the grass goes. */
+const FLOWER_MAX = 34.0;
 /** How many clump cells in the patch actually grow one. */
 const CLUMP_CHANCE = 0.62;
 /** Flower slots per clump at full density; the thinning eats about 30%. */
@@ -129,9 +156,8 @@ uniform vec3  uCamPos, uRight, uUp, uFwd;
 uniform float uFocal, uAspect;
 uniform vec2  uJitter;
 
-/** Grid centre, snapped to the cell size so the hashes stay put. */
-uniform vec2  uPatch;
-/** Where the fade is measured from — the unsnapped centre. */
+/** Where the cover is centred. Each ring snaps this to its own cell
+    size for itself, which is what keeps the hashes still. */
 uniform vec2  uViewer;
 /** Where the cover fades out. The flowers are handed a shorter one. */
 uniform float uRadius;
@@ -280,10 +306,10 @@ ${SKY}
 ${GROUND_COMMON}
 
 uniform float uShadowSoft;
-/* The grid, as numbers rather than as defines: how far the cover
-   reaches is a control now, and both of these are derived from it. */
-uniform int   uGrid;
-uniform float uCell;
+/* The rings. uCell is ring 0's cell and never changes with the reach —
+   that is the whole point of the scheme. */
+uniform int   uGrid, uLayers, uRings;
+uniform float uCell, uRingStep;
 
 /* Root, tip, and the colour of a blade that has given up. Authored
    linear, like everything downstream of here. */
@@ -300,11 +326,34 @@ void main() {
   vDist = 0.0;
 
   int cells = uGrid * uGrid;
-  int cell = gl_InstanceID % cells;
-  int layer = gl_InstanceID / cells;
+  int perRing = cells * uLayers;
+  int ring = gl_InstanceID / perRing;
+  int rest = gl_InstanceID - ring * perRing;
+  int cell = rest % cells;
+  int layer = rest / cells;
 
   vec2 ci = vec2(float(cell % uGrid), float(cell / uGrid)) - float(uGrid) * 0.5;
-  vec2 corner = uPatch + ci * uCell;
+
+  /* Each ring is coarser than the one inside it and snapped to its own
+     size, so the fine cells stay fine no matter how far the cover
+     reaches. Ring 0 is the same lawn at every setting of the control. */
+  float cellR = uCell * pow(uRingStep, float(ring));
+  vec2 origin = floor(uViewer / cellR + 0.5) * cellR;
+
+  /* Cut out the middle: a finer ring has already covered it. Biased a
+     cell inward so the rings overlap slightly rather than risk a gap —
+     each is snapped to its own size, so their edges do not line up, and
+     an overlapping band is invisible where a bare one would be a ring of
+     naked soil around the viewer. */
+  if (ring > 0) {
+    float hole = float(uGrid) * 0.5 / uRingStep - 1.0;
+    if (max(abs(ci.x + 0.5), abs(ci.y + 0.5)) < hole) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
+  }
+
+  vec2 corner = origin + ci * cellR;
 
   /* Hashed off the world coordinate of the cell, never off the instance
      index. The grid slides under the camera; if the seed slid with it
@@ -313,12 +362,17 @@ void main() {
      Quantised before hashing, and not for tidiness: the corner is a
      multiple of the cell size, but it is a multiple computed in floats,
      and two paths to the same cell can land an ulp apart. One ulp is
-     enough for hash33 to return a different blade. */
-  vec2 key = floor(corner / uCell + 0.5);
-  vec3 h1 = hash33(vec3(key * 31.7, float(layer) * 13.3 + 0.7));
-  vec3 h2 = hash33(vec3(key * 17.1 + 91.3, float(layer) * 5.9 + 2.1));
+     enough for hash33 to return a different blade.
 
-  vec2 base = corner + (h1.xy * 0.94 + 0.03) * uCell;
+     The ring goes into the salt as well. Without it, ring 1's cell at
+     the origin and ring 0's cell at the origin are the same key, and
+     two blades grow out of the same spot in the overlap band. */
+  vec2 key = floor(corner / cellR + 0.5);
+  float salt = float(layer) * 13.3 + float(ring) * 57.1;
+  vec3 h1 = hash33(vec3(key * 31.7, salt + 0.7));
+  vec3 h2 = hash33(vec3(key * 17.1 + 91.3, salt * 0.44 + 2.1));
+
+  vec2 base = corner + (h1.xy * 0.94 + 0.03) * cellR;
 
   /* The rim fade is a height fade. Blades do not become transparent and
      they do not wink out; they shorten into the ground, and the last
@@ -635,7 +689,7 @@ export class GroundCover {
     /** The lattice the patch origin is snapped to. Published because it
         is the whole reason the grass stays put, and a claim that cannot
         be checked from outside is a claim nobody will notice breaking. */
-    this.cell = CELL_REF;
+    this.cell = CELL;
     this._patch = new Float32Array(2);
     this._viewer = new Float32Array(2);
     this._jitter = new Float32Array(2);
@@ -736,25 +790,30 @@ export class GroundCover {
     if (!isCovered(opts.style)) { this.blades = 0; this.flowers = 0; this.triangles = 0; return; }
     const gl = this.gl;
 
-    const radius = Math.max(RADIUS_MIN, Math.min(RADIUS_MAX, opts.radius));
-    const { cell, grid } = grassGrid(radius);
-    this.cell = cell;
+    const { rings, step, radius } = coverPlan(opts.radius);
+    /* Ring 0's cell, which is a constant. Published, because "the reach
+       control does not resize the plants" is the claim this whole scheme
+       exists to make good on, and it should be checkable. */
+    this.cell = CELL;
     this.radius = radius;
+    this.rings = rings;
 
     /* Centred a little ahead of the camera rather than under it. Half a
        patch centred on the lens is spent behind the viewer; pushing it
        down the view axis spends the same budget on ground that is
        actually in frame. */
-    const ahead = radius * 0.35;
+    const ahead = Math.min(radius, HALF0) * 0.35;
     const cx = camera.pos[0] + camera.fwd[0] * ahead;
     const cz = camera.pos[2] + camera.fwd[2] * ahead;
     this._viewer[0] = cx;
     this._viewer[1] = cz;
 
-    // Snapped, so a cell keeps its world coordinate and therefore its
-    // hash while the grid slides underneath.
-    this._patch[0] = Math.round(cx / cell) * cell;
-    this._patch[1] = Math.round(cz / cell) * cell;
+    /* Ring 0's origin, snapped, so a cell keeps its world coordinate and
+       therefore its hash while the grid slides underneath. The shader
+       derives this and every coarser ring's origin the same way from
+       uViewer; this copy is what the flower sowing is keyed on. */
+    this._patch[0] = Math.round(cx / CELL) * CELL;
+    this._patch[1] = Math.round(cz / CELL) * CELL;
 
     // The cat's jitter, for the same reason: this is the same target and
     // the same temporal filter resolves both.
@@ -773,11 +832,13 @@ export class GroundCover {
       uAspect: camera.aspect,
       uJitter: this._jitter,
 
-      uPatch: this._patch,
       uViewer: this._viewer,
       uRadius: radius,
-      uGrid: grid,
-      uCell: cell,
+      uGrid: GRID,
+      uCell: CELL,
+      uLayers: layers,
+      uRings: rings,
+      uRingStep: step,
       uWind: opts.wind,
       uFog: env.fog,
 
@@ -819,17 +880,25 @@ export class GroundCover {
     gl.disable(gl.CULL_FACE);
 
     gl.bindVertexArray(this.grassVao);
-    this.blades = grid * grid * layers;
+    /* Every ring gets a full square of instances; the ones over the hole
+       park themselves in four instructions. Trimming them out would mean
+       a per-ring index offset for a saving on the cheapest invocations
+       in the pass. */
+    this.blades = GRID * GRID * layers * rings;
     this.grass.use(common);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, BLADE_VERTS, this.blades);
     this.triangles = this.blades * (BLADE_VERTS - 2);
 
     if (opts.style === 'meadow') {
-      /* The clump grid grows with the reach the same way the grass grid
-         does, so a wider view spreads the clumps out rather than sowing
-         quadratically more of them. */
-      const clumpCell = CLUMP_CELL_REF * Math.sqrt(radius / RADIUS_REF);
-      const reach = radius * FLOWER_REACH;
+      /* Fixed, like ring 0's cell and for the same reason: winding the
+         reach out must not thin the flowers underfoot.
+
+         What is capped instead is how far they go. A blade at the rim
+         still contributes the far field's colour; a flower head out
+         there is a fraction of a pixel, so past FLOWER_MAX there is
+         nothing to buy. */
+      const clumpCell = CLUMP_CELL;
+      const reach = Math.min(radius * FLOWER_REACH, FLOWER_MAX);
       const perClump = Math.max(4, Math.round(density * MAX_PER_CLUMP));
 
       /* Sown when — and only when — the answer would differ. The origin

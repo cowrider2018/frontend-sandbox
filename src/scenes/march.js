@@ -621,15 +621,16 @@ export default {
         { value: 'meadow', label: '草地與花' },
       ] },
     { id: 'cover', type: 'slider', label: '植被密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
-    { id: 'coverRadius', type: 'slider', label: '植被視距', min: 7, max: 44, step: 0.5, value: 16 },
+    { id: 'coverRadius', type: 'slider', label: '植被視距', min: 8, max: 120, step: 1, value: 15 },
     { id: 'wind', type: 'slider', label: '風', min: 0, max: 1.4, step: 0.01, value: 0.55 },
     { id: 'hintGround', type: 'hint',
       text: '草與花是三角形，不在距離場裡——它們和貓畫進同一張深度緩衝，'
         + '所以貓是站在草裡而不是站在草的圖片上。'
         + '草皮跟著鏡頭走並對齊格線，每一株的位置由它所在格子的**世界座標**決定，'
         + '所以格線在滑動、草沒有。風是一個吹過整片地的場，草和花讀的是同一份。'
-        + '「視距」拉遠是一望無際的草原，拉近把幀數還回來——格子隨視距開根號變大，'
-        + '所以成本是線性而不是平方，而且變稀的是遠處。' },
+        + '「視距」拉遠是一望無際的草原，拉近把幀數還回來。它加的是**面積不是尺寸**：'
+        + '近處那一圈的格寬永遠不變，遠的距離是往外加一圈比一圈粗的環買來的，'
+        + '所以腳邊的草在任何設定下都長得一樣，成本則隨環數（約是視距的對數）成長。' },
 
     { group: '貓' },
     { id: 'cat', type: 'switch', label: '顯示貓', value: true },

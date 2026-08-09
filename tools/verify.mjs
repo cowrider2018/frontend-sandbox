@@ -237,10 +237,12 @@ const SHOTS_PLAN = [
            return true;` },
 
   /* Reach wound out to the end of its travel: grass to the fog, and the
-     rim nowhere to be seen. The cells grow with it, so this is about
-     three times the blades of the default rather than eight. */
+     rim nowhere to be seen. The near cells are the same size they are at
+     every other setting — what bought the distance is rings, not bigger
+     plants, so the grass underfoot here should be indistinguishable from
+     the default shot's. */
   { name: '25-grass-far',
-    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&cat=0&coverRadius=44',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&cat=0&coverRadius=120',
     settle: 2500, freeze: 8.0,
     pre: '__aether.scene.laser.silence(); return true;',
     poke: `const s = __aether.scene;
@@ -1875,23 +1877,33 @@ async function interact(cdp, base, problems) {
     `origin ${parked.patch.map((v) => v.toFixed(2))} → ${walked.patch.map((v) => v.toFixed(2))}, `
     + `off-lattice by ${walked.off.toExponential(1)}`);
 
-  /* Reach is a control, and the cell grows as its square root so that the
-     cost follows the reach rather than its square. Four times the view
-     distance for four times the blades, not sixteen. */
+  /* Reach adds ground, not size. The near cells are one constant at
+     every setting of the control — an earlier version grew them with the
+     reach, which kept the cost down and scaled the whole pattern, so
+     winding the view out thinned the grass at your feet. */
+  const READ = `({ r: __aether.scene.ground.radius, rings: __aether.scene.ground.rings,
+    blades: __aether.scene.ground.blades, cell: __aether.scene.ground.cell })`;
   await cdp.eval(`__aether.panel.setValues({ coverRadius: 8 }, { notify: true }); true`);
   await sleep(300);
-  const near = await cdp.eval(`({ r: __aether.scene.ground.radius,
-    blades: __aether.scene.ground.blades, cell: __aether.scene.ground.cell })`);
-  await cdp.eval(`__aether.panel.setValues({ coverRadius: 32 }, { notify: true }); true`);
+  const near = await cdp.eval(READ);
+  await cdp.eval(`__aether.panel.setValues({ coverRadius: 120 }, { notify: true }); true`);
   await sleep(300);
-  const far = await cdp.eval(`({ r: __aether.scene.ground.radius,
-    blades: __aether.scene.ground.blades, cell: __aether.scene.ground.cell })`);
-  const growth = far.blades / near.blades;
-  check('reach costs blades in proportion to itself, not to its square',
-    near.r === 8 && far.r === 32 && growth > 3.4 && growth < 4.6,
-    `${near.r}u → ${near.blades} blades (cell ${near.cell.toFixed(2)}), `
-    + `${far.r}u → ${far.blades} (cell ${far.cell.toFixed(2)}); ×${growth.toFixed(2)} for ×4 reach`);
-  await cdp.eval(`__aether.panel.setValues({ coverRadius: 16 }, { notify: true }); true`);
+  const far = await cdp.eval(READ);
+
+  check('the reach control never resizes the plants',
+    near.cell === far.cell && near.r === 8 && far.r === 120,
+    `${near.r}u and ${far.r}u both on a ${near.cell} cell`);
+
+  /* And what it costs is the rings it had to add, which is the log of
+     the reach — not its square. */
+  check('reach is bought in rings, and costs exactly the rings it buys',
+    far.rings > near.rings
+    && Math.abs(far.blades / near.blades - far.rings / near.rings) < 1e-6,
+    `${near.r}u → ${near.rings} ring / ${near.blades} blades, `
+    + `${far.r}u → ${far.rings} rings / ${far.blades}; ×15 reach for `
+    + `×${(far.blades / near.blades).toFixed(1)} blades`);
+
+  await cdp.eval(`__aether.panel.setValues({ coverRadius: 15 }, { notify: true }); true`);
   await sleep(200);
 
   /* Grass in wind never comes to rest, so the temporal filter must not
