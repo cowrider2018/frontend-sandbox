@@ -236,6 +236,17 @@ const SHOTS_PLAN = [
            s.yaw = 0.85; s.pitch = -0.02; s.targetDist = 3.2;
            return true;` },
 
+  /* Reach wound out to the end of its travel: grass to the fog, and the
+     rim nowhere to be seen. The cells grow with it, so this is about
+     three times the blades of the default rather than eight. */
+  { name: '25-grass-far',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&cat=0&coverRadius=44',
+    settle: 2500, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.05; s.targetDist = 9;
+           return true;` },
+
   /* And the point of sharing a depth buffer: the cat is in the grass,
      not on it — blades in front of its paws, blades behind them, and
      its own shadow lying across the sward. */
@@ -1817,19 +1828,71 @@ async function interact(cdp, base, problems) {
      taken from the world coordinate of its cell, so an origin that
      landed anywhere off the lattice would reseed the whole meadow every
      frame and the ground would crawl as you walked over it. */
-  const patchBefore = await cdp.eval(`[...__aether.scene.ground._patch]`);
+  /* Sown once and kept. The flowers used to be re-derived in the vertex
+     shader, off a 4 m clump grid whose corners were snapped to the
+     0.5 m *grass* lattice — so every half-metre of camera travel
+     re-rolled every clump, and the flowers changed places continuously
+     while you walked. They are placed on the CPU now, when the patch
+     shifts a whole clump cell. */
+  const WHERE = `(() => {
+    const g = __aether.scene.ground, out = [];
+    for (let i = 0; i < g.flowers; i++) {
+      out.push(g._sown[i * 11].toFixed(4) + ',' + g._sown[i * 11 + 1].toFixed(4));
+    }
+    const off = (v) => Math.abs(v / g.cell - Math.round(v / g.cell));
+    return { at: out, sowings: g.sowings, patch: [...g._patch],
+             off: Math.max(off(g._patch[0]), off(g._patch[1])) };
+  })()`;
+
+  const parked = await cdp.eval(WHERE);
+  await sleep(900);                                  // a good many frames
+  const stillParked = await cdp.eval(WHERE);
+  check('standing still never re-sows the flowers',
+    stillParked.sowings === parked.sowings,
+    `${parked.sowings} sowings → ${stillParked.sowings} over ~0.9 s`);
+
   await drag([700, 450], [1180, 470]);
   await sleep(400);
-  const patchAfter = await cdp.eval(`(() => {
-    const g = __aether.scene.ground;
-    const off = (v) => Math.abs(v / g.cell - Math.round(v / g.cell));
-    return { p: [...g._patch], off: Math.max(off(g._patch[0]), off(g._patch[1])) };
-  })()`);
+  const walked = await cdp.eval(WHERE);
+
+  /* And when it does re-sow, a flower the two buffers have in common is
+     at the identical coordinate — the placement is deterministic in the
+     world cell, so what the shift changes is which flowers are in the
+     buffer, never where any of them stands. */
+  const shared = new Set(parked.at);
+  const kept = walked.at.filter((p) => shared.has(p)).length;
+  check('flowers keep their exact places when the patch moves under them',
+    kept > walked.at.length * 0.4,
+    `${kept} of ${walked.at.length} unchanged to 0.1 mm, `
+    + `${walked.sowings - parked.sowings} re-sowing(s) for the whole drag`);
+
+  /* The patch is snapped to its own lattice, which is what lets the
+     grass be re-derived from a hash of its cell every frame without the
+     ground crawling as you walk over it. */
   check('the patch follows the camera but stays on its own lattice',
-    patchAfter.off < 1e-4
-    && (patchAfter.p[0] !== patchBefore[0] || patchAfter.p[1] !== patchBefore[1]),
-    `origin ${patchBefore.map((v) => v.toFixed(2))} → ${patchAfter.p.map((v) => v.toFixed(2))}, `
-    + `off-lattice by ${patchAfter.off.toExponential(1)}`);
+    walked.off < 1e-4
+    && (walked.patch[0] !== parked.patch[0] || walked.patch[1] !== parked.patch[1]),
+    `origin ${parked.patch.map((v) => v.toFixed(2))} → ${walked.patch.map((v) => v.toFixed(2))}, `
+    + `off-lattice by ${walked.off.toExponential(1)}`);
+
+  /* Reach is a control, and the cell grows as its square root so that the
+     cost follows the reach rather than its square. Four times the view
+     distance for four times the blades, not sixteen. */
+  await cdp.eval(`__aether.panel.setValues({ coverRadius: 8 }, { notify: true }); true`);
+  await sleep(300);
+  const near = await cdp.eval(`({ r: __aether.scene.ground.radius,
+    blades: __aether.scene.ground.blades, cell: __aether.scene.ground.cell })`);
+  await cdp.eval(`__aether.panel.setValues({ coverRadius: 32 }, { notify: true }); true`);
+  await sleep(300);
+  const far = await cdp.eval(`({ r: __aether.scene.ground.radius,
+    blades: __aether.scene.ground.blades, cell: __aether.scene.ground.cell })`);
+  const growth = far.blades / near.blades;
+  check('reach costs blades in proportion to itself, not to its square',
+    near.r === 8 && far.r === 32 && growth > 3.4 && growth < 4.6,
+    `${near.r}u → ${near.blades} blades (cell ${near.cell.toFixed(2)}), `
+    + `${far.r}u → ${far.blades} (cell ${far.cell.toFixed(2)}); ×${growth.toFixed(2)} for ×4 reach`);
+  await cdp.eval(`__aether.panel.setValues({ coverRadius: 16 }, { notify: true }); true`);
+  await sleep(200);
 
   /* Grass in wind never comes to rest, so the temporal filter must not
      be allowed to believe the frame has settled. Tested with everything
