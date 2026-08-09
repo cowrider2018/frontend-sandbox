@@ -638,6 +638,7 @@ export default {
     { id: 'flowers', type: 'switch', label: '花', value: false },
     { id: 'flowerClumps', type: 'slider', label: '花叢密度', min: 0.05, max: 1, step: 0.01, value: 0.62 },
     { id: 'flowerDensity', type: 'slider', label: '叢內花密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
+    { id: 'flowerSpread', type: 'slider', label: '花叢範圍', min: 0.2, max: 3, step: 0.01, value: 1 },
     { id: 'coverRadius', type: 'slider', label: '植被視距', min: 8, max: 200, step: 1, value: 15 },
     { id: 'trees', type: 'switch', label: '樹', value: false },
     { id: 'treeDensity', type: 'slider', label: '樹的密度', min: 0.1, max: 1, step: 0.01, value: 0.6 },
@@ -650,6 +651,8 @@ export default {
         + '花的兩支滑桿是兩種不同的畫面：**花叢密度**是「有幾叢」，'
         + '**叢內花密度**是「一叢有多密」——'
         + '疏落的幾叢濃花，和撒滿整片地的稀花，一支滑桿到得了兩端卻說不出自己在做哪一種。'
+        + '**花叢範圍**是第三件事：同樣數量的花攤在多大一片地上——'
+        + '拉小是緊實的一球，拉大到叢與叢重疊就成了連續的散花。'
         + '「視距」拉遠是一望無際的草原，拉近把幀數還回來。它加的是**面積不是尺寸**：'
         + '近處那一圈的格寬永遠不變，遠的距離是往外加一圈比一圈粗的環買來的，'
         + '所以腳邊的草在任何設定下都長得一樣，成本則隨環數（約是視距的對數）成長。'
@@ -1922,6 +1925,7 @@ class MarchScene {
         flowers: Boolean(state.flowers),
         flowerClumps: state.flowerClumps,
         flowerDensity: state.flowerDensity,
+        flowerSpread: state.flowerSpread,
         radius: state.coverRadius,
         wind: state.wind,
         frame,

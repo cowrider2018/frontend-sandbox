@@ -141,6 +141,11 @@ const FLOWER_MAX = 60.0;
 const CLUMP_CHANCE = 0.62;
 /** Flower slots per clump at full density; the thinning eats about 30%. */
 const MAX_PER_CLUMP = 30;
+/* How wide a clump is, before the spread control scales it. Wound right
+   up, clumps overlap into a continuous scatter, which is a legitimate
+   thing to want and the reason the control's range runs past 1. */
+const CLUMP_R_MIN = 0.40;
+const CLUMP_R_MAX = 1.50;
 /** Ceiling on the placement buffer. Comfortably above the widest reach. */
 const MAX_FLOWERS = 12288;
 /** Floats per flower in that buffer; see the attribute layout below. */
@@ -626,12 +631,18 @@ export class GroundCover {
    * origin, and upload it. Called only when that origin, the clump size
    * or the density changes.
    */
-  _sow(originX, originZ, clumpCell, perClump, reach, chance) {
+  _sow(originX, originZ, clumpCell, perClump, reach, chance, spread) {
     const buf = this._sown;
     /* One cell of margin past the reach: the fade is measured from where
        the eye is now, which can be half a cell beyond the origin this was
-       sown around, and a flower missing from the buffer cannot fade in. */
-    const span = Math.ceil((reach + clumpCell) / clumpCell);
+       sown around, and a flower missing from the buffer cannot fade in.
+
+       Plus however far a clump can throw a flower. A wide clump seeded
+       just outside the visited cells still drops flowers inside them, and
+       leaving those out thins a ring at the rim — invisible at spread 1,
+       obvious once the clumps are metres across. */
+    const bleed = clumpCell + CLUMP_R_MAX * spread;
+    const span = Math.ceil((reach + bleed) / clumpCell);
     const ix0 = Math.round(originX / clumpCell);
     const iz0 = Math.round(originZ / clumpCell);
     const limit = (reach + clumpCell) * (reach + clumpCell);
@@ -649,7 +660,8 @@ export class GroundCover {
 
         const cx = (ix + seed(ix, iz, 2) * 0.72 + 0.14) * clumpCell;
         const cz = (iz + seed(ix, iz, 3) * 0.72 + 0.14) * clumpCell;
-        const clumpR = 0.40 + seed(ix, iz, 4) * 1.10;
+        const clumpR = (CLUMP_R_MIN
+          + seed(ix, iz, 4) * (CLUMP_R_MAX - CLUMP_R_MIN)) * spread;
         const tint = PETAL_COLOURS[Math.min(4, (seed(ix, iz, 5) * 5) | 0)];
 
         for (let k = 0; k < perClump && n < MAX_FLOWERS; k++) {
@@ -856,6 +868,7 @@ export class GroundCover {
       const perClump = Math.max(3, Math.round(
         Math.max(0, Math.min(1, opts.flowerDensity)) * MAX_PER_CLUMP));
       const chance = Math.max(0, Math.min(1, opts.flowerClumps));
+      const spread = Math.max(0.05, opts.flowerSpread);
 
       /* Sown when — and only when — the answer would differ. The origin
          moves a whole clump cell at a time, so walking a straight line
@@ -863,9 +876,9 @@ export class GroundCover {
       const ox = Math.round(this._patch[0] / clumpCell) * clumpCell;
       const oz = Math.round(this._patch[1] / clumpCell) * clumpCell;
       const key = `${ox}|${oz}|${clumpCell.toFixed(4)}|${perClump}`
-        + `|${chance.toFixed(3)}|${reach.toFixed(3)}`;
+        + `|${chance.toFixed(3)}|${spread.toFixed(3)}|${reach.toFixed(3)}`;
       if (key !== this._sowKey) {
-        this.flowers = this._sow(ox, oz, clumpCell, perClump, reach, chance);
+        this.flowers = this._sow(ox, oz, clumpCell, perClump, reach, chance, spread);
         this._sowKey = key;
       }
 

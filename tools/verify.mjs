@@ -1927,6 +1927,32 @@ async function interact(cdp, base, problems) {
     `all ${bothFull} · few clumps ${fewClumps} · thin clumps ${thinClumps}`);
   await flowerAt(0.62, 0.7);
 
+  /* Spread is the third of them, and the odd one out: the other two take
+     flowers away, this one spends the same flowers over more ground.
+     Measured as how many square metres the flowers land in — tight
+     clumps pile many into one, a wide scatter puts one in each. */
+  const spreadAt = async (v) => {
+    await cdp.eval(`__aether.panel.setValues(
+      { flowerSpread: ${v} }, { notify: true }); true`);
+    await sleep(350);
+    return cdp.eval(`(() => {
+      const g = __aether.scene.ground, cells = new Set();
+      for (let i = 0; i < g.flowers; i++) {
+        cells.add(Math.round(g._sown[i * 11]) + ',' + Math.round(g._sown[i * 11 + 1]));
+      }
+      return { n: g.flowers, cells: cells.size };
+    })()`);
+  };
+  const tight = await spreadAt(0.25);
+  const loose = await spreadAt(2.5);
+  check('the spread control moves the ground covered, not the count',
+    Math.abs(loose.n - tight.n) < tight.n * 0.35
+    && loose.cells > tight.cells * 1.5,
+    `tight ${tight.n} flowers over ${tight.cells} m², `
+    + `loose ${loose.n} over ${loose.cells} m²`);
+  await cdp.eval(`__aether.panel.setValues({ flowerSpread: 1 }, { notify: true }); true`);
+  await sleep(250);
+
   /* The patch follows the camera but is snapped to its own lattice, and
      that snap is the entire reason a blade keeps its place: the hash is
      taken from the world coordinate of its cell, so an origin that
