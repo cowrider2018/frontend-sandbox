@@ -17,6 +17,8 @@
 import { PRECISION } from '../shaders/common.js';
 import { CANOPY_SHADE_GLSL } from './canopy.js';
 import { RASTER_NEAR, RASTER_FAR } from './raster.js';
+import { TERRAIN_GLSL } from './terrain.js';
+import { WEATHER_GLSL } from './weather.js';
 import { WIND_GLSL } from './wind.js';
 
 export const PLANT_COMMON = /* glsl */`
@@ -50,22 +52,35 @@ vec4 rasterise(vec3 world) {
               z, view.z);
 }
 
+${TERRAIN_GLSL}
+/* After the terrain, and not by preference: snow asks the ground for its
+   slope and asks the water where the shore is, so the block that answers
+   both has to already be here. */
+${WEATHER_GLSL}
 ${WIND_GLSL}
 ${CANOPY_SHADE_GLSL}
 
 /**
- * How much of the sun reaches a point, through the cluster, the cat, and
- * the leaves overhead.
+ * How much of the sun reaches a point, through the cluster, the cat, the
+ * leaves overhead, and the hill in the way.
  *
- * Cheap almost everywhere despite the march: the ray leaves the
- * cluster's bounding sphere immediately unless it is actually headed
- * into it, so the overwhelming majority of plants pay three dot products
- * and stop. Only the ones standing in the shadow do the walk.
+ * Cheap almost everywhere despite the marches: the cluster ray leaves
+ * its bounding sphere immediately unless it is actually headed into it,
+ * and the ground ray leaves its slab the moment it clears the ridge
+ * line, so the overwhelming majority of plants pay a handful of compares
+ * and stop. Only the ones standing in a shadow do the walk.
+ *
+ * The hill term is the one that has to be here rather than anywhere
+ * else. A blade on a north face and the soil it grows out of are shaded
+ * by two different passes — this vertex shader and the marcher — and the
+ * only reason they agree about where the shade falls is that both call
+ * one shared terrainShadow over one shared height field.
  */
 float sunlight(vec3 p, float soft) {
   float sh = canopyShade(p);
   if (soft <= 0.0) return sh;
   float k = mix(6.0, 26.0, soft);
+  sh = min(sh, terrainShadow(p, uLightDir, k));
   return min(sh, min(clusterShadow(p, uLightDir, k), catShadow(p, uLightDir, k)));
 }
 
@@ -108,7 +123,7 @@ vec3 shadeBlade(vec3 n, vec3 albedo, float sun, float occ, float transmit) {
   float back = max(-dot(n, l), 0.0);
   back = back * back * transmit;
   return albedo * (uTint * 2.4 * (ndl + back) * sun * occ
-                 + vec3(0.16, 0.19, 0.24) * occ);
+                 + uAmbient * 1.5 * occ);
 }
 
 /**
@@ -128,6 +143,84 @@ void emit(vec3 world, vec3 col) {
   gl_Position = rasterise(world);
 }
 `;
+
+/**
+ * The JS side of the same contract: everything `PLANT_COMMON` declares,
+ * filled from the scene's one description of the light and the field.
+ *
+ * It exists for exactly the reason the GLSL block does. Three passes now
+ * include that header — the grass, the wood, and whatever is flying over
+ * both — and a header shared by three shaders whose *values* are typed
+ * out three times is a header that is only shared on paper. The way that
+ * fails is not a crash: it is one pass quietly keeping last week's
+ * ripple radius, and a meadow where the shadow under the cluster has two
+ * different edges depending on what is standing in it.
+ *
+ * Callers add their own on top. Extra keys cost nothing — a uniform a
+ * shader does not declare is skipped on upload — so a pass that needs a
+ * grid or a reach simply spreads this and appends.
+ *
+ * @param {object} camera pos/right/up/fwd/focal/aspect
+ * @param {object} env    the scene's light, ground, weather and cluster
+ * @param {object} opts   `wind`, and the subpixel `jitter` this target's
+ *                        temporal filter is expecting
+ */
+export function plantUniforms(camera, env, opts) {
+  return {
+    uCamPos: camera.pos,
+    uRight: camera.right,
+    uUp: camera.up,
+    uFwd: camera.fwd,
+    uFocal: camera.focal,
+    uAspect: camera.aspect,
+    uJitter: opts.jitter,
+
+    uWind: opts.wind,
+    uFog: env.fog,
+
+    /* The ground everything here is standing on, the water on it, and
+       the weather over both. One number each, read by every pass, which
+       is the only reason they can all be in the same place at once. */
+    uHills: env.hills,
+    uWaterY: env.waterY,
+    uRain: env.weather.rain,
+    uSnow: env.weather.snow,
+
+    uLightDir: env.dir,
+    uTint: env.tint,
+    uDay: env.day,
+    uAmbient: env.ambient,
+    uShadowSoft: env.shadowSoft,
+    uShadowSteps: env.shadowSteps,
+    uShadowNoise: env.shadowNoise,
+
+    // The cluster, exactly as the marcher sees it this frame, so the
+    // shadow it throws across a leaf is the shadow it throws.
+    uTime: env.time,
+    uBlend: env.blend,
+    uBallPos: env.ballPos,
+    uBalls: env.balls,
+    uBound: env.bound,
+    uRipples: env.ripples,
+    uRippleTo: env.rippleTo,
+    uRippleOn: env.rippleOn,
+    uRippleAmp: env.rippleAmp,
+    uRippleSpeed: env.rippleSpeed,
+    uRippleFreq: env.rippleFreq,
+    uRippleTight: 5.0,
+    uErode: env.erode,
+    uDisplace: env.displace,
+
+    // And the cat, so it casts one too.
+    uCatCapA: env.catCapA,
+    uCatCapB: env.catCapB,
+    uCatBound: env.catBound,
+    uCatCaps: env.catCaps,
+
+    // And the wood, so anything under a tree is in its shade.
+    ...env.canopy,
+  };
+}
 
 /**
  * The fragment shader, shared by every plant pass.

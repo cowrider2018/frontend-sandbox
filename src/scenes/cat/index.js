@@ -28,6 +28,7 @@ import {
 } from '../cluster.js';
 import { CANOPY_SHADE_GLSL } from '../canopy.js';
 import { RASTER_NEAR as NEAR, RASTER_FAR as FAR } from '../raster.js';
+import { TERRAIN_GLSL, terrainHeight } from '../terrain.js';
 import { parseCat, Rig, modelMatrix } from './rig.js';
 import { Driver, Sway, applyPose } from './pose.js';
 
@@ -248,6 +249,7 @@ ${CLUSTER_LAYERS}
 ${CLUSTER_SHADOW}
 ${SKY}
 ${CANOPY_SHADE_GLSL}
+${TERRAIN_GLSL}
 
 in vec3 vNormal;
 in vec3 vColor;
@@ -313,7 +315,12 @@ void main() {
        in places, and self-shadowing against them is all acne. */
     float sh = 1.0;
     if (ndl > 0.0 && uShadowSoft > 0.0) {
-      sh = clusterShadow(vWorld + n * 0.01, l, mix(6.0, 26.0, uShadowSoft));
+      float k = mix(6.0, 26.0, uShadowSoft);
+      sh = clusterShadow(vWorld + n * 0.01, l, k);
+      // And the hill it is walking behind. Same march the grass around
+      // its feet fires, so the animal goes into shade at the moment the
+      // meadow does rather than a metre later.
+      sh = min(sh, terrainShadow(vWorld + n * 0.01, l, k));
     }
     // And whatever is growing over its head.
     sh = min(sh, canopyShade(vWorld));
@@ -323,7 +330,7 @@ void main() {
     float sheen = pow(1.0 - max(dot(n, v), 0.0), FUR_SHEEN_POWER) * ndl;
     float fresnel = pow(1.0 - max(dot(n, v), 0.0), 5.0);
 
-    col = albedo * (uTint * 2.3 * ndl * sh + vec3(0.10, 0.12, 0.16));
+    col = albedo * (uTint * 2.3 * ndl * sh + uAmbient);
     col += uTint * sheen * sh * FUR_SHEEN;
     col += sky(reflect(rd, n)) * (0.04 + fresnel * FUR_SKY);
   }
@@ -658,10 +665,14 @@ export class Cat {
    * Movement is always in the floor plane, and the cat only ever travels
    * along its own nose unless it is sidling. What changes between the
    * modes is where the heading comes from — the keys, or the mouse.
+   *
+   * The ground is given as an amplitude rather than a height, so that the
+   * height can be looked up *after* the step. Handing in last frame's
+   * floor is the obvious shape and it is a frame of lag between the feet
+   * and the hill, which at a walk on a slope is a visible skate.
    */
-  update(dt, floorY, camera) {
+  update(dt, hills, camera) {
     const d = Math.min(0.05, Math.max(0, dt));
-    this.floorY = floorY;
 
     const look = this.mode === 'look';
     const kx = (this.keys.d ? 1 : 0) - (this.keys.a ? 1 : 0);
@@ -696,6 +707,12 @@ export class Cat {
 
     this.x += (fx * this.velocity + rx * this.strafeVel) * d;
     this.z += (fz * this.velocity + rz * this.strafeVel) * d;
+
+    /* Where the ground is, now that the cat is standing somewhere else.
+       The same function the marcher traces and the grass roots into, so
+       the animal is on the surface it can be seen standing on rather
+       than on a second opinion about it. */
+    this.floorY = terrainHeight(this.x, this.z, hills);
 
     // One turn signal for both modes, taken from the yaw that actually
     // happened rather than from whichever input caused it. The lean and
@@ -734,7 +751,7 @@ export class Cat {
     this.animating = this.speed !== 0 || this.turnRate !== 0
       || this.rig.changed || this.sway.activity > 2e-3;
 
-    modelMatrix(this._model, this.x, floorY + this.footOffset, this.z, this.yaw, this.scale);
+    modelMatrix(this._model, this.x, this.floorY + this.footOffset, this.z, this.yaw, this.scale);
     this._fitProxy();
     return this;
   }
@@ -882,7 +899,11 @@ export class Cat {
       // The scene's light, and the field it has to cast through.
       uLightDir: env.dir,
       uTint: env.tint,
+      uDay: env.day,
+      uAmbient: env.ambient,
       uFog: env.fog,
+      uHills: env.hills,
+      uWaterY: env.waterY,
       uShadowSoft: env.shadowSoft,
       uShadowSteps: env.shadowSteps,
       uShadowNoise: env.shadowNoise,

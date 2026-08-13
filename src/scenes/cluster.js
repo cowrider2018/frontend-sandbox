@@ -336,17 +336,93 @@ float clusterShadow(vec3 ro, vec3 rd, float k) {
 export const SKY = /* glsl */`
 uniform vec3 uLightDir, uTint;
 
+/* The stars' own hash, rather than the shared one.
+
+   This block is included by four shaders and only two of them carry the
+   common hash header — the cat's fragment stage is one that does not,
+   and reaching for hash33 here is what broke it. A sky that drags a
+   dependency in behind it is a sky that can only be included where
+   somebody already thought to include something else, and the whole
+   point of a shared chunk is that it goes anywhere. Six lines is a
+   cheaper answer than a rule everybody has to remember. */
+vec3 starHash(vec3 p) {
+  p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  p += dot(p, p.yxz + 33.33);
+  return fract((p.xxy + p.yxx) * p.zyx);
+}
+/** How much daylight is in the sky, 0..1. One is the sky this scene has
+    always had; the fixed-light mode uploads exactly that, so a frame
+    taken before there was a time of day still renders byte for byte. */
+uniform float uDay;
+
+/**
+ * The light that arrives from everywhere rather than from the sun.
+ *
+ * Was three hardcoded numbers, repeated in the marcher, the cat and the
+ * plants. It became a uniform the moment there was a night, because it
+ * is the *only* term still delivering light once the sun is down — the
+ * ground here has an albedo of about four percent and a directional term
+ * scaled by moonlight, so with the fill left at its daytime value the
+ * whole meadow resolves to black and the picture is a starfield with a
+ * cluster in it.
+ *
+ * It is also what snow needs. Snow is bright because it is lit, and most
+ * of what lights the shaded side of a drift is the sky; a snowfield with
+ * a daytime-meadow fill has no blue in its shadows, and blue shadows are
+ * most of what the eye is reading when it calls something snow rather
+ * than sand.
+ */
+uniform vec3 uAmbient;
+
 vec3 sky(vec3 rd) {
   float h = rd.y * 0.5 + 0.5;
-  vec3 top = vec3(0.045, 0.062, 0.10);
-  vec3 hor = vec3(0.10, 0.11, 0.135) * 1.1;
-  vec3 bot = vec3(0.015, 0.016, 0.022);
+
+  /* Two palettes and a lerp. The day one is the original set, unchanged
+     and unchangeable — every reference shot in the project is measured
+     against it. The night one is the same sky with the air taken out of
+     it: a horizon barely brighter than the zenith, because at night what
+     lights the low sky is the ground, and this ground is dark. */
+  vec3 top = mix(vec3(0.006, 0.009, 0.022), vec3(0.045, 0.062, 0.10), uDay);
+  vec3 hor = mix(vec3(0.012, 0.016, 0.030), vec3(0.110, 0.121, 0.149), uDay);
+  vec3 bot = mix(vec3(0.004, 0.005, 0.010), vec3(0.015, 0.016, 0.022), uDay);
+
   vec3 c = mix(bot, hor, smoothstep(0.35, 0.5, h));
   c = mix(c, top, smoothstep(0.5, 1.0, h));
-  // A soft sun disc so reflections have something to catch.
-  float sun = pow(max(dot(rd, uLightDir), 0.0), 220.0);
-  c += uTint * sun * 4.0;
-  c += uTint * 0.14 * pow(max(dot(rd, uLightDir), 0.0), 5.0);
+
+  /* Stars, and only the ones the sky is dark enough to show. Placed by
+     hashing a cell of the direction itself rather than a texture: the
+     sphere is being sampled by the same rays that sample everything
+     else, so there is no projection to distort and no seam to hide.
+
+     The threshold is what keeps them sparse. Every cell has a candidate
+     in it; roughly one in eighty is allowed to be a star, and which one
+     is decided by the same hash that placed it, so the field is fixed to
+     the world and does not swim as the camera turns. */
+  float night = 1.0 - smoothstep(0.0, 0.62, uDay);
+  if (night > 0.002 && rd.y > -0.02) {
+    vec3 d = rd * 46.0;
+    vec3 g = starHash(floor(d));
+    float star = pow(max(0.0, 1.0 - length(fract(d) - 0.15 - g * 0.7) * 2.6), 22.0);
+    star *= step(0.9875, g.z);
+    // Faded into the horizon haze, where there is more air to look
+    // through and where the ground is about to be in the way anyway.
+    c += vec3(0.86, 0.90, 1.0) * star * night * smoothstep(-0.02, 0.30, rd.y) * 1.5;
+  }
+
+  /* A soft disc so reflections have something to catch. It is the sun by
+     day and the moon by night without being told which: uTint already
+     carries the body's colour and its strength, so the same two lines
+     draw a white-hot sun, a red one at dusk, and a small pale moon. */
+  float toLight = max(dot(rd, uLightDir), 0.0);
+  c += uTint * pow(toLight, 220.0) * 4.0;
+
+  /* The halo around it, which has to tighten at night or the moon has no
+     disc left. By day the wide glow is the sun's own scatter and reads
+     correctly at the horizon; at night the same width spread over a sky
+     that is a hundredth as bright swallows the body inside it and leaves
+     a pale smear where the moon should be. Both ends interpolate from
+     uDay, so full daylight is the original two constants exactly. */
+  c += uTint * mix(0.030, 0.14, uDay) * pow(toLight, mix(26.0, 5.0, uDay));
   return c;
 }
 `;

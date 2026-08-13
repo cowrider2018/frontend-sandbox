@@ -8,9 +8,14 @@
 
    Two structural decisions carry most of the performance:
 
-   1. THE FLOOR IS NOT MARCHED. It is a plane, so it is intersected in
-      closed form and compared against the cluster's hit. A grazing ray
-      used to walk the entire march budget along it for nothing.
+   1. THE GROUND IS MARCHED, BUT NEVER BLINDLY. It was a plane once,
+      solved in closed form; it is a height field now, and the closed
+      form survives as the far-field fallback. What keeps it affordable
+      is that the field is trapped in a slab and its slope is bounded, so
+      a ray skips everything above the ridge line in a divide and takes
+      conservative steps through the rest. A grazing ray that exhausts
+      its budget lands on the plane the hills average to, at a distance
+      where the fog owns the colour anyway. See scenes/terrain.js.
 
    2. THE CLUSTER HAS A BOUNDING SPHERE, computed in JS every frame from
       the same numbers that place the spheres. Every distance the shader
@@ -27,9 +32,22 @@ import { Program } from '../core/program.js';
 import { Target, DoubleTarget, bindScreen, BLEND } from '../core/gl.js';
 import { PRECISION, CONSTANTS, HASH, COLOR, ROTATE, SIMPLEX3, VERT_FULLSCREEN } from '../shaders/common.js';
 import {
-  BALL_N, RIPPLE_N, RING_MAJOR, RING_MINOR, FLOOR_Y, DISPLACE_AMP,
+  BALL_N, RIPPLE_N, RING_MAJOR, RING_MINOR, DISPLACE_AMP,
   CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_LAYERS, CLUSTER_SHADOW, SKY,
 } from './cluster.js';
+import {
+  TERRAIN_GLSL, HILLS_DEFAULT, HILLS_MAX, terrainHeight, traceTerrainJS,
+  WATER_DEFAULT, waterSurfaceY,
+} from './terrain.js';
+import {
+  WEATHER_GLSL, WEATHER_MODES, weatherOf, Precipitation,
+} from './weather.js';
+import {
+  HOUR_DEFAULT, AMBIENT_FIXED, hourDrives, skyAt, advanceHour,
+} from './daycycle.js';
+import {
+  Creatures, CREATURE_REACH_MIN, CREATURE_REACH_MAX, CREATURE_REACH_DEFAULT,
+} from './creatures.js';
 import { Cat, CAT_PROXY_GLSL, CAT_CAPS, HEAD_YAW_MAX } from './cat/index.js';
 import { Laser } from './laser.js';
 import { GroundCover, isCovered } from './ground.js';
@@ -81,6 +99,8 @@ ${COLOR}
 ${ROTATE}
 ${SIMPLEX3}
 ${CLUSTER_UNIFORMS}
+${TERRAIN_GLSL}
+${WEATHER_GLSL}
 
 #define AO_REFERENCE ${AO_REFERENCE.toFixed(6)}
 
@@ -176,20 +196,16 @@ float traceCluster(vec3 ro, vec3 rd, int steps, float tMin) {
   return -1.0;
 }
 
-/** Analytic floor plane. Negative when the ray never reaches it. */
-float traceFloor(vec3 ro, vec3 rd) {
-  if (rd.y >= -1e-5) return -1.0;
-  return (FLOOR_Y - ro.y) / rd.y;
-}
-
 /**
- * The cluster is marched; the cat is solved. Two different answers to
- * the same question, each the cheap one for its own shape — and the
- * cluster half is the shared one from cluster.js, so the cat is lit by
- * exactly the penumbra the spheres are.
+ * The cluster is marched, the cat is solved, the ground is marched
+ * against its own slope bound. Three different answers to the same
+ * question, each the cheap one for its own shape — and every one of them
+ * is the shared copy, so the cat is lit by exactly the penumbra the
+ * spheres are and stands in exactly the hillshade the grass does.
  */
 float softShadow(vec3 ro, vec3 rd, float k) {
-  return min(clusterShadow(ro, rd, k), catShadow(ro, rd, k));
+  return min(min(clusterShadow(ro, rd, k), catShadow(ro, rd, k)),
+             terrainShadow(ro, rd, k));
 }
 
 /**
@@ -218,37 +234,118 @@ float ambientOcclusion(vec3 p, vec3 n) {
 ${SKY}
 ${CANOPY_SHADE_GLSL}
 
-vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal) {
+/**
+ * The ground's own colour, wherever it is asked for.
+ *
+ * Split out of material() the moment the water arrived, because the
+ * shallows have to show what they are standing on: a lake whose edge
+ * does not read the bed is a lake with a painted-on shoreline. It only
+ * ever looks at xz, which is why the surface point can be handed to it
+ * in place of the bed point underneath.
+ */
+vec3 groundAlbedo(vec3 p, out float rough) {
+  /* Soil, once there is a meadow standing on it.
+     The grid is a reference surface — a ruled, faintly polished plane
+     that says where the floor is. Grass growing out of a ruled plane
+     reads as grass growing out of a diagram, and the polish is worse
+     than the ruling: a mirror finish between the blades throws the
+     cluster back up through the sward. So the ground under the cover
+     is rough, dark and mottled, and its job is to be the shadow
+     between the blades rather than a surface anyone looks at. */
+  if (uGround > 0.5) {
+    float broad = snoise(vec3(p.x * 0.42, 3.7, p.z * 0.42)) * 0.5 + 0.5;
+    float fine = snoise(vec3(p.x * 3.10, 8.1, p.z * 3.10)) * 0.5 + 0.5;
+    /* Green, not brown. There is no instance budget that puts a blade
+       over every square centimetre, so what shows between them has to
+       be the same colour as what is standing in it — a dark sward seen
+       from above, not the dirt underneath. Soil-coloured ground turns
+       a thin meadow into stubble on a ploughed field. */
+    vec3 soil = mix(vec3(0.016, 0.030, 0.011), vec3(0.046, 0.086, 0.026), broad);
+    rough = 0.94;
+    /* And whatever fell on it. Applied here rather than at every call
+       site because there are three of them now — the soil under the eye,
+       the bed under the water, and the bounce — and a lake whose floor
+       had not heard about the snow would be a lake with a green bottom
+       in a white field. */
+    return weatherSurface(soil * (0.82 + 0.36 * fine), snowCover(p.xz), rough);
+  }
+
+  // floor: a faint grid that fades out with distance
+  vec2 g = abs(fract(p.xz * 0.5) - 0.5);
+  float line = 1.0 - smoothstep(0.0, 0.03, min(g.x, g.y));
+  float fade = exp(-length(p.xz) * 0.09);
+  rough = mix(0.42, 0.12, uFloorMix);
+  /* The grid is a diagram, not ground: it is the reference surface you
+     switch to in order to see where the floor is, and snowing on a
+     diagram would only make it harder to read. */
+  return mix(vec3(0.024, 0.026, 0.032), uTint * 0.6, line * fade * 0.5);
+}
+
+/**
+ * The surface of the water: flat, with four crossing wave trains laid
+ * over its normal.
+ *
+ * Nothing is displaced. A lake seen from eye height is almost entirely
+ * reflection, and reflection is a function of the normal alone — so
+ * perturbing the normal buys the whole look and the plane stays a plane,
+ * which is what keeps traceWater a divide instead of a march.
+ *
+ * The trains fade out with distance for the reason every other detail in
+ * this scene does: ripple finer than a pixel is not ripple, it is noise
+ * that the temporal filter then has to spend frames arguing with.
+ */
+vec3 waterNormal(vec2 q, float dist) {
+  float fade = exp(-dist * 0.030);
+  if (fade < 0.02) return vec3(0.0, 1.0, 0.0);
+
+  /* Wave vector carries the direction and the frequency together, so the
+     gradient of each term is just that vector times the cosine — the
+     same trick, and the same reason, as the hills. */
+  vec2 g = vec2(0.0), k;
+  k = vec2( 1.70,  0.60); g += k * (0.0300 * cos(dot(q, k) + uTime * 1.30));
+  k = vec2(-1.60,  2.35); g += k * (0.0140 * cos(dot(q, k) - uTime * 1.05));
+  k = vec2( 1.75, -4.70); g += k * (0.0045 * cos(dot(q, k) + uTime * 1.70));
+  k = vec2(-8.50, -2.10); g += k * (0.0012 * cos(dot(q, k) - uTime * 2.20));
+
+  return normalize(vec3(-g.x * fade, 1.0, -g.y * fade));
+}
+
+vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal,
+              out float snowOut) {
+  /* Reported back rather than recomputed by the caller. The shading needs
+     it too — snow's shaded side is lit almost entirely by the sky, which
+     is a change to the *fill* and not to the albedo — and snowCover is a
+     terrain evaluation plus three sines, which is not a thing to do twice
+     per pixel for an answer that was already on the stack. */
+  snowOut = 0.0;
+  /* Water.
+     Not simulated, not refracted. Two things sell a lake and this is
+     both of them: the shallows show the bed and the deeps do not, and
+     the surface is smooth enough that the reflection bounce main() was
+     already firing lands on it. The second one is why there is no
+     reflection code here — the water is simply the first surface in this
+     scene polished enough to use the one that already existed. */
+  if (mat > 2.5) {
+    metal = 0.0;
+    rough = 0.045;
+
+    float d = max(waterDepth(p.xz), 0.0);
+    // How far down you can see. The one number between a puddle and a
+    // lake, and the reason the shoreline needs no geometry: the bed
+    // fades out of view over the first half metre by itself.
+    float clarity = 1.0 - exp(-d * 2.1);
+
+    float bedRough;
+    // Wet, so darker than the same ground in air.
+    vec3 bed = groundAlbedo(p, bedRough) * 0.55;
+    vec3 deep = vec3(0.014, 0.043, 0.055);
+    return mix(bed, deep, clarity);
+  }
+
   if (mat > 1.5) {
     metal = 0.0;
-
-    /* Soil, once there is a meadow standing on it.
-       The grid is a reference surface — a ruled, faintly polished plane
-       that says where the floor is. Grass growing out of a ruled plane
-       reads as grass growing out of a diagram, and the polish is worse
-       than the ruling: a mirror finish between the blades throws the
-       cluster back up through the sward. So the ground under the cover
-       is rough, dark and mottled, and its job is to be the shadow
-       between the blades rather than a surface anyone looks at. */
-    if (uGround > 0.5) {
-      float broad = snoise(vec3(p.x * 0.42, 3.7, p.z * 0.42)) * 0.5 + 0.5;
-      float fine = snoise(vec3(p.x * 3.10, 8.1, p.z * 3.10)) * 0.5 + 0.5;
-      /* Green, not brown. There is no instance budget that puts a blade
-         over every square centimetre, so what shows between them has to
-         be the same colour as what is standing in it — a dark sward seen
-         from above, not the dirt underneath. Soil-coloured ground turns
-         a thin meadow into stubble on a ploughed field. */
-      vec3 soil = mix(vec3(0.016, 0.030, 0.011), vec3(0.046, 0.086, 0.026), broad);
-      rough = 0.94;
-      return soil * (0.82 + 0.36 * fine);
-    }
-
-    // floor: a faint grid that fades out with distance
-    vec2 g = abs(fract(p.xz * 0.5) - 0.5);
-    float line = 1.0 - smoothstep(0.0, 0.03, min(g.x, g.y));
-    float fade = exp(-length(p.xz) * 0.09);
-    rough = mix(0.42, 0.12, uFloorMix);
-    return mix(vec3(0.024, 0.026, 0.032), uTint * 0.6, line * fade * 0.5);
+    snowOut = snowCover(p.xz);
+    return groundAlbedo(p, rough);
   }
 
   // body: iridescent, driven by the angle between normal and view
@@ -298,13 +395,17 @@ vec3 shadeDirect(vec3 ro, vec3 rd, float t, float mat, bool lit,
   if (mat < 0.5) return sky(rd);
 
   vec3 p = pOut;
-  // The floor's normal is known in closed form; only the cluster needs
-  // four more field evaluations to find one.
-  vec3 n = mat > 1.5 ? vec3(0.0, 1.0, 0.0) : calcNormal(p);
+  /* The ground's normal comes out of the same sum of sines that gave its
+     height — the derivative of a sine is a cosine, so it is exact and it
+     is free. The water's comes out of four more of them, for the same
+     reason. Only the cluster needs four field evaluations to find one. */
+  vec3 n = mat > 2.5 ? waterNormal(p.xz, t)
+         : mat > 1.5 ? terrainNormal(p.xz)
+         : calcNormal(p);
   nOut = n;
 
-  float rough, metal;
-  vec3 albedo = material(p, n, mat, rough, metal);
+  float rough, metal, snow;
+  vec3 albedo = material(p, n, mat, rough, metal, snow);
   roughOut = rough;
 
   vec3 l = uLightDir;
@@ -332,7 +433,19 @@ vec3 shadeDirect(vec3 ro, vec3 rd, float t, float mat, bool lit,
   spec *= step(0.0001, ndl);
   float fresnel = pow(1.0 - max(dot(n, v), 0.0), 5.0);
 
-  vec3 col = albedo * (uTint * 2.3 * ndl * sh + vec3(0.10, 0.12, 0.16) * occ);
+  /* The fill, and the one place snow changes the *lighting* rather than
+     the surface.
+
+     Snow is bright because of what falls on it, and on its shaded side
+     almost all of that is the sky. Left on the meadow's own fill it comes
+     out as a flat pale surface with no blue anywhere in it — which is
+     sand, and was exactly what the first version photographed as. Lifting
+     the sky term where the snow is lying puts the lit faces warm from the
+     sun and the shaded ones blue from above, and that contrast is what
+     the eye is actually reading when it calls something snow. */
+  vec3 fill = uAmbient * mix(1.0, 3.4, snow);
+
+  vec3 col = albedo * (uTint * 2.3 * ndl * sh + fill * occ);
   col += uTint * spec * sh * 2.0;
   col += sky(reflect(rd, n)) * (0.06 + fresnel * 0.9) * occ;
 
@@ -343,14 +456,24 @@ vec3 shadeDirect(vec3 ro, vec3 rd, float t, float mat, bool lit,
 
 /* ═══ entry ═══════════════════════════════════════════════════════ */
 
-/** Nearest of the marched cluster and the analytic floor. */
+/**
+ * Nearest of the marched cluster, the marched ground and the water.
+ *
+ * The water is last and cheapest — one divide and one height sample —
+ * and it is resolved here rather than inside traceGround so that the
+ * ground march stays a function of the ground alone. A ray that crests a
+ * ridge before reaching the lake is handled by nothing more than this
+ * comparison: the hill came first, so the hill is what it hit.
+ */
 void trace(vec3 ro, vec3 rd, int steps, out float t, out float mat) {
   float tc = traceCluster(ro, rd, steps, 0.02);
-  float tf = traceFloor(ro, rd);
+  float tf = traceGround(ro, rd);
+  float tw = traceWater(ro, rd);
 
-  if (tc > 0.0 && (tf <= 0.0 || tc < tf)) { t = tc; mat = 1.0; return; }
-  if (tf > 0.0) { t = tf; mat = 2.0; return; }
   t = 0.0; mat = 0.0;
+  if (tc > 0.0)                          { t = tc; mat = 1.0; }
+  if (tf > 0.0 && (mat < 0.5 || tf < t)) { t = tf; mat = 2.0; }
+  if (tw > 0.0 && (mat < 0.5 || tw < t)) { t = tw; mat = 3.0; }
 }
 
 void main() {
@@ -564,7 +687,7 @@ export default {
   id: 'march',
   index: '03',
   title: 'SDF 光線行進',
-  tech: 'sphere tracing · analytic floor · bounded field · impact ripples',
+  tech: 'sphere tracing · bounded field · height-field ground · impact ripples',
   desc: '整個 3D 場景沒有任何一個頂點：一道 fragment shader 沿著射線走進隱式曲面。點擊星體或星環，被碰到的那一點會盪出漣漪。',
   glyph: '◈',
   hue: 62,
@@ -591,7 +714,25 @@ export default {
     { id: 'flash', type: 'slider', label: '閃光', min: 0, max: 3, step: 0.01, value: 1.0 },
 
     { group: '光線' },
+    { id: 'daylight', type: 'select', label: '天光', value: 'fixed',
+      options: [
+        { value: 'fixed', label: '固定' },
+        { value: 'hour', label: '指定時刻' },
+        { value: 'cycle', label: '自動循環' },
+      ] },
+    { id: 'hour', type: 'slider', label: '時刻', min: 0, max: 24, step: 0.05,
+      value: HOUR_DEFAULT, unit: 'h' },
     { id: 'light', type: 'xy', label: '光源方向', value: [0.68, 0.24] },
+    { id: 'hintDay', type: 'hint',
+      text: '**天光**說的是誰在管光源，因為「時刻」和「光源方向」是同一個問題的兩個答案，'
+        + '與其讓它們互相搶，不如直接講明白：'
+        + '**固定**＝方向盤說了算，和這個檔案存在之前一模一樣（舊的網址和參考截圖仍然成立）；'
+        + '**指定時刻**＝時刻滑桿說了算，方向盤變成過時的讀數；**自動循環**＝同上，而且時刻自己會走。'
+        + '三個狀態不是兩個開關，因為「方向盤在管」和「時鐘在管」不可能同時成立。'
+        + '一天 130 秒。太陽落下時月亮從對面升起——**兩者是同一道弧讀正讀反**，'
+        + '所以沒有第二顆天體要跟第一顆對齊；黃昏時換的只是那一個 `uLightDir` 指著誰，'
+        + '而換的瞬間兩者都在地平線上、方向項已經降到零，所以看不出來。'
+        + '低角度的太陽不只是變紅**也變暗**：只改色相的夕陽讀起來像一盞有顏色的燈。' },
     { id: 'tint', type: 'select', label: '光色', value: 'amber',
       options: [
         { value: 'amber', label: '琥珀' },
@@ -634,6 +775,39 @@ export default {
         { value: 'grid', label: '網格' },
         { value: 'grass', label: '草地' },
       ] },
+    { id: 'hills', type: 'slider', label: '地形起伏', min: 0, max: HILLS_MAX, step: 0.05, value: HILLS_DEFAULT, unit: 'u' },
+    { id: 'hintHills', type: 'hint',
+      text: '地面是一個高度場，不是一張貼圖：它有真的輪廓、真的背光面，'
+        + '而且**自己會投影**——把光源壓低，影子會被拉長掃過整片地。'
+        + '高度是幾個正弦的疊加，所以斜率有上界，'
+        + '射線可以用保守步長走過去而不是沿著地面爬——這就是起伏付得起真陰影的原因。'
+        + '原點附近是**平的**：星團懸在那裡、貓在那裡玩，兩者都是對著平地量出來的。'
+        + '拉到 0 就完全還原成原本那片平地。' },
+    { id: 'weather', type: 'select', label: '天氣', value: 'clear',
+      options: [
+        { value: 'clear', label: '晴' },
+        { value: 'rain', label: '雨' },
+        { value: 'snow', label: '雪' },
+      ] },
+    { id: 'hintWeather', type: 'hint',
+      text: '三選一，不是三支滑桿：雨把地弄濕、雪把地蓋白，'
+        + '一個能給你「一半雨加一半雪」的控制是沒有人能拿來問問題的控制。'
+        + '落下來的東西吃的是**草和花正在讀的同一個風場**——'
+        + '所以掃過草地的那陣風，和穿過它落下的那陣雨，是同一陣風。'
+        + '雪是**覆蓋率不是高度**：它按坡度衰減（陡坡留不住），'
+        + '並在靠近水面時收到零，否則岸邊會浮出一圈站在水上的白。'
+        + '刻意**不**去抬高地形——雪只有幾公分厚，在這個尺度下看不見，'
+        + '卻會把地面賴以被行進的斜率上界弄壞。' },
+    { id: 'water', type: 'switch', label: '湖', value: false },
+    { id: 'waterLevel', type: 'slider', label: '水位', min: 0, max: 1, step: 0.01, value: WATER_DEFAULT },
+    { id: 'hintWater', type: 'hint',
+      text: '水是**一個數字**：水面的高度。它是一個水平面，射線用一次除法就碰到它，'
+        + '不需要行進——而讓它讀起來像湖而不是蓋在世界上的一片玻璃的，'
+        + '是「只有當那一點底下的地更低才算命中」這一條，代價是一次高度取樣。'
+        + '所以**岸線不是畫出來的**：它就是地形跟水面相交的地方，'
+        + '拉「地形起伏」或拉「水位」它都會跟著動，而草、花、樹也用同一條規則決定自己有沒有被淹到。'
+        + '水位是**相對於起伏**的：0.5 在一公尺的丘陵和八公尺的丘陵都是「谷底積水一半」。'
+        + '地形起伏為 0 時沒有水——平地跟水面共面，誰在前面沒有穩定的答案。' },
     { id: 'cover', type: 'slider', label: '草的密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
     { id: 'flowers', type: 'switch', label: '花', value: false },
     { id: 'flowerClumps', type: 'slider', label: '花叢密度', min: 0.05, max: 1, step: 0.01, value: 0.62 },
@@ -643,6 +817,29 @@ export default {
     { id: 'trees', type: 'switch', label: '樹', value: false },
     { id: 'treeDensity', type: 'slider', label: '樹的密度', min: 0.1, max: 1, step: 0.01, value: 0.6 },
     { id: 'wind', type: 'slider', label: '風', min: 0, max: 1.4, step: 0.01, value: 0.55 },
+    { id: 'butterflies', type: 'slider', label: '蝴蝶', min: 0, max: 1, step: 0.01, value: 0 },
+    { id: 'fireflies', type: 'slider', label: '螢火蟲', min: 0, max: 1, step: 0.01, value: 0 },
+    { id: 'sparrowFlocks', type: 'slider', label: '麻雀群數', min: 0, max: 1, step: 0.01, value: 0 },
+    { id: 'sparrows', type: 'slider', label: '群體規模', min: 0, max: 1, step: 0.01, value: 0.7 },
+    { id: 'lifeRadius', type: 'slider', label: '生物視距',
+      min: CREATURE_REACH_MIN, max: CREATURE_REACH_MAX, step: 1,
+      value: CREATURE_REACH_DEFAULT, unit: 'u' },
+    { id: 'hintLife', type: 'hint',
+      text: '一種一支滑桿，不是一支「生物」總量——'
+        + '蝴蝶是白天看的，螢火蟲是把曝光壓下去才找得到的，'
+        + '一支滑桿沒辦法同時為兩者調對。'
+        + '兩者都問地面同樣的問題：**湖上不會有**，雪地上會變少——'
+        + '牠們知道岸線在哪，是因為高度場和水位只有一份答案，不是因為誰去告訴牠們。'
+        + '**蝴蝶就是兩片翅膀**，沒有身體：在牠佔到的像素數下，'
+        + '身體只是兩翅之間的一團暗色，而讀起來像蝴蝶的是兩個面交替接住又失去陽光的那個閃爍。'
+        + '牠是幾何，和草畫進同一個深度緩衝，所以草會擋在牠前面。'
+        + '**螢火蟲連翅膀都沒有**，牠是一個點：你看到的是光，而光是加上去的東西，不是會擋住東西的表面。'
+        + '**麻雀是第一個矇混不過去的**：認出一隻小雀的是輪廓——'
+        + '三分之一處最寬的胸、比胸小而且沒有脖子接上去的頭、後面一條長尾。'
+        + '所以牠的身體不是畫出來的，是一張**量出來的環表**（頭胸半徑比 0.64，真麻雀約 0.65，'
+        + '**1.0 以上就是童書插圖**）。九公分的身體、二十一公分翼展、五公分尾。'
+        + '牠 70 個三角形而蝴蝶只有 4 個——付得起只因為**牠們數量少**：'
+        + '一片草原有幾百隻蝴蝶和幾隻麻雀，整群加起來還不到草在一平方公尺上花的。' },
     { id: 'hintGround', type: 'hint',
       text: '草與花是三角形，不在距離場裡——它們和貓畫進同一張深度緩衝，'
         + '所以貓是站在草裡而不是站在草的圖片上。'
@@ -711,6 +908,8 @@ class MarchScene {
     this.meshRT = new Target(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR, depth: true });
     this.ground = new GroundCover(gl);
     this.trees = new Trees(gl);
+    this.precip = new Precipitation(gl);
+    this.creatures = new Creatures(gl);
 
     /* Loaded off the critical path: the scene renders from the first
        frame and the cat joins when its geometry arrives. A failure here
@@ -719,6 +918,9 @@ class MarchScene {
     this.catError = null;
     this._showCat = false;
     this._catView = false;
+    /** The ground's amplitude, refreshed every frame. Held because the
+        input handlers fire beams and have no state to read. */
+    this.hills = HILLS_DEFAULT;
     Cat.load(gl, new URL('./cat/cat.bin', import.meta.url).href)
       .then((cat) => { this.cat = cat; })
       .catch((err) => { this.catError = err; console.error('cat failed to load', err); });
@@ -731,7 +933,11 @@ class MarchScene {
        same point — the locked view circles the origin but aims a little
        above it — and in follow mode both chase the cat. */
     this._treeJitter = new Float32Array(2);
+    this._catXZ = new Float32Array(2);
     this.center = new Float32Array([0, 0, 0]);
+    /** The orbit centre in xz, for anything that must not move when
+        the view is merely turned. */
+    this._orbitXZ = new Float32Array(2);
     this.target = new Float32Array([0, 0.1, 0]);
     this.camMode = 'orbit';
     this.scale = 0;
@@ -748,6 +954,11 @@ class MarchScene {
       fwd: new Float32Array(3),
     };
     this.lightDir = new Float32Array([0.5, 0.6, 0.4]);
+    /** The scene's own hour, advanced by the simulation clock rather than
+        read from it — so pausing stops the sun and `.` steps it one frame
+        like everything else. */
+    this.hour = HOUR_DEFAULT;
+    this._hourShown = -1;
 
     /* ── the cluster, computed here and uploaded ── */
     this.ballPos = new Float32Array(BALL_N * 4);
@@ -1011,7 +1222,10 @@ class MarchScene {
       const cat = this.cat;
       // Chest height, so the camera looks at the animal and not at the
       // floor it is standing on.
-      const chest = FLOOR_Y + cat.footOffset + cat.header.bounds.max[1] * cat.scale * 0.55;
+      // Measured from the ground under the animal, not from a constant:
+      // on a slope the two differ by metres, and the camera would be
+      // aiming at the hillside beside it.
+      const chest = cat.floorY + cat.footOffset + cat.header.bounds.max[1] * cat.scale * 0.55;
       cx = ax = cat.x;
       cy0 = ay = chest;
       cz = az = cat.z;
@@ -1051,6 +1265,8 @@ class MarchScene {
     this.center[0] += (cx - this.center[0]) * k;
     this.center[1] += (cy0 - this.center[1]) * k;
     this.center[2] += (cz - this.center[2]) * k;
+    this._orbitXZ[0] = this.center[0];
+    this._orbitXZ[1] = this.center[2];
     this.target[0] += (ax - this.target[0]) * k;
     this.target[1] += (ay - this.target[1]) * k;
     this.target[2] += (az - this.target[2]) * k;
@@ -1068,9 +1284,15 @@ class MarchScene {
     pos[1] = this.center[1] + this.dist * sp + 0.35;
     pos[2] = this.center[2] + this.dist * cp * cyw;
 
-    // Never let the camera drop through the floor while chasing a cat
-    // that is, by definition, standing on it.
-    if (follow && pos[1] < FLOOR_Y + 0.3) pos[1] = FLOOR_Y + 0.3;
+    /* Never let the camera drop through the ground while chasing a cat
+       that is, by definition, standing on it. Against the hill under the
+       *camera*, not under the cat: swinging round a rising slope is
+       exactly when the two are furthest apart, and it is the ground the
+       lens is about to enter that matters. */
+    if (follow) {
+      const floor = terrainHeight(pos[0], pos[2], state.hills) + 0.3;
+      if (pos[1] < floor) pos[1] = floor;
+    }
 
     let fx = this.target[0] - pos[0], fy = this.target[1] - pos[1], fz = this.target[2] - pos[2];
     const fl = Math.hypot(fx, fy, fz) || 1;
@@ -1346,15 +1568,16 @@ class MarchScene {
    *
    * It is not stopped by the cluster: this beam bores, so it goes
    * through and out the far side, and the channel it opens is what lets
-   * it be seen doing so. The only thing that ends it is the floor, which
-   * is a plane and needs no searching.
+   * it be seen doing so. The only thing that ends it is the ground —
+   * which used to be a plane and needed no searching, and is now a height
+   * field marched by the JS half of terrain.js. The same conservative
+   * step the shader takes, so the beam stops on the hillside the eye can
+   * see it striking.
    */
   _beamReach(ox, oy, oz, dir) {
-    if (dir[1] < -1e-4) {
-      const toFloor = (FLOOR_Y - oy) / dir[1];
-      if (toFloor > 0) return Math.min(BEAM_REACH, toFloor);
-    }
-    return BEAM_REACH;
+    const t = traceTerrainJS(ox, oy, oz, dir[0], dir[1], dir[2],
+                             BEAM_REACH, this.hills);
+    return t > 0 ? t : BEAM_REACH;
   }
 
   /**
@@ -1697,6 +1920,12 @@ class MarchScene {
 
     const dt = Math.min(clock.dt, 1 / 30);
 
+    /* How high the ground stands, kept on the scene rather than passed
+       down. The pointer and key handlers fire a beam that has to stop
+       somewhere, and they have no state to read — the same reason
+       `_catView` and `_showCat` are stashed here. */
+    this.hills = state.hills;
+
     /* ── the cat ──
        Stepped before the camera, not after: a follow shot that reads
        last frame's position lags the animal it is following by exactly
@@ -1709,7 +1938,20 @@ class MarchScene {
        floor is made of and nothing else about the march. */
     const covered = isCovered(state.ground);
     const wooded = Boolean(state.trees);
-    const raster = showCat || covered || wooded;
+    /* Butterflies are geometry, so they are one more reason the raster
+       target has to be drawn and composited at all — turn every other
+       thing in it off and a meadow with butterflies still needs it. */
+    const flying = state.butterflies > 0
+      || (state.sparrows > 0 && state.sparrowFlocks > 0);
+    const raster = showCat || covered || wooded || flying;
+    /* The lake, resolved once. Three controls collapse into the one
+       number every pass is handed, for the same reason `hills` is: four
+       passes that each worked out their own water level would each be
+       standing on a different shore. */
+    const waterY = waterSurfaceY(state.water, state.waterLevel, state.hills);
+    /* And the weather, resolved to the two numbers anything downstream
+       actually reads. Past this line the name of the mode is gone. */
+    const weather = weatherOf(state.weather);
     /* The weapon belongs to the cat's own view. With the camera locked
        on the cluster you are watching it, not being it, and a click
        there means what it always meant: strike the surface. Read by the
@@ -1723,7 +1965,7 @@ class MarchScene {
       // Last frame's basis, deliberately: the camera has not been moved
       // yet this frame, and steering off the picture the user is
       // actually looking at is both correct and one less feedback path.
-      this.cat.update(dt, FLOOR_Y, this.basis);
+      this.cat.update(dt, state.hills, this.basis);
     } else if (this.cat) {
       this.cat.releaseKeys();                   // or it resumes mid-stride
     }
@@ -1735,14 +1977,56 @@ class MarchScene {
     // blinking, not just walking.
     if (showCat && this.cat.animating) this.moving = 1;
 
-    // XY pad → hemisphere direction.
-    const az = (state.light[0] - 0.5) * Math.PI * 2.2;
-    const el = (1 - state.light[1]) * 1.35 + 0.05;
-    this.lightDir[0] = Math.cos(el) * Math.sin(az);
-    this.lightDir[1] = Math.sin(el);
-    this.lightDir[2] = Math.cos(el) * Math.cos(az);
+    /* The light, from whichever control the mode put in charge.
 
-    const tint = TINTS[state.tint] || TINTS.amber;
+       The hour is advanced here rather than read off the clock, because
+       the clock can be paused and stepped a frame at a time and the sun
+       has to do the same — a scene that keeps turning while it is frozen
+       is a scene whose reference shot is not reproducible. */
+    const timed = hourDrives(state.daylight);
+    if (state.daylight === 'cycle') {
+      this.hour = advanceHour(this.hour, clock.dt);
+      /* Written back into the slider, so the control reads the time it
+         is producing rather than sitting at whatever it was left at.
+         Throttled: at sixty frames a second a slider redrawn every frame
+         is a slider nobody can grab, and the hour moves 0.18 of an hour
+         in the quarter second between writes. */
+      if (clock.time - this._hourShown > 0.25) {
+        this._hourShown = clock.time;
+        this.ctx.setParams({ hour: Math.round(this.hour * 20) / 20 });
+      }
+    } else if (timed) {
+      this.hour = state.hour;
+    }
+
+    let tint = TINTS[state.tint] || TINTS.amber;
+    let day = 1;
+    let ambient = AMBIENT_FIXED;
+
+    if (timed) {
+      const sky = skyAt(this.hour);
+      this.lightDir.set(sky.dir);
+      day = sky.day;
+      ambient = sky.ambient;
+      /* The tint control still says which hue the light leans; the hour
+         says how strong it is and how far toward the horizon its colour
+         has been pushed. Multiplied rather than replaced, so "amber at
+         dawn" and "ice at dawn" stay two different scenes — and so that
+         every surface already multiplying by uTint gets a time of day
+         without a single shader learning that there is one. */
+      tint = [
+        tint[0] * sky.tint[0],
+        tint[1] * sky.tint[1],
+        tint[2] * sky.tint[2],
+      ];
+    } else {
+      // XY pad → hemisphere direction.
+      const az = (state.light[0] - 0.5) * Math.PI * 2.2;
+      const el = (1 - state.light[1]) * 1.35 + 0.05;
+      this.lightDir[0] = Math.cos(el) * Math.sin(az);
+      this.lightDir[1] = Math.sin(el);
+      this.lightDir[2] = Math.cos(el) * Math.cos(az);
+    }
 
     this._updateBalls(state, clock.time);
 
@@ -1797,6 +2081,8 @@ class MarchScene {
       density: state.treeDensity,
       radius: state.coverRadius,
       wind: state.wind,
+      hills: state.hills,
+      waterY,
     });
 
     BLEND.none(gl);
@@ -1814,8 +2100,14 @@ class MarchScene {
       uRough: state.rough,
       uFloorMix: 0.6,
       uGround: covered ? 1 : 0,
+      uHills: state.hills,
+      uWaterY: waterY,
+      uRain: weather.rain,
+      uSnow: weather.snow,
       uLightDir: this.lightDir,
       uTint: tint,
+      uDay: day,
+      uAmbient: ambient,
       uReflect: state.reflect,
       uFog: fog,
       uAO: state.ao,
@@ -1885,7 +2177,24 @@ class MarchScene {
       const env = {
         dir: this.lightDir,
         tint,
+        /* How much daylight is in the sky. Every pass here draws sky
+           somewhere — into its fog, or into a leaf's rim — so every one
+           of them has to be told what time it is, or the meadow fogs out
+           into a daytime horizon under a night sky. */
+        day,
+        ambient,
         fog,
+        /* The ground itself. Every pass drawn into this target puts
+           something on it — the cat's feet, the grass's roots, the
+           trees' trunks — and they are only on the same ground because
+           they are handed the same number. */
+        hills: state.hills,
+        /* And where the water on it stands — for the same reason and
+           with the same consequence: the grass, the flowers and the
+           trees decide whether a seed drowned by asking this. */
+        waterY,
+        /* And the weather on both, for the same reason a third time. */
+        weather,
         shadowSoft: state.shadow,
         // The same budget the marcher spends. A shadow that converges
         // differently is a differently shaped shadow.
@@ -1918,7 +2227,11 @@ class MarchScene {
       };
 
       const frame = this.frameCount++;
-      if (showCat) this.cat.draw(camera, env, frame);
+      if (showCat) {
+        this._catXZ[0] = this.cat.x;
+        this._catXZ[1] = this.cat.z;
+        this.cat.draw(camera, env, frame);
+      }
       this.ground.draw(camera, env, {
         style: state.ground,
         density: state.cover,
@@ -1941,6 +2254,71 @@ class MarchScene {
         wind: state.wind,
         jitter: this._treeJitter,
       });
+
+      /* And whatever is flying over it — last into this target, because
+         a butterfly is the smallest thing in it and the depth buffer is
+         already carrying everything it has to get behind.
+
+         The trees' jitter, not a third one. Everything drawn here is
+         resolved by one temporal filter, and a pass jittered by a
+         different amount is a pass the filter never converges on. */
+      const flyVerts = this.creatures.drawFlies(camera, env, {
+        density: state.butterflies,
+        reach: state.lifeRadius,
+        wind: state.wind,
+        jitter: this._treeJitter,
+        /* The same two numbers the sowing was handed, so the flight
+           circles the clumps that were actually grown. Passing the
+           control rather than a copy is the whole point: move the flower
+           density and the butterflies move with it. */
+        flowers: Boolean(state.flowers),
+        clumpChance: Math.max(0, Math.min(1, state.flowerClumps)),
+        clumpSpread: Math.max(0.05, state.flowerSpread),
+      });
+      /* Each draw follows its own bind immediately. Both creature passes
+         end with the programme they are about to use already current, so
+         calling them both and then drawing twice would draw the
+         butterflies with the sparrow's shader. */
+      if (flyVerts) {
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LESS);
+        gl.depthMask(true);
+        // Both faces of a wing are the wing, exactly as with a blade.
+        gl.disable(gl.CULL_FACE);
+        empty.drawTriangles(flyVerts);
+      }
+
+      const birdVerts = this.creatures.drawBirds(camera, env, {
+        density: state.sparrows,
+        flocks: state.sparrowFlocks,
+        reach: state.lifeRadius,
+        /* The pass index is a function of the clock, and without it every
+           flock flies one frozen line for ever. */
+        time: clock.time,
+        wind: state.wind,
+        jitter: this._treeJitter,
+        /* The wood, so the birds can sit in it. Handed the object rather
+           than a list, because what they want is the nearest few crowns
+           to wherever the eye is now and only the wood knows that. */
+        trees: wooded ? this.trees : null,
+        hills: state.hills,
+        waterY,
+        snow: weather.snow,
+        /* Where the cat is, for the one thing it does to a flock. Null
+           when there is no cat, which is also "nothing to run from". */
+        cat: showCat ? this._catXZ : null,
+      });
+      if (birdVerts) {
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LESS);
+        gl.depthMask(true);
+        /* A bird's body is a closed tube, so its far side is behind its
+           near side and culling would save nothing — and the wings and
+           the tail are single-sided sheets that have to be visible from
+           underneath, which is most of where a bird is seen from. */
+        gl.disable(gl.CULL_FACE);
+        empty.drawTriangles(birdVerts);
+      }
     }
 
     // Temporal blend is dialled back while anything moves, or the jitter
@@ -1983,6 +2361,62 @@ class MarchScene {
       BLEND.none(gl);
     }
 
+    /* Whatever is falling, over the resolved image and additive like the
+       flares — and before the beams, because a shot fired through rain
+       should be the brighter of the two.
+
+       Deliberately outside the temporal filter. Everything in this
+       target that is worth accumulating is worth accumulating because it
+       is standing still; a raindrop crosses the frame in a fifth of a
+       second, and the filter's answer to that is a grey smear where the
+       weather was. */
+    {
+      const camera = {
+        pos: this.basis.pos,
+        right: this.basis.right,
+        up: this.basis.up,
+        fwd: this.basis.fwd,
+        focal: 1.5,
+        aspect: this.width / Math.max(this.height, 1),
+      };
+      const verts = this.precip.draw(camera, {
+        weather,
+        time: clock.time,
+        wind: state.wind,
+        scene: this.rt.texture,
+        mesh: this.meshRT.texture,
+        meshOn: raster,
+        resolution: [this.width, this.height],
+      });
+      if (verts) {
+        BLEND.additive(gl);
+        empty.drawTriangles(verts);
+        BLEND.none(gl);
+      }
+
+      /* And the fireflies, which are here for the same reason the rain
+         is and not for the same reason the butterflies are: a glow is
+         something added to the image, not a surface that occludes one.
+         They still hide behind the scene's published depth, so a lit one
+         behind a trunk stays behind it. */
+      const glowVerts = this.creatures.drawGlow(camera, {
+        density: state.fireflies,
+        reach: state.lifeRadius,
+        time: clock.time,
+        hills: state.hills,
+        waterY,
+        scene: this.rt.texture,
+        mesh: this.meshRT.texture,
+        meshOn: raster,
+        resolution: [this.width, this.height],
+      });
+      if (glowVerts) {
+        BLEND.additive(gl);
+        empty.drawTriangles(glowVerts);
+        BLEND.none(gl);
+      }
+    }
+
     /* The beams, over the resolved image and additive like the flares.
        They read the same depth channel, so a beam ends at the surface it
        strikes instead of being painted across it. */
@@ -2016,6 +2450,21 @@ class MarchScene {
     if (this.trees.triangles) {
       parts.push(`樹：${this.trees.trees} 棵 / ${this.trees.triangles.toLocaleString()} 三角形`);
     }
+    /* Counted, and counted separately, because the whole claim about the
+       butterflies is that one costs four triangles — a claim nobody
+       should have to take on trust. The fireflies have none: that is the
+       claim about them. */
+    if (this.creatures.butterflies) {
+      parts.push(`蝴蝶：${this.creatures.butterflies} 隻 / `
+        + `${this.creatures.triangles.toLocaleString()} 三角形`);
+    }
+    if (this.creatures.sparrows) {
+      parts.push(`麻雀：${this.creatures.sparrows} 隻`);
+    }
+    if (this.creatures.fireflies) {
+      parts.push(`螢火蟲：${this.creatures.fireflies} 點`);
+    }
+    if (this.precip.drops) parts.push(`天氣：${this.precip.drops.toLocaleString()} 顆`);
     const geometry = parts.length ? `場：0 頂點 · ${parts.join(' · ')}` : '0 頂點 · 0 三角形';
 
     const out = {
@@ -2056,6 +2505,8 @@ class MarchScene {
     this.meshRT.dispose();
     this.ground.dispose();
     this.trees.dispose();
+    this.precip.dispose();
+    this.creatures.dispose();
     this.history.dispose();
     this.cat?.dispose();
   }

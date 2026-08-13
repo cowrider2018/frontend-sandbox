@@ -43,7 +43,10 @@ import {
   CLUSTER_UNIFORMS, CLUSTER_FIELD, CLUSTER_LAYERS, CLUSTER_SHADOW, SKY,
 } from './cluster.js';
 import { CAT_PROXY_GLSL } from './cat/index.js';
-import { PLANT_COMMON, FRAG_PLANT } from './plant.js';
+import { PLANT_COMMON, FRAG_PLANT, plantUniforms } from './plant.js';
+import { terrainHeight, waterDepthAt } from './terrain.js';
+import { snowCoverAt } from './weather.js';
+import { CLUMP_CELL, CLUMP_R_MIN, CLUMP_R_MAX, seed } from './clumps.js';
 
 /* ── the grid ─────────────────────────────────────────────────────
    How far the cover reaches is a control, because the two things people
@@ -117,8 +120,13 @@ function coverPlan(reach) {
    Flowers are placed by clump, not by blade. A clump cell either grows
    one or it does not, and the flowers inside it thin out toward its rim,
    so what comes out is a dense middle with singles scattered round it
-   rather than a disc with an edge. */
-const CLUMP_CELL = 4.0;
+   rather than a disc with an edge.
+
+   The grid itself lives in clumps.js now, because the butterflies read
+   it too. A flight aimed at a second, private scatter would circle bare
+   grass a few metres from the flowers, and a near miss is far more
+   visible than no aim at all — the eye notices the gap, and never
+   notices an absence. */
 
 /* Flowers stop well short of where the grass does. A blade at the rim
    still counts, because what it contributes there is the *colour* of
@@ -141,11 +149,10 @@ const FLOWER_MAX = 60.0;
 const CLUMP_CHANCE = 0.62;
 /** Flower slots per clump at full density; the thinning eats about 30%. */
 const MAX_PER_CLUMP = 30;
-/* How wide a clump is, before the spread control scales it. Wound right
-   up, clumps overlap into a continuous scatter, which is a legitimate
-   thing to want and the reason the control's range runs past 1. */
-const CLUMP_R_MIN = 0.40;
-const CLUMP_R_MAX = 1.50;
+/* How wide a clump is before the spread control scales it — in clumps.js
+   with the rest of the grid. Wound right up, clumps overlap into a
+   continuous scatter, which is a legitimate thing to want and the reason
+   the control's range runs past 1. */
 /** Ceiling on the placement buffer. Comfortably above the widest reach. */
 const MAX_FLOWERS = 12288;
 /** Floats per flower in that buffer; see the attribute layout below. */
@@ -291,6 +298,33 @@ void main() {
      they do not wink out; they shorten into the ground, and the last
      thing to go is the thing that was already the least visible. */
   float rim = 1.0 - smoothstep(uRadius * 0.72, uRadius, length(base - uViewer));
+
+  /* And the shore. Grass drowns, and it drowns the same way it fades at
+     the rim: by shortening into the ground rather than winking out.
+     A hard cull at the waterline would be a hard cull at a line nobody
+     drew — the shore is wherever the hills happen to cross the surface,
+     so it wanders across the cells at whatever angle it likes, and a
+     binary test would show every one of those cells as a stair. Twelve
+     centimetres of taper turns the same information into a fringe of
+     short grass standing in the shallows, which is what a lake edge
+     looks like anyway.
+
+     Multiplied into the same factor rather than tested separately, so a
+     blade that is both far and wet gets the smaller of the two and the
+     cull below keeps working unchanged. */
+  rim *= 1.0 - smoothstep(0.0, 0.12, waterDepth(base));
+
+  /* And the snow. A drift does not shorten a blade, it hides the bottom
+     of one — but a blade is drawn upward from its root, so on this
+     geometry those are the same edit, and the third factor goes into the
+     same product as the other two.
+
+     Not all the way to zero at full cover. What reads as a snowed-over
+     meadow is not a blank white plain; it is stubble showing through,
+     thinning as the drifts deepen, which is also what the mottle in
+     snowCover is for. */
+  float snow = snowCover(base);
+  rim *= 1.0 - snow * 0.78;
   if (rim <= 0.002) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
 
   float height = BLADE_H * mix(0.55, 1.20, h1.z) * rim;
@@ -328,7 +362,14 @@ void main() {
   vec2 bendDir = normalize(own * lean + WIND_DIR * push);
   float bend = min(lean + push * 1.15, 1.35);
 
-  vec3 root = vec3(base.x, FLOOR_Y, base.y);
+  /* The ground came up to meet it. A blade still grows straight up —
+     grass grows against gravity, not out of the slope — but where it
+     starts and which way the sward it belongs to is facing both come
+     from the height field. */
+  vec2 slope;
+  vec3 root = vec3(base.x, terrainAt(base, slope), base.y);
+  vec3 sward = normalize(vec3(-slope.x, 1.0, -slope.y));
+
   vec3 tangent;
   vec3 p = stalk(root, height, f, bendDir, bend, tangent);
 
@@ -342,10 +383,17 @@ void main() {
      across the width, and a blade lit from both sides at once flickers.
      The curl is applied after and keeps its own sense either way — it
      splays outward from the centreline, which is not a handedness. */
+  /* Biased toward the *hill's* normal, not toward straight up. On flat
+     ground the two are the same and nothing changes; on a slope they are
+     not, and a sward that keeps facing the sky while the soil it grows
+     out of turns away from the sun is how a hillside ends up with lit
+     grass standing on dark earth. The soil is shaded by the marcher and
+     the grass by this shader — they only agree because both read the
+     same gradient. */
   vec3 face = normalize(cross(across, tangent));
   float sgn = dot(face, uCamPos - root) < 0.0 ? -1.0 : 1.0;
   vec3 n = normalize(face * sgn + across * (side * BLADE_CURL)
-                   + vec3(0.0, SWARD_BIAS, 0.0));
+                   + sward * SWARD_BIAS);
 
   /* Shaded from one point half-way up, not from this vertex. The shadow
      is the expensive term and it cannot resolve a blade anyway, so
@@ -358,6 +406,14 @@ void main() {
   vec3 albedo = mix(GRASS_ROOT, GRASS_TIP, f);
   albedo = mix(albedo, GRASS_DRY, dry * f);
   albedo *= mix(0.80, 1.20, h1.z);
+
+  /* The blade takes the weather the soil under it took, out of the same
+     function — a rained-on meadow whose grass stayed bright over dark
+     wet ground is the specific wrongness this prevents. Snow is fed in
+     at a fraction of the ground's: what is left standing above a drift
+     is the part the snow did not reach. */
+  float bladeRough = 0.9;
+  albedo = weatherSurface(albedo, snow * 0.35, bladeRough);
 
   emit(p, shadeBlade(n, albedo, sun, mix(0.50, 1.05, f), TRANSMIT));
 }
@@ -425,7 +481,15 @@ void main() {
   vec2 bendDir = normalize(own * lean + WIND_DIR * push);
   float bend = min(lean + push, 1.05);
 
-  vec3 root = vec3(pos.x, FLOOR_Y, pos.y);
+  /* Sown on the CPU, but only in xz — the height is looked up here.
+     Deliberately: the sowing runs once every few metres walked and the
+     ground under a flower never changes, so storing it would be one more
+     float per record and one more thing that can disagree with the
+     shader that draws the soil. */
+  vec2 slope;
+  vec3 root = vec3(pos.x, terrainAt(pos, slope), pos.y);
+  vec3 sward = normalize(vec3(-slope.x, 1.0, -slope.y));
+
   vec2 perp = vec2(-bendDir.y, bendDir.x);
   vec3 across = vec3(perp.x, 0.0, perp.y);
 
@@ -450,7 +514,7 @@ void main() {
     vec3 face = normalize(cross(across, tangent));
     float sgn = dot(face, uCamPos - root) < 0.0 ? -1.0 : 1.0;
     n = normalize(face * sgn + across * (side * 0.9)
-               + vec3(0.0, SWARD_BIAS * 0.5, 0.0));
+               + sward * (SWARD_BIAS * 0.5));
     albedo = STEM_COL;
     occ = mix(0.55, 1.05, f);
   } else {
@@ -557,15 +621,6 @@ function cellOrder(span) {
   return o;
 }
 
-function seed(ix, iz, k) {
-  let h = Math.imul(ix | 0, 0x27d4eb2d) ^ Math.imul(iz | 0, 0x165667b1)
-        ^ Math.imul(k | 0, 0x9e3779b1);
-  h ^= h >>> 15; h = Math.imul(h, 0x2c1b3c6d);
-  h ^= h >>> 12; h = Math.imul(h, 0x297a2d39);
-  h ^= h >>> 15;
-  return (h >>> 0) / 4294967296;
-}
-
 /** A clump is one species, so the colour is drawn once per clump. */
 const PETAL_COLOURS = [
   [0.780, 0.760, 0.700],   // white
@@ -630,8 +685,22 @@ export class GroundCover {
    * Fill the instance buffer with every flower within reach of a snapped
    * origin, and upload it. Called only when that origin, the clump size
    * or the density changes.
+   *
+   * The drowned ones are dropped here rather than shortened away in the
+   * shader as the grass is, and the asymmetry is the difference between
+   * where the two are placed. A blade's position is derived in the vertex
+   * shader from the cell it stands in, so there is no earlier moment at
+   * which it could be left out; a flower is sown on the CPU, so a flower
+   * in the lake is an instance record, a draw and a stem's worth of
+   * triangles that can simply never be written. The taper the grass gets
+   * is also the wrong look here — a flower is one object, and half a
+   * flower standing in the water is a flower cut in half.
    */
-  _sow(originX, originZ, clumpCell, perClump, reach, chance, spread) {
+  _sow(originX, originZ, clumpCell, perClump, reach, chance, spread,
+       hills, surfaceY, snow) {
+    /* Scratch for the slope the snow cover needs, hoisted out of a loop
+       that runs tens of thousands of times. */
+    const grad = this._grad || (this._grad = [0, 0]);
     const buf = this._sown;
     /* One cell of margin past the reach: the fade is measured from where
        the eye is now, which can be half a cell beyond the origin this was
@@ -681,6 +750,23 @@ export class GroundCover {
 
           const rx = x - originX, rz = z - originZ;
           if (rx * rx + rz * rz > limit) continue;
+
+          // Drowned. Tested per flower and not per clump: a clump that
+          // straddles the shore should lose the half that is in the
+          // water, not all of itself or none of it.
+          if (waterDepthAt(x, z, hills, surfaceY) > 0) continue;
+
+          /* And buried. A threshold rather than the taper the grass
+             gets, for the same reason the drowning is: a flower is one
+             object, and the top half of one sticking out of a drift is
+             a flower with its stem cut off. The line sits well short of
+             full cover, so the blooms go first from the deep drifts and
+             last from the scoured patches — which is where the mottle
+             in snowCover finally shows up as something other than a
+             shade of white. */
+          if (snowCoverAt(x, z, hills, surfaceY, snow, terrainHeight, grad) > 0.45) {
+            continue;
+          }
 
           const o = n * FLOWER_STRIDE;
           buf[o] = x;
@@ -758,14 +844,10 @@ export class GroundCover {
     const density = Math.max(0, Math.min(1, opts.density));
     const layers = Math.max(1, Math.round(density * MAX_LAYERS));
 
+    /* Everything every plant needs, from the one place that knows what
+       that is, plus the rings — which are this pass's alone. */
     const common = {
-      uCamPos: camera.pos,
-      uRight: camera.right,
-      uUp: camera.up,
-      uFwd: camera.fwd,
-      uFocal: camera.focal,
-      uAspect: camera.aspect,
-      uJitter: this._jitter,
+      ...plantUniforms(camera, env, { wind: opts.wind, jitter: this._jitter }),
 
       uViewer: this._viewer,
       uRadius: radius,
@@ -774,40 +856,6 @@ export class GroundCover {
       uLayers: layers,
       uRings: rings,
       uRingStep: step,
-      uWind: opts.wind,
-      uFog: env.fog,
-
-      uLightDir: env.dir,
-      uTint: env.tint,
-      uShadowSoft: env.shadowSoft,
-      uShadowSteps: env.shadowSteps,
-      uShadowNoise: env.shadowNoise,
-
-      // The cluster, exactly as the marcher sees it this frame, so the
-      // shadow it throws across the grass is the shadow it throws.
-      uTime: env.time,
-      uBlend: env.blend,
-      uBallPos: env.ballPos,
-      uBalls: env.balls,
-      uBound: env.bound,
-      uRipples: env.ripples,
-      uRippleTo: env.rippleTo,
-      uRippleOn: env.rippleOn,
-      uRippleAmp: env.rippleAmp,
-      uRippleSpeed: env.rippleSpeed,
-      uRippleFreq: env.rippleFreq,
-      uRippleTight: 5.0,
-      uErode: env.erode,
-      uDisplace: env.displace,
-
-      // And the cat, so it casts one too.
-      uCatCapA: env.catCapA,
-      uCatCapB: env.catCapB,
-      uCatBound: env.catBound,
-      uCatCaps: env.catCaps,
-
-      // And the wood, so a blade standing under a tree is in its shade.
-      ...env.canopy,
     };
 
     gl.enable(gl.DEPTH_TEST);
@@ -876,9 +924,18 @@ export class GroundCover {
       const ox = Math.round(this._patch[0] / clumpCell) * clumpCell;
       const oz = Math.round(this._patch[1] / clumpCell) * clumpCell;
       const key = `${ox}|${oz}|${clumpCell.toFixed(4)}|${perClump}`
-        + `|${chance.toFixed(3)}|${spread.toFixed(3)}|${reach.toFixed(3)}`;
+        + `|${chance.toFixed(3)}|${spread.toFixed(3)}|${reach.toFixed(3)}`
+        /* The ground and the water on it are part of the answer now:
+           raise the hills or the level and a different set of flowers
+           has drowned, which is a different buffer and not merely a
+           different way of drawing the same one. */
+        + `|${env.hills.toFixed(3)}|${env.waterY.toFixed(3)}`
+        // And the snow, which buries a different set of them.
+        + `|${env.weather.snow.toFixed(3)}`;
       if (key !== this._sowKey) {
-        this.flowers = this._sow(ox, oz, clumpCell, perClump, reach, chance, spread);
+        this.flowers = this._sow(ox, oz, clumpCell, perClump, reach, chance,
+                                 spread, env.hills, env.waterY,
+                                 env.weather.snow);
         this._sowKey = key;
       }
 

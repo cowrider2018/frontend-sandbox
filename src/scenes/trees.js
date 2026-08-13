@@ -39,6 +39,7 @@ import {
 } from './cluster.js';
 import { CAT_PROXY_GLSL } from './cat/index.js';
 import { PLANT_COMMON, FRAG_PLANT } from './plant.js';
+import { TERRAIN_GLSL, waterDepthAt } from './terrain.js';
 import { WIND_GLSL } from './wind.js';
 import { CANOPY_SHADE_GLSL, CANOPY_EXTENT, CANOPY_SIZE } from './canopy.js';
 
@@ -462,6 +463,17 @@ vec3 sway(vec3 rest, vec2 base, float flex, float phase) {
   float h = max(rest.y - FLOOR_Y, 0.0);
   vec2 perp = vec2(-WIND_DIR.y, WIND_DIR.x);
 
+  /* A tree is grown against a flat floor on the CPU and lifted onto the
+     ground here, by the height under its own trunk.
+     Deliberately not baked into the vertices. Chunks are generated once
+     and cached, so baking would mean regrowing the entire wood every
+     time the undulation control moves — and the trunk's xz is already an
+     attribute, because the wind needed it, so the lookup is four sines
+     and no new data. It also keeps a tree vertical on a slope, which is
+     what a tree does: they grow toward the light, not perpendicular to
+     the hill. */
+  float lift = terrainH(base) - FLOOR_Y;
+
   // The whole tree leaning, growing as the square of the height.
   vec2 d = WIND_DIR * (slowGust(base) * uWind * TRUNK_BEND * h * h);
 
@@ -471,7 +483,7 @@ vec3 sway(vec3 rest, vec2 base, float flex, float phase) {
   d += WIND_DIR * (sin(uTime * 2.10 + phase) * s);
   d += perp * (cos(uTime * 1.63 + phase * 1.3) * s * 0.45);
 
-  return rest + vec3(d.x, 0.0, d.y);
+  return rest + vec3(d.x, lift, d.y);
 }
 `;
 
@@ -650,7 +662,22 @@ void main() {
      upside down. */
   float occ = mix(0.55, 1.05, along);
   vec3 lit = normalize(n + vec3(0.0, SWARD_BIAS * 0.55, 0.0));
-  emit(p, shadeBlade(lit, aTint.rgb, sun, occ, TRANSMIT));
+
+  /* The weather, from the cover lying on the ground the tree is standing
+     on. A proxy, and an honest one: snow settles on a canopy roughly
+     where it settles under it, and the alternative — asking each of four
+     hundred leaves per tree which way it happens to be facing — buys a
+     difference nobody can see from under the branches. Fed in at a
+     fraction, because a canopy sheds most of what lands on it, and only
+     the leaves facing up hold any of it.
+
+     Without this the wood stays in full summer green in the middle of a
+     snowfield, which is the one thing in the frame that says the weather
+     is a coat of paint on the ground rather than a thing that happened
+     to the meadow. */
+  float leafRough = 0.85;
+  vec3 albedo = weatherSurface(aTint.rgb, snowCover(aLeaf.xz) * 0.55, leafRough);
+  emit(p, shadeBlade(lit, albedo, sun, occ, TRANSMIT));
 }
 `;
 
@@ -670,6 +697,11 @@ ${CONSTANTS}
 ${HASH}
 uniform float uTime, uWind;
 ${WIND_GLSL}
+/* The sun's pass reads the ground for the same reason the camera's does:
+   the trees are lifted onto it in the vertex shader, and a shadow map
+   drawn from trees still standing on the old flat floor would put every
+   shadow in the wrong place on a slope. */
+${TERRAIN_GLSL}
 ${TREE_SWAY}
 
 uniform vec3  uCanopyX, uCanopyY, uCanopyC, uLightDir;
@@ -760,7 +792,10 @@ export class Trees {
     this.triangles = 0;
     this.chunk = CHUNK;
     this.reach = TREE_REACH_MIN;
-    this._density = -1;
+    /** What the cached chunks were grown against: density, hills and
+        water level. Any of the three moving means every chunk is wrong,
+        not merely repacked. */
+    this._shape = null;
     this._viewer = new Float32Array(2);
     /** Canopies of the live trees, for whatever wants to cast their
         shadow. Filled by the pack. */
@@ -841,7 +876,7 @@ export class Trees {
    * fraction of a texel each frame and every shadow edge in the scene
    * crawls.
    */
-  _renderMap(gl, light, camPos, time, wind) {
+  _renderMap(gl, light, camPos, time, wind, hills, waterY) {
     const cx = camPos[0], cz = camPos[2];
     // A frame perpendicular to the light. The reference axis is swapped
     // near the poles, where the obvious one is parallel to the light and
@@ -872,7 +907,11 @@ export class Trees {
          With the wind off it goes back to being redrawn only when the
          ground under it moves, which is the cheap case and the common
          one. */
-      + `|${this.packs}|${wind > 0.001 ? time.toFixed(2) : 'calm'}`;
+      /* And the ground, because the trees are lifted onto it in the
+         vertex shader: raise the hills and every trunk in the map moves
+         without a single instance record changing. */
+      + `|${this.packs}|${hills.toFixed(3)}`
+      + `|${wind > 0.001 ? time.toFixed(2) : 'calm'}`;
     if (key === this._mapKey) return;
     this._mapKey = key;
 
@@ -886,6 +925,8 @@ export class Trees {
       uCamPos: camPos,
       uTime: time,
       uWind: wind,
+      uHills: hills,
+      uWaterY: waterY,
     };
 
     this.map.bind();
@@ -933,7 +974,7 @@ export class Trees {
    * neighbours — which is the only reason chunks can be generated in any
    * order and dropped independently.
    */
-  _growChunk(ix, iz, density) {
+  _growChunk(ix, iz, density, hills, waterY) {
     /* Sized for the chunk's own hard cap — SUB*SUB trees, each bounded by
        the recursion — so growing can never outrun the array and never has
        to reallocate half way down a branch. */
@@ -959,6 +1000,16 @@ export class Trees {
         // The clearing. Measured before anything is grown, so a rejected
         // tree costs one hypot.
         if (x * x + z * z < CLEAR_R * CLEAR_R) continue;
+
+        /* And the lake, in the same place and for the same reason: a
+           drowned tree is rejected for four sines instead of a whole
+           recursion, a hundred and sixty segments and four hundred
+           leaves. The test is the bare one — no margin, no shoreline
+           band — because a trunk standing at the waterline is what the
+           edge of a wood by a lake actually looks like, and a margin
+           would be a second, invisible shoreline to keep in step with
+           the real one. */
+        if (waterDepthAt(x, z, hills, waterY) > 0) continue;
 
         const before = { segs: out.segN, leaves: out.leafN };
         const canopy = growTree(out, rngFor(ix * SUB + sx, iz * SUB + sz, k), x, z);
@@ -988,7 +1039,7 @@ export class Trees {
   }
 
   /** Make sure every chunk within reach exists, then pack the live ones. */
-  _ensure(cx, cz, density, reach) {
+  _ensure(cx, cz, density, reach, hills, waterY) {
     /* One chunk of margin past the reach, so the far edge of what has
        been grown is always beyond the far edge of what can be seen. */
     const span = Math.ceil((reach + CHUNK) / CHUNK);
@@ -1001,12 +1052,19 @@ export class Trees {
        do four times as often as growing, and far cheaper than a draw
        call per chunk, which was the alternative. */
     const key = `${ix0}|${iz0}|${density.toFixed(3)}|${reach.toFixed(1)}`
-      + `|${Math.round(cx / LOD_STEP)}|${Math.round(cz / LOD_STEP)}`;
+      + `|${Math.round(cx / LOD_STEP)}|${Math.round(cz / LOD_STEP)}`
+      // The ground and the water on it decide which trees exist at all.
+      + `|${hills.toFixed(3)}|${waterY.toFixed(3)}`;
     if (key === this._key) return;
     this._key = key;
 
-    // A density change invalidates every chunk; a step does not.
-    if (this._density !== density) { this.cache.clear(); this._density = density; }
+    /* A density change invalidates every chunk; a step does not. So does
+       moving the water or the hills, because both change which sub-cells
+       came up drowned — the trees are lifted onto the terrain in the
+       vertex shader, so the hills alone never used to reach this far
+       back into the pipeline, and now they do. */
+    const shape = `${density.toFixed(4)}|${hills.toFixed(4)}|${waterY.toFixed(4)}`;
+    if (this._shape !== shape) { this.cache.clear(); this._shape = shape; }
 
     const live = [];
     const limit = (reach + CHUNK) * (reach + CHUNK);
@@ -1022,7 +1080,7 @@ export class Trees {
         const ck = `${ix},${iz}`;
         let chunk = this.cache.get(ck);
         if (!chunk) {
-          chunk = this._growChunk(ix, iz, density);
+          chunk = this._growChunk(ix, iz, density, hills, waterY);
           this.cache.set(ck, chunk);
         }
         live.push(chunk);
@@ -1085,6 +1143,54 @@ export class Trees {
   }
 
   /**
+   * The nearest canopies to a point, packed as xyz-centre and radius.
+   *
+   * Published for the birds, which need somewhere to sit. It is the same
+   * list the shadow map is drawn from — the real trees, at their real
+   * heights, out of the recursion that grew them — so a sparrow perched
+   * by this is in the tree rather than beside it. Deriving the positions
+   * a second time from the placement hash was the alternative and would
+   * have got the trunk right and the canopy height wrong, because a
+   * tree's height comes out of its own growth stream and not out of its
+   * cell.
+   *
+   * @param {number} x
+   * @param {number} z
+   * @param {Float32Array} out  4 floats per slot; the length sets how many
+   * @returns {number} slots filled
+   */
+  perches(x, z, out) {
+    const slots = Math.floor(out.length / 4);
+    if (!slots || !this.canopies.length) return 0;
+
+    /* A partial selection rather than a sort. The list runs to a couple
+       of hundred trees and only the first handful are wanted, so this is
+       n*k compares against n log n and no allocation at all — and it runs
+       every frame the wood is repacked. */
+    let filled = 0;
+    const best = this._perchD || (this._perchD = new Float64Array(slots));
+    for (const c of this.canopies) {
+      const dx = c[0] - x, dz = c[2] - z;
+      const d = dx * dx + dz * dz;
+      if (filled === slots && d >= best[filled - 1]) continue;
+
+      let i = Math.min(filled, slots - 1);
+      while (i > 0 && best[i - 1] > d) {
+        best[i] = best[i - 1];
+        out.copyWithin(i * 4, (i - 1) * 4, i * 4);
+        i--;
+      }
+      best[i] = d;
+      out[i * 4] = c[0];
+      out[i * 4 + 1] = c[1];
+      out[i * 4 + 2] = c[2];
+      out[i * 4 + 3] = c[3];
+      if (filled < slots) filled++;
+    }
+    return filled;
+  }
+
+  /**
    * Draw into the currently bound target — the same one the cat and the
    * grass draw into, sharing its depth buffer.
    */
@@ -1106,10 +1212,12 @@ export class Trees {
     this.reach = Math.max(TREE_REACH_MIN,
       Math.min(TREE_REACH_MAX, opts.radius * TREE_REACH));
     this._ensure(camPos[0], camPos[2],
-      Math.max(0.05, Math.min(1, opts.density)), this.reach);
+      Math.max(0.05, Math.min(1, opts.density)), this.reach,
+      opts.hills, opts.waterY);
     if (!this.segments) { this.triangles = 0; this._uniforms.uCanopyOn = 0; return; }
 
-    this._renderMap(this.gl, lightDir, camPos, time, opts.wind);
+    this._renderMap(this.gl, lightDir, camPos, time,
+                    opts.wind, opts.hills, opts.waterY);
     this._uniforms.uCanopy = this.map.texture;
     this._uniforms.uCanopyOn = 1;
   }
@@ -1133,9 +1241,15 @@ export class Trees {
       uRadius: this.reach,
       uWind: opts.wind,
       uFog: env.fog,
+      uHills: env.hills,
+      uWaterY: env.waterY,
+      uRain: env.weather.rain,
+      uSnow: env.weather.snow,
 
       uLightDir: env.dir,
       uTint: env.tint,
+      uDay: env.day,
+      uAmbient: env.ambient,
       uShadowSoft: env.shadowSoft,
       uShadowSteps: env.shadowSteps,
       uShadowNoise: env.shadowNoise,
