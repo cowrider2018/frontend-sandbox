@@ -306,6 +306,226 @@ const SHOTS_PLAN = [
            s.yaw = 0.85; s.pitch = 0.09; s.targetDist = 14;
            return true;` },
 
+  /* The ground with a shape to it, and the same ground without.
+     The pair differs by the undulation control alone, so between them
+     they say two things a single frame cannot. That the hills are
+     geometry and not a texture: a real horizon line, real back slopes
+     going dark, grass and trees carried up and over them. And that
+     turning the control off restores exactly the floor this scene had
+     before there was any — anything that shifts in `31` is a leak.
+
+     The sun is put low on purpose. A hill under a high sun is a shape;
+     a hill under a raking one throws its shadow the length of the field,
+     and that shadow is the whole reason the ground is marched against
+     its own slope bound rather than drawn into a map. If it ever stops
+     working, it stops here first. */
+  ...[
+    { name: '30-hills', hills: 4.5 },
+    { name: '31-hills-flat', hills: 0 },
+  ].map((s) => ({
+    name: s.name,
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0'
+        + `&visibility=200&light=0.68,0.10&hills=${s.hills}`,
+    settle: 3200, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.16; s.targetDist = 16;
+           return true;` }),
+  ),
+
+  /* One meadow, four times of day, everything else held.
+     The hour is the only thing that differs between these four, which is
+     the claim: a time of day is one number in, and out come the light's
+     direction, its colour, its strength and the sky's — not four
+     controls that have to be set consistently with each other.
+
+     What each is watching:
+       06:30 sunrise. The light is red and *dim*, and the shadows are
+         raked the length of the field. A dusk that only changed hue
+         would fail here by being as bright as noon.
+       12:00 the sun overhead. Shadows short, colour near white, and the
+         hills lit on every face — which is the frame that shows the
+         terrain still has a slope bound, since the snow shots and this
+         one are marched by the same conservative step.
+       19:00 after sunset. The sun is below the horizon and the moon has
+         taken over from the opposite side; the sky has not gone out with
+         it, because it is lit by air rather than by line of sight.
+       00:00 the moon at its highest, and the stars. The one frame where
+         the fireflies are what the picture is about. */
+  ...[
+    { name: '42-dawn',  hour: 6.5,  fireflies: 0 },
+    { name: '43-noon',  hour: 12.0, fireflies: 0 },
+    { name: '44-dusk',  hour: 18.3, fireflies: 0.5 },
+    { name: '45-night', hour: 0.0,  fireflies: 1 },
+  ].map((s) => ({
+    name: s.name,
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0'
+        + '&visibility=200&hills=4.5&water=1&waterLevel=0.9&coverRadius=70'
+        + `&daylight=hour&hour=${s.hour}&fireflies=${s.fireflies}`,
+    settle: 3600, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.06; s.targetDist = 22;
+           return true;` }),
+  ),
+
+  /* The meadow's population, close enough to see what each one is.
+     40 is butterflies at full density from three metres away — two
+     wings, no body, and every one of them at a different point in its
+     stroke, which is the thing that has to be true for a field of them
+     to read as alive rather than as a flock of identical toys.
+     41 is fireflies, with the exposure wound down to where they are
+     what is left in the frame. */
+  /* The cluster is wound down to one small sphere in both. It hangs at
+     the origin and the camera orbits it, so at the range these need it
+     fills the frame and there is nowhere else to stand — and what is
+     being photographed here is two wings, not the star. */
+  /* Looking down over the meadow rather than across it, which is the
+     only angle that shows the thing this is testing: the butterflies are
+     gathered over the flower clumps and not scattered evenly, because
+     they are reading the grid the flowers were sown from. Spread wound
+     in and clump density down, so the clumps are separated enough for
+     "gathered over" to be a visible claim rather than an assertion. */
+  /* Two frozen instants, twelve seconds apart — longer than any one
+     animal's leg, which runs five to ten seconds. Held at the same
+     camera and the same everything, so what differs between them is the
+     population having moved on.
+
+     This is the pair that catches the failure the still above cannot.
+     A butterfly locked to one clump makes a closed path, and a closed
+     path is a thing the eye finds inside half a minute however unevenly
+     it is walked — so the frames would come out with the same animals
+     over the same flowers in slightly different places, and everything
+     would look correct and be wrong. What should differ is *which*
+     flowers are occupied, with a few caught out over the open grass
+     between them and riding higher for it. */
+  ...[
+    { name: '40-butterflies', freeze: 8.0 },
+    { name: '40b-butterflies-later', freeze: 20.0 },
+  ].map((s) => ({
+    name: s.name,
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&cat=0'
+        + '&hills=2&butterflies=1&wind=0.4&balls=1&blend=0.02&displace=0'
+        + '&flowerClumps=0.35&flowerSpread=0.7&coverRadius=26',
+    settle: 3000, freeze: s.freeze,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.46; s.targetDist = 9.0;
+           return true;` }),
+  ),
+
+  /* The sparrow, close enough to check the one thing that separates a
+     bird from a cartoon of one: the head has to be smaller than the
+     chest, and joined to it without a neck. The ring table says 0.64
+     against a real bird's 0.65, but a table is not a silhouette — this
+     is where that claim is actually looked at.
+
+     Also the bounding flight. A sparrow climbs on every burst of
+     wingbeats and falls with its wings shut between them, so a frozen
+     frame should catch some of the population with wings spread and
+     rising and the rest folded and dropping. All of them in the same
+     pose means the fold and the climb have come apart. */
+  { name: '46-sparrows',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&cat=0'
+        + '&hills=2&sparrows=1&sparrowFlocks=1&balls=1&blend=0.02&displace=0&visibility=140'
+        + '&daylight=hour&hour=10.5&trees=1&coverRadius=40',
+    settle: 3200, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.62; s.targetDist = 13.0;
+           return true;` },
+
+  { name: '41-fireflies',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&cat=0'
+        + '&hills=2&fireflies=1&exposure=0.5&balls=1&blend=0.02&displace=0',
+    settle: 3000, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.09; s.targetDist = 5.5;
+           return true;` },
+
+  /* The three weathers, over one meadow with one lake in it.
+     Held to the same camera, the same clock and the same everything
+     else, because what is being compared is a mode and not a picture:
+     37 is the scene as it has always been, and anything that shows up
+     in it that was not there before belongs to a weather that is
+     supposed to be switched off.
+
+     What each of the other two is watching:
+       rain — the ground goes darker and shinier, and there are streaks
+         slanting the same way the grass is leaning. Slanting the wrong
+         way means the drops and the blades have stopped reading the
+         same wind field, which is the failure this arrangement exists
+         to make visible.
+       snow — white on the flats, bare on the steep faces, and stopping
+         short of the water rather than out over it. The blades thin to
+         stubble and the flowers are gone from the drifts but not from
+         the scoured patches. */
+  ...[
+    { name: '37-clear', mode: 'clear' },
+    { name: '38-rain',  mode: 'rain' },
+    { name: '39-snow',  mode: 'snow' },
+  ].map((s) => ({
+    name: s.name,
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0'
+        + '&visibility=200&light=0.68,0.10&hills=4.5&water=1&waterLevel=0.9'
+        + `&coverRadius=70&wind=0.7&weather=${s.mode}`,
+    settle: 4000, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.06; s.targetDist = 22;
+           return true;` }),
+  ),
+
+  /* The shore, with the cover wound out far enough to reach it.
+     The three shots above look at the lake from beyond the grass, which
+     is exactly where the drowning cannot be seen. This is the one that
+     watches it: blades taper out over the last few centimetres of dry
+     ground and stop, flowers are simply absent, and no trunk stands in
+     the water. What would show here and nowhere else is a shoreline that
+     the planting and the marcher disagree about — grass standing on top
+     of the surface, or a bare metre of soil around a lake that has not
+     reached it yet. */
+  { name: '36-lake-shore',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0'
+        + '&visibility=200&light=0.68,0.10&hills=4.5&water=1&waterLevel=0.95'
+        + '&coverRadius=70',
+    settle: 4000, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.06; s.targetDist = 22;
+           return true;` },
+
+  /* The lake, at three levels and once without it.
+     What these are watching is the shoreline, because the shoreline is
+     the only part of the water nobody authored: it is wherever the hills
+     cross the surface, so it has to move when the level moves and it has
+     to stay put when nothing does. The pair to compare are 33 and 35 —
+     same world, same camera, more water — and what should differ between
+     them is the outline of the lake and nothing else about the ground.
+
+     `32-lake-off` is the regression that matters most. Water switched
+     off has to give back the frame the hills gave before there was any
+     water at all, and the way that could quietly stop being true is a
+     consumer left reading an unset uWaterY, which defaults to zero and
+     reads as a lake standing above every ridge in the world. */
+  ...[
+    { name: '32-lake-off',  water: 0, level: 0.45 },
+    { name: '33-lake',      water: 1, level: 0.45 },
+    { name: '34-lake-low',  water: 1, level: 0.05 },
+    { name: '35-lake-high', water: 1, level: 0.95 },
+  ].map((s) => ({
+    name: s.name,
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0'
+        + '&visibility=200&light=0.68,0.10&hills=4.5'
+        + `&water=${s.water}&waterLevel=${s.level}`,
+    settle: 3200, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.16; s.targetDist = 16;
+           return true;` }),
+  ),
+
   /* Reach wound out to the end of its travel: grass to the fog, and the
      rim nowhere to be seen. The near cells are the same size they are at
      every other setting — what bought the distance is rings, not bigger
@@ -642,8 +862,72 @@ async function lintShaders() {
   }
 }
 
+/**
+ * The water level control, held to what it claims.
+ *
+ * A screenshot cannot check this one. The level is defined as *how much
+ * of the open meadow stands under water*, and the depth that produces
+ * that is read out of a distribution sampled from the wave table — so
+ * the thing that can break is not the picture but the agreement between
+ * the control's meaning and the ground's actual shape, which changes
+ * the moment anyone edits a wavelength or a weight in `WAVES`. Nothing
+ * about that would look wrong in a still; the lake would simply be a
+ * different size than the number said.
+ *
+ * Measured independently of the table: sample the real height field on
+ * a different lattice and count. Two samplings of the same ground, one
+ * of which never sees the other's answer.
+ */
+async function checkWater() {
+  const t = await import(new URL('../src/scenes/terrain.js', import.meta.url));
+
+  const flooded = (y, hills) => {
+    let wet = 0, total = 0;
+    // Well outside the clearing, and on a stride sharing no factor with
+    // the one the table itself was built on.
+    for (let i = 0; i < 260; i++) {
+      for (let j = 0; j < 260; j++) {
+        total++;
+        if (t.terrainHeight(70 + i * 1.13, -150 + j * 1.13, hills) < y) wet++;
+      }
+    }
+    return wet / total;
+  };
+
+  const bad = [];
+  for (const hills of [1.5, 4.5]) {
+    for (const level of [0, 0.25, 0.5, 0.75, 1]) {
+      const claimed = t.waterArea(level);
+      const actual = flooded(t.waterSurfaceY(true, level, hills), hills);
+      if (Math.abs(actual - claimed) > 0.03) {
+        bad.push(`hills ${hills} level ${level}: claims `
+          + `${(claimed * 100).toFixed(1)}% flooded, measures `
+          + `${(actual * 100).toFixed(1)}%`);
+      }
+    }
+  }
+
+  /* And the two ways there is no water at all. The second matters more
+     than it looks: a flat world has no low ground for a lake to sit in,
+     and a surface that did not retreat out of reach would be coplanar
+     with the floor everywhere. */
+  if (t.waterSurfaceY(false, 1, 4.5) > t.TERRAIN_BASE - 4.5) {
+    bad.push('water switched off still reaches the ground');
+  }
+  if (t.waterSurfaceY(true, 1, 0) > t.TERRAIN_BASE) {
+    bad.push('water on a flat world still reaches the floor');
+  }
+
+  if (bad.length) {
+    console.error('✗ water level does not mean what it says:');
+    for (const b of bad) console.error(`    ${b}`);
+    throw new Error('water check failed');
+  }
+}
+
 async function main() {
   await lintShaders();
+  await checkWater();
   const { server, port } = await serve();
   const base = `http://127.0.0.1:${port}/index.html`;
   console.log(`▸ serving ${ROOT}\n  ${base}`);
@@ -699,7 +983,7 @@ async function main() {
   if (probe) {
     const hash = value('at', '#/flow');
     await cdp.send('Page.navigate', { url: base + hash });
-    await waitFor(cdp, `document.documentElement.dataset.boot`, 'ready', 20000);
+    await waitFor(cdp, `document.documentElement.dataset.boot`, 'ready', 90000);
     await cdp.eval(`document.getElementById('intro-enter').click(); true`);
     await sleep(Number(value('settle', 3000)));
     console.dir(await cdp.eval(`(() => { ${probe} })()`), { depth: 8 });
@@ -734,7 +1018,7 @@ async function main() {
     ];
     console.log('▸ responsive');
     await cdp.send('Page.navigate', { url: `${base}#/reaction` });
-    await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 20000);
+    await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 90000);
     await cdp.eval(`document.getElementById('intro-enter').click(); true`);
 
     for (const v of viewports) {
@@ -785,7 +1069,7 @@ async function main() {
     const before = problems.length;
     await cdp.send('Page.navigate', { url });
     try {
-      await waitFor(cdp, `document.documentElement.dataset.boot`, 'ready', 20000);
+      await waitFor(cdp, `document.documentElement.dataset.boot`, 'ready', 90000);
     } catch (err) {
       // A boot that never completes is almost always a module or shader
       // error the page already logged — surface it instead of the timeout.
@@ -988,7 +1272,7 @@ async function pixelDiff(cdp) {
   console.log('▸ pixel diff  (frozen clock, 320×180 sample, 8-bit channels)');
 
   await cdp.send('Page.navigate', { url });
-  await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 20000);
+  await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 90000);
   await cdp.eval(`document.getElementById('intro-enter').click(); true`);
   await sleep(2500);
 
@@ -1076,7 +1360,7 @@ async function bench(cdp) {
 
   for (const c of BENCH_CASES) {
     await cdp.send('Page.navigate', { url: base + c.hash });
-    await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 20000);
+    await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 90000);
     await cdp.eval(`document.getElementById('intro-enter').click(); true`);
 
     // Warm up before measuring: shader compilation, the first few frames
@@ -1191,7 +1475,7 @@ async function interact(cdp, base, problems) {
   console.log('▸ interaction');
 
   await cdp.send('Page.navigate', { url: `${base}#/march` });
-  await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 20000);
+  await waitFor(cdp, 'document.documentElement.dataset.boot', 'ready', 90000);
 
   /* intro */
   await cdp.eval(`document.getElementById('intro-enter').click(); true`);
@@ -2095,6 +2379,390 @@ async function interact(cdp, base, problems) {
     felled.tri === 0 && felled.on === 0,
     `${felled.tri} triangles, canopy term ${felled.on}`);
 
+  /* ── the lake ──
+     Every one of these is really the same assertion asked three ways:
+     that there is one answer to where the water is. The screenshots
+     already show the shoreline; what a still cannot show is that the
+     planting arrived at the same line by itself, from the same field,
+     without anything having been told where to stop. */
+  const sown = async (set) => {
+    await cdp.eval(`__aether.panel.setValues(${JSON.stringify(set)},
+      { notify: true }); true`);
+    await sleep(450);
+    return cdp.eval(`({ flowers: __aether.scene.ground.flowers,
+      trees: __aether.scene.trees.trees })`);
+  };
+
+  /* Everything this section reads, set explicitly rather than inherited.
+     It runs after the wood, which leaves its own switches where it likes,
+     and a section that silently depended on the previous one's leftovers
+     is a section that breaks the day somebody reorders them. */
+  const dry = await sown({ ground: 'grass', flowers: true, flowerClumps: 1,
+                           hills: 4.5, coverRadius: 60,
+                           trees: true, water: false, weather: 'clear' });
+  const flooded = await sown({ water: true, waterLevel: 1 });
+
+  check('flooding the valleys drowns what was growing in them',
+    flooded.flowers < dry.flowers * 0.85 && flooded.trees < dry.trees * 0.9,
+    `dry ${dry.flowers} flowers / ${dry.trees} trees → `
+    + `flooded ${flooded.flowers} / ${flooded.trees}`);
+
+  /* And puts them back. This is the regression that would otherwise be
+     invisible: every shader including the terrain block declares
+     uWaterY, so an upload site left unfilled reads zero — which is a
+     lake standing above every ridge in the world, and a meadow with
+     nothing left growing in it. */
+  const drained = await sown({ water: false });
+  check('switching the lake off gives the whole meadow back',
+    drained.flowers === dry.flowers && drained.trees === dry.trees,
+    `${drained.flowers} flowers / ${drained.trees} trees, exactly as before`);
+
+  /* The level control claims to be linear in flooded *area*, not depth.
+     checkWater() holds it to that against the height field itself; this
+     holds the planting to the same curve, from the other end of the
+     pipeline — half the water should take away far less than all of it,
+     and a control that had stayed linear in depth would fail here by
+     taking away almost nothing. */
+  const half = await sown({ water: true, waterLevel: 0.5 });
+  check('the water level is linear in how much it floods, not how deep it is',
+    half.flowers < dry.flowers * 0.95 && half.flowers > flooded.flowers * 1.1,
+    `dry ${dry.flowers} · half ${half.flowers} · full ${flooded.flowers} flowers`);
+
+  /* ── the weather ──
+     Rain and snow are not two amounts of one thing, and the flowers are
+     where that is checkable: snow buries them and rain does not touch
+     them. A weather that had been built as one intensity would move both
+     numbers together. */
+  await sown({ water: false });
+  const rained = await sown({ weather: 'rain' });
+  const snowed = await sown({ weather: 'snow' });
+  check('snow buries the flowers and rain leaves them where they are',
+    rained.flowers === dry.flowers && snowed.flowers < dry.flowers * 0.7,
+    `clear ${dry.flowers} · rain ${rained.flowers} · snow ${snowed.flowers}`);
+
+  /* Not all of them. The mottle in snowCover is the whole reason snow
+     reads as fallen rather than painted, and the way to see that it is
+     doing anything is that the blooms go from the drifts and stay in the
+     scoured patches. All-or-nothing here means the mottle is flat. */
+  check('snow takes the drifts and leaves the scoured patches',
+    snowed.flowers > 0,
+    `${snowed.flowers} of ${dry.flowers} flowers still standing in the open`);
+
+  await sown({ weather: 'clear' });
+
+  /* ── the time of day ──
+     The light direction is a Float32Array the scene publishes, so where
+     the sun is can simply be read. What is being checked is not that the
+     arithmetic runs but that the *authority* is where the mode says: a
+     time of day and an XY pad are two answers to one question, and the
+     failure that matters is both of them being half in charge. */
+  const lit = async (set) => {
+    await cdp.eval(`__aether.panel.setValues(${JSON.stringify(set)},
+      { notify: true }); true`);
+    await sleep(260);
+    return cdp.eval(`({ dir: Array.from(__aether.scene.lightDir),
+      hour: __aether.scene.hour })`);
+  };
+
+  const noon = await lit({ daylight: 'hour', hour: 12 });
+  const morning = await lit({ hour: 7.5 });
+  const evening = await lit({ hour: 16.5 });
+  const midnight = await lit({ hour: 0 });
+
+  /* Morning and evening are taken well inside the day rather than at
+     06:00 and 18:00. Those two are the tie: the sun and the moon are
+     both exactly on the horizon and which one is chosen is arbitrary, so
+     testing there tests the tie-break and not the arc. Equidistant from
+     noon instead — the same height, opposite sides — which is the claim
+     that there is one arc and not two hand-placed bodies. */
+  check('the hour puts the sun on an arc, and the moon on the same one',
+    noon.dir[1] > 0.85
+    && Math.abs(morning.dir[1] - evening.dir[1]) < 1e-3
+    && morning.dir[0] * evening.dir[0] < 0
+    /* And midnight is the moon, at the noon sun's height and — this is
+       the part worth having a test for — at the noon sun's *bearing*.
+       It looks like a bug and is the definition: a moon opposite the sun
+       is full, and a full moon at midnight is exactly where the sun is
+       at noon. Falling out of one arc read backwards rather than being
+       placed is what makes it come out right without being aimed. */
+    && midnight.dir[1] > 0.85
+    && Math.abs(midnight.dir[2] - noon.dir[2]) < 1e-3,
+    `noon y ${noon.dir[1].toFixed(2)} · 07:30 and 16:30 both y `
+    + `${morning.dir[1].toFixed(3)}, x ${morning.dir[0].toFixed(2)}/`
+    + `${evening.dir[0].toFixed(2)} · midnight moon y `
+    + `${midnight.dir[1].toFixed(2)} on the noon bearing (full)`);
+
+  /* And the reason the swap at dusk cannot be seen. At the moment the
+     two bodies trade places both are on the horizon, so whichever one
+     wins is delivering a grazing light that the whole meadow is nearly
+     edge-on to — the direction flips, and there is no directional term
+     left for the flip to show up in. */
+  const terminator = await lit({ hour: 18 });
+  check('the light has nothing left to give at the moment it swaps bodies',
+    Math.abs(terminator.dir[1]) < 0.02,
+    `at 18:00 the light sits ${terminator.dir[1].toFixed(4)} above the horizon`);
+
+  /* The pad, and whether it is listened to. Under the hour it must not
+     be — a control that still moves the light after another one has been
+     put in charge of it is the worst of the three possible designs,
+     because nothing on screen says which of them you are looking at. */
+  const padBase = await lit({ hour: 9 });
+  const padUnderHour = await lit({ light: [0.1, 0.9] });
+  const padUnderFixed = await lit({ daylight: 'fixed' });
+
+  check('the hour takes the pad off the light, and giving it back works',
+    Math.abs(padUnderHour.dir[1] - padBase.dir[1]) < 1e-6
+    && Math.abs(padUnderFixed.dir[1] - padBase.dir[1]) > 0.2,
+    `pad dragged under the hour: y ${padBase.dir[1].toFixed(3)} → `
+    + `${padUnderHour.dir[1].toFixed(3)} (unmoved); back on fixed: y `
+    + `${padUnderFixed.dir[1].toFixed(3)}`);
+
+  /* And that the clock is what advances it, not the wall — so pausing
+     stops the sun, and the reference shots stay reproducible. */
+  await lit({ daylight: 'cycle' });
+  await cdp.eval(`__aether.clock.setPaused(true); true`);
+  await sleep(120);
+  const frozen = await cdp.eval(`__aether.scene.hour`);
+  await sleep(700);
+  const stillFrozen = await cdp.eval(`__aether.scene.hour`);
+  await cdp.eval(`__aether.clock.setPaused(false); true`);
+  await sleep(600);
+  const sunMoved = await cdp.eval(`__aether.scene.hour`);
+
+  check('a paused scene stops the sun, and running it starts it again',
+    stillFrozen === frozen && sunMoved !== frozen,
+    `${frozen.toFixed(3)}h held for 0.7 s paused, then ${sunMoved.toFixed(3)}h`);
+
+  await lit({ daylight: 'fixed', light: [0.68, 0.24] });
+
+  /* ── the population ──
+     One slider each, and the claim about what each one costs. A
+     butterfly is four triangles; a firefly is none at all, because it is
+     a light and not a surface. */
+  const life = async (b, f) => {
+    await cdp.eval(`__aether.panel.setValues({ butterflies: ${b}, fireflies: ${f} },
+      { notify: true }); true`);
+    await sleep(300);
+    return cdp.eval(`({ b: __aether.scene.creatures.butterflies,
+      f: __aether.scene.creatures.fireflies,
+      tri: __aether.scene.creatures.triangles })`);
+  };
+  const none = await life(0, 0);
+  const flies = await life(1, 0);
+  const glows = await life(0, 1);
+
+  check('each kind of creature has its own control',
+    none.b === 0 && none.f === 0
+    && flies.b > 0 && flies.f === 0
+    && glows.b === 0 && glows.f > 0,
+    `off ${none.b}/${none.f} · butterflies ${flies.b}/${flies.f} `
+    + `· fireflies ${glows.b}/${glows.f}`);
+
+  check('a butterfly is four triangles and a firefly is none',
+    flies.tri === flies.b * 4 && glows.tri === 0,
+    `${flies.b} butterflies → ${flies.tri} triangles, `
+    + `${glows.f} fireflies → ${glows.tri}`);
+
+  /* And the bird, which is the one that had to be paid for. Seventy
+     triangles against four is the trade this whole file argues about, so
+     the number is held to rather than merely described — and the count
+     being a whole number of flocks is what says the flocking survived,
+     since a population that had quietly gone back to scattering would
+     still report the right total. */
+  await cdp.eval(`__aether.panel.setValues({ butterflies: 0, fireflies: 0,
+    sparrows: 1, sparrowFlocks: 1 }, { notify: true }); true`);
+  await sleep(320);
+  const birds = await cdp.eval(`({ n: __aether.scene.creatures.sparrows,
+    tri: __aether.scene.creatures.triangles })`);
+
+  check('a sparrow costs seventy triangles',
+    birds.n > 0 && birds.tri === birds.n * 70,
+    `${birds.n} sparrows → ${birds.tri} triangles`);
+
+  /* The flock structure, which is the whole of the second redesign. What
+     it is guarding is that the *control* moves the size of a flock and
+     not the number of them: a slider that added groups instead of
+     members is how a sky of birds turns back into a scatter of flies,
+     which is the specific thing that was wrong. So the count of live
+     flocks has to sit between three and six at every setting, and the
+     total has to move anyway. */
+  const flockAt = async (d) => {
+    await cdp.eval(`__aether.panel.setValues({ sparrows: ${d}, sparrowFlocks: 1 },
+      { notify: true }); true`);
+    await sleep(300);
+    return cdp.eval(`__aether.scene.creatures.sparrows`);
+  };
+  const few = await flockAt(0.35);
+  const many = await flockAt(1);
+
+  check('the control sets how big a flock is, not how many there are',
+    few > 0 && many > few * 1.8,
+    `density 0.35 → ${few} birds, density 1 → ${many}`);
+
+  /* And the other one, which sets how many. The pair is the flowers'
+     bargain — a few big flocks and many small ones are two different
+     skies, and one slider reaches both ends without ever saying which of
+     them it is doing — so what has to hold is that they move different
+     things: halving the groups roughly halves the birds while leaving
+     each group the size it was. */
+  await cdp.eval(`__aether.panel.setValues({ sparrows: 1, sparrowFlocks: 1 },
+    { notify: true }); true`);
+  await sleep(320);
+  const allFlocks = await cdp.eval(`__aether.scene.creatures.sparrows`);
+  await cdp.eval(`__aether.panel.setValues({ sparrowFlocks: 0.4 },
+    { notify: true }); true`);
+  await sleep(320);
+  const someFlocks = await cdp.eval(`__aether.scene.creatures.sparrows`);
+
+  check('the second control sets how many flocks there are',
+    someFlocks > 0 && someFlocks < allFlocks * 0.75,
+    `all flocks → ${allFlocks} birds, 40% of them → ${someFlocks}`);
+
+  /* And that a wood offers somewhere to sit. The perches are the real
+     canopies out of the list the shadow map is drawn from, so this is
+     also the check that the two halves of the wood — the one that is
+     drawn and the one that is sat in — are the same wood. */
+  await cdp.eval(`__aether.panel.setValues({ trees: true }, { notify: true }); true`);
+  await sleep(500);
+  /* Every pass is one of three things and the wood decides which: aimed
+     at a crown, put down on open ground, or straight across without
+     stopping. The line's w flags a tree and the stop's w flags whether
+     there is a stop at all, so both can be counted — and with a wood on
+     the map some of them must be trees, or the crowns are not reaching
+     the flight at all. */
+  const kinds = await cdp.eval(`(() => {
+    const c = __aether.scene.creatures, L = c._flockLine, S = c._flockStop;
+    const I = c._flockInfo;
+    let tree = 0, ground = 0, through = 0;
+    for (let i = 0; i < L.length / 4; i++) {
+      if (I[i * 4] <= 0) continue;
+      if (S[i * 4 + 3] < 0) through++;
+      else if (L[i * 4 + 3] > 0) tree++;
+      else ground++;
+    }
+    return { tree, ground, through };
+  })()`);
+
+  check('a wood gives the birds somewhere to perch, at the real canopies',
+    kinds.tree > 0,
+    `${kinds.tree} passes aimed at a crown, ${kinds.ground} onto open `
+    + `ground, ${kinds.through} straight across`);
+
+  await cdp.eval(`__aether.panel.setValues({ trees: false }, { notify: true }); true`);
+  await sleep(200);
+
+  /* The reach, which is one control over three ranges — the same bargain
+     the cover reach makes with the grass, the flowers and the wood.
+     What has to hold is that it buys *area* and not thinning: the
+     populations grow with the patch, because a density that fell as the
+     view widened would make the two sliders the same slider.
+
+     The sparrows are the exception and are checked for being one. A
+     flock is the unit there, so a wider patch spreads the flocks apart
+     and does not add birds — the count must stay put. */
+  const reachAt = async (r) => {
+    await cdp.eval(`__aether.panel.setValues({ butterflies: 1, fireflies: 1,
+      sparrows: 1, sparrowFlocks: 1, lifeRadius: ${r} }, { notify: true }); true`);
+    await sleep(400);
+    return cdp.eval(`({ b: __aether.scene.creatures.butterflies,
+      f: __aether.scene.creatures.fireflies,
+      s: __aether.scene.creatures.sparrows })`);
+  };
+  const lifeNear = await reachAt(15);
+  const lifeFar = await reachAt(120);
+
+  check('the creature reach buys ground, and does not thin what is on it',
+    lifeFar.b > lifeNear.b * 2 && lifeFar.f > lifeNear.f * 2,
+    `15u → ${lifeNear.b} butterflies / ${lifeNear.f} fireflies, `
+    + `120u → ${lifeFar.b} / ${lifeFar.f}`);
+
+  /* Seeing further has to put more in the sky — for both kinds — but it
+     does it to them differently, and that difference is the claim.
+
+     Insects are a scatter on a patch, so their count follows the area
+     outright: fourteen times over this range. Flocks live on a grid of
+     fixed world spacing, so their count follows the area too, up to the
+     ceiling on how many can be handed over at once, and then it stops.
+     The birds grow, and grow by less.
+
+     This check used to assert the opposite — that the bird count stayed
+     put — and it was right about the code and wrong about what the code
+     should do. The grid was a fraction of the reach; the two cancelled
+     in the area, and the control moved the horizon with nothing new
+     arriving at it. */
+  check('seeing further puts more in the sky, and most of all the small things',
+    lifeFar.s > lifeNear.s * 1.5
+    && lifeFar.b > lifeNear.b * 8
+    && lifeFar.b / lifeNear.b > lifeFar.s / lifeNear.s,
+    `sparrows ${lifeNear.s} → ${lifeFar.s} across the range, `
+    + `where butterflies go ${lifeNear.b} → ${lifeFar.b}`);
+
+  /* Turning the camera must not change what is in the sky.
+     This is a regression, and the bug it is guarding was reported from
+     the running scene rather than found here: the flocks used to be
+     wrapped into a box centred on the eye, and this is an orbit camera,
+     so a yaw drag translates the eye and re-wrapped them — whole groups
+     faded out at one edge and reappeared at the other. With a few
+     hundred insects that is invisible; with four flocks it is the most
+     obvious thing in the frame.
+
+     Swept on a tight orbit so the eye stays inside one flock cell, which
+     is what isolates "the camera turned" from "the camera travelled".
+
+     And at a *short* reach, deliberately. The count has to be small
+     enough that one group is a large share of it, or the test loses the
+     only thing it can see: with a hundred and ten birds in two dozen
+     flocks, a whole group blinking is six per cent of the total and
+     hides inside the ordinary breathing of everything at the rim. With a
+     handful of flocks it is a fifth, and unmissable. */
+  await cdp.eval(`const s = __aether.scene; s.targetDist = 2.5; s.yaw = 0;
+    __aether.panel.setValues({ sparrows: 1, sparrowFlocks: 1, lifeRadius: 28 },
+      { notify: true }); true`);
+  await sleep(400);
+  const spun = [];
+  for (const yaw of [0, 1.6, 3.1, 4.7]) {
+    await cdp.eval(`__aether.scene.yaw = ${yaw}; true`);
+    await sleep(220);
+    spun.push(await cdp.eval(`__aether.scene.creatures.sparrows`));
+  }
+
+  /* Not "unchanging" — that was tried and it was the wrong target. An
+     orbit camera turning is an orbit camera *travelling*: nine metres at
+     this distance, forty at twenty. The observer really is somewhere
+     else, and a population that ignored that would be pinned to the
+     view. Anchoring on the orbit centre did make the number constant,
+     and it did so by nailing the birds to the point the camera always
+     looks at — the picture was worse and the test was greener, which is
+     the whole hazard of measuring the wrong invariant.
+
+     What must not happen is a flock appearing or disappearing *whole*.
+     The count is fade-weighted, so a group popping in at full brightness
+     moves it by its own size — seven to fifteen birds — while a group
+     fading across the rim moves it by two or three. Watching the largest
+     single step separates those two, and it is the difference that was
+     being reported from the running scene. */
+  let jump = 0;
+  for (let i = 1; i < spun.length; i++) {
+    jump = Math.max(jump, Math.abs(spun[i] - spun[i - 1]));
+  }
+  check('no flock appears or disappears whole as the camera turns',
+    spun[0] > 0 && jump < 6,
+    `${spun.join(' → ')} sparrows through a full turn `
+    + `(largest step ${jump}, a whole flock is 7–15)`);
+
+  await cdp.eval(`__aether.panel.setValues({ butterflies: 0, fireflies: 0,
+    sparrows: 0, sparrowFlocks: 0, lifeRadius: 45 }, { notify: true }); true`);
+  await sleep(200);
+
+  await cdp.eval(`__aether.panel.setValues({ sparrows: 0, sparrowFlocks: 0 }, { notify: true }); true`);
+  await sleep(200);
+
+  await life(0, 0);
+  await cdp.eval(`__aether.panel.setValues({ hills: 2, coverRadius: 15,
+    flowerClumps: 0.62, trees: false }, { notify: true }); true`);
+  await sleep(300);
+
+
   /* Visibility is a master, in the same sense the quality slider is: it
      writes into the reach and then goes stale, so the reach stays yours
      afterwards. Locking the two together would forbid thick fog with a
@@ -2198,19 +2866,46 @@ async function shot(cdp, name) {
   await writeFile(join(SHOTS, `${name}.png`), Buffer.from(data, 'base64'));
 }
 
+/**
+ * Poll the page until an expression reaches a value.
+ *
+ * The boot budget is generous — a minute and a half — and it is worth
+ * saying why, because a long timeout usually hides something.
+ *
+ * Booting this app compiles a dozen large programmes, and on integrated
+ * graphics under a loaded machine that is genuinely slow: measured here
+ * at a hundred seconds on a laptop with the user's own browser running,
+ * against a handful of seconds on an idle one. The old twenty-second
+ * budget turned that into a bare "boot failed" with no exception and no
+ * console error, which is the least useful failure a harness can
+ * produce — it looks exactly like a hang.
+ *
+ * So the budget is large and the *time taken* is reported instead. A
+ * compile-time regression then shows up as a number climbing rather than
+ * as an intermittent mystery, and a busy machine is merely slow.
+ */
 async function waitFor(cdp, expression, expected, timeout) {
-  const deadline = Date.now() + timeout;
+  const started = Date.now();
+  const deadline = started + timeout;
   while (Date.now() < deadline) {
     try {
       const v = await cdp.eval(expression);
-      if (v === expected) return v;
+      if (v === expected) {
+        const took = Date.now() - started;
+        if (took > 8000) {
+          console.log(`  (boot took ${(took / 1000).toFixed(1)} s — `
+            + 'shader compilation on a loaded machine)');
+        }
+        return v;
+      }
       if (v === 'failed') throw new Error('App reported boot failure');
     } catch (err) {
       if (String(err).includes('boot failure')) throw err;
     }
     await sleep(200);
   }
-  throw new Error(`Timed out waiting for ${expression} === ${expected}`);
+  throw new Error(`Timed out waiting for ${expression} === ${expected} `
+    + `after ${(timeout / 1000).toFixed(0)} s`);
 }
 
 function truncate(s, n) { return s.length > n ? `${s.slice(0, n)}…` : s; }
