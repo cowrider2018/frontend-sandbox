@@ -167,6 +167,29 @@ const SWING_KNEE = 0.34;  // knee follows the hip, lagging a quarter turn
 const SWING_FRONT = 0.62; // front leg swing
 const BOB_AMP = 0.055;    // vertical travel of the whole body per step
 
+/* ── the paddle ──
+   Swimming is the walk with three numbers moved, and that is not a
+   shortcut — it is what a cat actually does. It keeps the same diagonal
+   gait in the water; what changes is that the legs hang *under* the body
+   instead of reaching out in front of it, that they travel a fraction as
+   far, and that they never stop, because a cat that stops paddling
+   sinks.
+
+   The alternative was a second animation, which would have been a second
+   description of how this animal moves — and the two would have had to
+   agree at the waterline, where the blend between them happens. */
+/** How far back the legs sit once they are under the animal. */
+const PADDLE_BACK_HIND = 0.50;
+const PADDLE_BACK_FRONT = 0.34;
+/** What is left of the swing when it becomes a paddle. */
+const PADDLE_SWING = 0.24;
+/** The stroke a floating cat keeps up while going nowhere. Small, but
+    never zero: stillness in deep water reads as a stuffed animal. */
+const PADDLE_IDLE = 0.45;
+/** Strokes per second per unit of drive. Faster than a walk and shorter,
+    which is the difference between pushing on ground and on water. */
+const PADDLE_HZ = 2.60;
+
 export class Driver {
   constructor() {
     this.phase = 0;
@@ -175,6 +198,11 @@ export class Driver {
     this.nextBlink = 2.4;
     this.speed = 0;      // smoothed, so the gait does not snap on keydown
     this.turn = 0;
+    /** How much of the animal is being carried by water rather than by
+        its feet, smoothed for the same reason the speed is: a shelving
+        bank hands this over gradually and the gait has to arrive with
+        it. */
+    this.swim = 0;
 
     this.pose = {
       headPitch: 0, headYaw: 0, headTilt: 0,
@@ -198,8 +226,9 @@ export class Driver {
    * @param {number} dt      seconds
    * @param {number} speed   0…1, how hard it is being driven forward
    * @param {number} turn    -1…1, steering, for the lean into a corner
+   * @param {number} [swim]  0…1, how much of it the water is carrying
    */
-  step(dt, speed, turn) {
+  step(dt, speed, turn, swim = 0) {
     const d = Math.min(0.05, Math.max(0, dt));
     this.time += d;
 
@@ -207,36 +236,58 @@ export class Driver {
     // stride on a keypress reads as a glitch, not as a cat.
     this.speed += (speed - this.speed) * (1 - Math.exp(-d * 9));
     this.turn += (turn - this.turn) * (1 - Math.exp(-d * 6));
-
-    // The stride advances with speed, so the feet keep pace with the
-    // ground instead of scrubbing along it.
-    this.phase += d * STRIDE_HZ * Math.PI * 2 * Math.max(this.speed, 0.0001);
-    if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
+    this.swim += (swim - this.swim) * (1 - Math.exp(-d * 5));
 
     const p = this.pose;
     const s = this.speed;
-    const a = this.phase;
+    const w = this.swim;
     const t = this.time;
+
+    /* What the legs are doing, which on the ground is what the animal is
+       doing and in the water is not. A walk's stride advances with speed
+       so the feet keep pace with the ground instead of scrubbing along
+       it; there is no ground to scrub on out here, and a cat treading
+       water is working hardest of all. */
+    const drive = Math.max(s, w * PADDLE_IDLE);
+    this.phase += d * (STRIDE_HZ + (PADDLE_HZ - STRIDE_HZ) * w)
+                * Math.PI * 2 * Math.max(drive, 0.0001);
+    if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
+
+    const a = this.phase;
+    /* The same swing, a quarter of the size, about a rest angle that has
+       moved back under the body. Both halves matter: the small travel on
+       its own reads as a cat walking on the bottom, and the rest angle on
+       its own reads as one frozen mid-stride. */
+    const legs = drive * (1.0 - w * (1.0 - PADDLE_SWING));
+    const backH = -PADDLE_BACK_HIND * w;
+    const backF = -PADDLE_BACK_FRONT * w;
 
     // One diagonal swings while the other is planted, half a cycle apart.
     // A hind leg and the front leg *across* from it move together — that
     // is what a walk is, and pairing same-side legs instead gives a
     // rocking horse.
-    const swing = Math.sin(a), counter = -swing;
-    p.hipA = swing * SWING_HIND * s;
-    p.hipB = counter * SWING_HIND * s;
-    p.shoulderA = swing * SWING_FRONT * s;
-    p.shoulderB = counter * SWING_FRONT * s;
+    const swingA = Math.sin(a), counter = -swingA;
+    p.hipA = backH + swingA * SWING_HIND * legs;
+    p.hipB = backH + counter * SWING_HIND * legs;
+    p.shoulderA = backF + swingA * SWING_FRONT * legs;
+    p.shoulderB = backF + counter * SWING_FRONT * legs;
     // The knee trails the hip — the lower leg is still catching up when
     // the thigh has already reversed, which is what makes a walk read as
     // jointed rather than as a pendulum.
-    p.kneeA = Math.max(0, Math.sin(a - Math.PI / 2)) * SWING_KNEE * s;
-    p.kneeB = Math.max(0, Math.sin(a + Math.PI / 2)) * SWING_KNEE * s;
+    p.kneeA = Math.max(0, Math.sin(a - Math.PI / 2)) * SWING_KNEE * legs;
+    p.kneeB = Math.max(0, Math.sin(a + Math.PI / 2)) * SWING_KNEE * legs;
 
-    // Two bobs per stride — the body rises on each diagonal, not once
-    // per cycle. Idle breathing takes over as the gait fades out.
-    p.bob = Math.sin(a * 2) * BOB_AMP * s + Math.sin(t * 1.6) * 0.012 * (1 - s);
-    p.bodyPitch = -s * 0.10 + Math.sin(a * 2 + 1.0) * 0.02 * s;
+    /* Two bobs per stride — the body rises on each diagonal, not once per
+       cycle. Idle breathing takes over as the gait fades out, and the
+       water takes over from both: a floating cat does not bob to its own
+       footfalls, it rides a surface that has its own slow period. */
+    const step = Math.sin(a * 2) * BOB_AMP * s + Math.sin(t * 1.6) * 0.012 * (1 - s);
+    p.bob = step * (1 - w) + Math.sin(t * 1.15) * 0.020 * w;
+    /* And it swims nose-up. Negative is the lift here, the same sense the
+       gait already uses to raise the head at speed — see setAim, where
+       the sign is written down. */
+    p.bodyPitch = (-s * 0.10 + Math.sin(a * 2 + 1.0) * 0.02 * s) * (1 - w)
+                - 0.09 * w;
 
     // Lean into the turn, and let the tail counterweight it.
     p.lean = -this.turn * 0.16 * Math.max(s, 0.35);
@@ -244,9 +295,11 @@ export class Driver {
       + Math.sin(a + 0.6) * 0.20 * s                     // sway with the gait
       + this.turn * 0.28;                                // and swing wide on a corner
 
-    // The head leads the turn and lifts a little at speed.
+    // The head leads the turn and lifts a little at speed — and a lot
+    // more in the water, which is the one thing a swimming cat is
+    // unambiguously doing.
     p.headYaw = this.turn * 0.30;
-    p.headPitch = -s * 0.10;
+    p.headPitch = -s * 0.10 - 0.14 * w;
     p.headTilt = Math.sin(t * 0.7) * 0.03 * (1 - s);
 
     // Ears flick back as it picks up speed, and twitch at rest.

@@ -378,6 +378,31 @@ const SHOTS_PLAN = [
            return true;` }),
   ),
 
+  /* The cat, out of its depth.
+     Driven for real: `pre` puts it in the lake and W swims it further in,
+     so what is photographed is the animal arriving in deep water rather
+     than being posed there. The clock runs — the swim blend and the
+     paddle are both time, and a frozen frame would catch a cat that had
+     not noticed the water yet.
+
+     Three things in one frame, and none of them is drawn by anything
+     that knows about the other two: the legs are gone because the lake
+     is nearer to the eye than they are, the body is riding the surface
+     rather than the bed under it, and the rings are coming off the same
+     bounding sphere the shadow is thrown from. */
+  { name: '49-cat-swims',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&hills=4.5&water=1'
+        + '&waterLevel=1&coverRadius=50&visibility=140&reeds=1&wind=0.35'
+        + '&camera=follow&daylight=hour&hour=11',
+    settle: 2800,
+    pre: `const c = __aether.scene.cat;
+          c.x = -10.5; c.z = -7.5; c.yaw = 3.9; c.velocity = 0;
+          __aether.scene.laser.silence(); return true;`,
+    hold: { key: 'w', ms: 1500, after: 400 },
+    poke: `const s = __aether.scene;
+           s.targetDist = 4.0; s.pitch = 0.15;
+           return true;` },
+
   /* The same midnight as 45, with weather in it — and the pair is the
      whole point, because the two frames differ by one control and what
      has to change is the *sky*. Before this, a snowstorm at midnight
@@ -2524,6 +2549,72 @@ async function interact(cdp, base, problems) {
      reads as fallen rather than painted, and the way to see that it is
      doing anything is that the blooms go from the drifts and stay in the
      scoured patches. All-or-nothing here means the mottle is flat. */
+  /* ── the cat in it ──
+     Everything else in this scene answers the water by staying out of
+     it. The cat is the one thing that can be driven into it, so it is
+     the one thing that needs two answers: it wades while the ground is
+     still holding it up and it swims when the ground has let go — and
+     the threshold is a share of the animal's own height rather than a
+     depth in metres, which is what makes it mean the same thing at any
+     scale.
+
+     What could break without showing: a cat walking along the bottom of
+     the lake. It would be *invisible* while it happened, because the
+     water is nearer to the eye than the animal and the composite would
+     hide the whole thing — right up to the moment it walked back out of
+     a lake it should have had to swim across. */
+  const catNow = () => cdp.eval(`(() => {
+    const c = __aether.scene.cat;
+    return { swim: c.swim, wake: c.wake, ride: c.rideY,
+             bed: c.floorY + c.footOffset, h: c.standH };
+  })()`);
+  const putCat = async (x, z) => {
+    await cdp.eval(`(() => { const c = __aether.scene.cat;
+      c.x = ${x}; c.z = ${z}; c.velocity = 0; c.strafeVel = 0;
+      return true; })()`);
+    await sleep(900);
+    return catNow();
+  };
+  await cdp.eval(`__aether.panel.setValues({ cat: true, hills: 4.5,
+    water: true, waterLevel: 1 }, { notify: true }); true`);
+  await sleep(400);
+  const onLand = await putCat(1.6, 1.6);
+  const afloat = await putCat(-10.5, -7.5);
+
+  check('deep water carries the cat rather than letting it walk the bottom',
+    onLand.swim === 0 && afloat.swim > 0.9
+    && Math.abs(onLand.ride - onLand.bed) < 1e-6
+    && afloat.ride > afloat.bed + afloat.h * 0.15,
+    `swim ${onLand.swim.toFixed(2)} ashore → ${afloat.swim.toFixed(2)} afloat, `
+    + `held ${(afloat.ride - afloat.bed).toFixed(2)}u off the bed `
+    + `(it stands ${afloat.h.toFixed(2)}u)`);
+
+  /* And that the surface is told, harder while it is going somewhere.
+     Zero on dry land is the half that matters: the rings are centred on
+     the cat's bounding sphere, which exists whether or not it is in any
+     water, so an animal walking past a lake could stir it from the
+     bank. */
+  const wakeIdle = (await catNow()).wake;
+  await hold(['w'], 700);
+  const wakeMoving = (await catNow()).wake;
+
+  check('a cat in the water works the surface, and works it harder moving',
+    onLand.wake === 0 && wakeIdle > 0 && wakeMoving > wakeIdle * 1.4,
+    `dry ${onLand.wake.toFixed(2)} · floating ${wakeIdle.toFixed(2)} `
+    + `· swimming ${wakeMoving.toFixed(2)}`);
+
+  /* Put the animal back on dry land *and* take the lake away again. The
+     sections after this one count what is flying over the meadow, and a
+     flooded meadow has fewer flocks on it — which is correct behaviour
+     and a wrong measurement, since what those checks are asking about is
+     the reach control. Left on, it reads as the reach having stopped
+     working. */
+  await cdp.eval(`(() => { const c = __aether.scene.cat;
+    c.x = 1.6; c.z = 1.6; c.velocity = 0;
+    __aether.panel.setValues({ water: false }, { notify: true });
+    return true; })()`);
+  await sleep(300);
+
   /* ── and the sky over it ──
      The weather used to reach everything under the sky and nothing in
      it, so a midnight snowstorm came with a clear field of stars. What

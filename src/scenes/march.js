@@ -120,6 +120,21 @@ ${WEATHER_GLSL}
 #define AO_REFERENCE ${AO_REFERENCE.toFixed(6)}
 #define CHOP_RATE ${CHOP_RATE.toFixed(4)}
 #define CHOP_NORM ${CHOP_NORM.toFixed(6)}
+/* The rings a cat makes: how many per metre, how fast they travel out,
+   how far they carry, and how deep. Short, quick and local — this is a
+   four-kilo animal, not a boat, and rings that outlived it or crossed the
+   whole lake would read as one.
+
+   The depth was found by photographing it rather than by reasoning, and
+   the first two guesses were both wrong by a lot. This lake shows its
+   normal almost entirely at grazing angles — that is where the fresnel
+   term hands the surface over to the reflection — and at a grazing angle
+   a ring a metre across is foreshortened into a line. A slope that
+   plainly beat the wind's chop on paper was invisible in the frame. */
+#define WAKE_K 9.0
+#define WAKE_SPEED 5.5
+#define WAKE_FALL 0.50
+#define WAKE_AMP 0.080
 
 in vec2 vUv;
 out vec4 outColor;
@@ -154,6 +169,12 @@ uniform float uReflectLit;
    sitting in, and that is visible the moment both are in frame. */
 uniform float uWind;
 ${WIND_GLSL}
+
+/* How hard the cat is working the surface it is standing in: 0 with dry
+   paws, a little while it floats, more while it swims. Where it is doing
+   it comes from uCatBound, which this shader already has because the
+   shadow needs it — so an animal in the water costs one float. */
+uniform float uCatWake;
 
 /* ═══ primitives and the shape ════════════════════════════════════ */
 ${CLUSTER_FIELD}
@@ -334,6 +355,8 @@ vec3 waterNormal(vec2 q, float dist) {
   float fade = exp(-dist * 0.030);
   if (fade < 0.02) return vec3(0.0, 1.0, 0.0);
 
+  vec2 g = vec2(0.0);
+
   /* How hard the wind is working the surface, and where in the gust this
      patch of it is.
 
@@ -354,26 +377,60 @@ vec3 waterNormal(vec2 q, float dist) {
   breeze *= 1.0 + 0.55 * slowGust(q);
   /* Still air is a mirror, and that is the honest answer rather than a
      special case: water is only rough because something is roughing it.
-     It is also eight sines cheaper than the alternative. */
-  if (breeze < 0.01) return vec3(0.0, 1.0, 0.0);
+     It is also eight sines cheaper than the alternative — but it is no
+     longer the end of the function, because the wind is not the only
+     thing that can be roughing it. */
+  if (breeze >= 0.01) {
+    /* The trains, fanned about the wind instead of crossing at fixed
+       angles. A wave is made by the wind blowing along it, so it travels
+       downwind — but not all of them exactly, because four trains dead in
+       line is corduroy and the spread either side is what gives a real
+       fetch its interference.
 
-  /* The trains, fanned about the wind instead of crossing at fixed
-     angles. A wave is made by the wind blowing along it, so it travels
-     downwind — but not all of them exactly, because four trains dead in
-     line is corduroy and the spread either side is what gives a real
-     fetch its interference.
+       Wave vector carries the direction and the frequency together, so
+       the gradient of each term is just that vector times the cosine —
+       the same trick, and the same reason, as the hills. The four lengths
+       and the four speeds are unchanged; what moved is where they
+       point. */
+    vec2 gw = vec2(0.0), k;
+    k = fetchDir(1.80, -0.38); gw += k * (0.0300 * cos(dot(q, k) - uTime * 1.30));
+    k = fetchDir(2.84,  0.52); gw += k * (0.0140 * cos(dot(q, k) - uTime * 1.05));
+    k = fetchDir(5.02, -0.86); gw += k * (0.0045 * cos(dot(q, k) - uTime * 1.70));
+    k = fetchDir(8.75,  1.02); gw += k * (0.0012 * cos(dot(q, k) - uTime * 2.20));
+    g += gw * breeze;
+  }
 
-     Wave vector carries the direction and the frequency together, so the
-     gradient of each term is just that vector times the cosine — the
-     same trick, and the same reason, as the hills. The four lengths and
-     the four speeds are unchanged; what moved is where they point. */
-  vec2 g = vec2(0.0), k;
-  k = fetchDir(1.80, -0.38); g += k * (0.0300 * cos(dot(q, k) - uTime * 1.30));
-  k = fetchDir(2.84,  0.52); g += k * (0.0140 * cos(dot(q, k) - uTime * 1.05));
-  k = fetchDir(5.02, -0.86); g += k * (0.0045 * cos(dot(q, k) - uTime * 1.70));
-  k = fetchDir(8.75,  1.02); g += k * (0.0012 * cos(dot(q, k) - uTime * 2.20));
+  /* And whatever is standing in it.
 
-  g *= breeze * fade;
+     Rings out from the animal, and they are added *after* the wind's
+     term rather than scaled by it — a cat in a dead calm is the case
+     these exist for, and one that only disturbed water the wind had
+     already disturbed would be a cat that cannot be seen to be in the
+     lake at all.
+
+     The centre costs nothing: the marcher is already given the cat's
+     bounding sphere, because the shadow needs it. What is new is one
+     float saying how hard the animal is working the surface — standing
+     in the shallows, or swimming — and it is zero the moment its paws
+     are dry, which is what keeps a cat walking *past* a lake from
+     stirring it.
+
+     The gradient is the derivative of the ring along the radius times
+     the radial direction. The wavenumber dominates the falloff by an
+     order of magnitude, so the falloff's own derivative is dropped: it
+     would be a correction of a few per cent to the slope of something
+     already made up. */
+  if (uCatWake > 0.0) {
+    vec2 rel = q - uCatBound.xz;
+    float r = length(rel);
+    float fall = exp(-r * WAKE_FALL);
+    if (fall > 0.02) {
+      g += (rel / max(r, 1e-4))
+         * (uCatWake * WAKE_AMP * WAKE_K * cos(r * WAKE_K - uTime * WAKE_SPEED) * fall);
+    }
+  }
+
+  g *= fade;
   return normalize(vec3(-g.x, 1.0, -g.y));
 }
 
@@ -887,7 +944,13 @@ export default {
         + '**擾動它的是「風」那支滑桿**——四道波列順著風向散開行進，'
         + '振幅隨風飽和，並被草和樹讀的**同一陣陣風**調製：'
         + '所以掃過草原的那陣風，你會看見它掃過湖面（真實湖面上那片粗糙的暗紋）。'
-        + '把風關到 0，湖就是一面鏡子——那不是特例，是誠實的答案：**水會粗糙只因為有東西在弄粗它**。' },
+        + '把風關到 0，湖就是一面鏡子——那不是特例，是誠實的答案：**水會粗糙只因為有東西在弄粗它**。'
+        + '**貓也算一個弄粗它的東西**：牠站在水裡會盪出漣漪，移動時更大、不動時仍有；'
+        + '那一圈的中心不用花任何代價，因為行進器本來就拿著牠的包圍球（陰影要用）。'
+        + '而水深過牠身高一半，牠就從走路換成**浮在水面上**——'
+        + '游泳不是第二套動畫，是同一套步態把腿的靜止角度往後移到身體底下、'
+        + '擺動縮到四分之一、而且**永遠不停**（停止划水的貓會沉）。'
+        + '沒入水下的部分不需要裁切：湖是行進器畫的、貓是光柵畫的，合成取近的那個。' },
     { id: 'cover', type: 'slider', label: '草的密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
     { id: 'flowers', type: 'switch', label: '花', value: false },
     { id: 'flowerClumps', type: 'slider', label: '花叢密度', min: 0.05, max: 1, step: 0.01, value: 0.62 },
@@ -1325,12 +1388,14 @@ class MarchScene {
 
     if (follow) {
       const cat = this.cat;
-      // Chest height, so the camera looks at the animal and not at the
-      // floor it is standing on.
-      // Measured from the ground under the animal, not from a constant:
-      // on a slope the two differ by metres, and the camera would be
-      // aiming at the hillside beside it.
-      const chest = cat.floorY + cat.footOffset + cat.header.bounds.max[1] * cat.scale * 0.55;
+      /* Chest height, so the camera looks at the animal and not at the
+         floor it is standing on.
+         Measured from wherever the animal actually is, not from a
+         constant and not from the ground: on a slope the two differ by
+         metres and the camera would aim at the hillside beside it, and
+         out in the lake the ground is not what the cat is standing on
+         at all. */
+      const chest = cat.rideY + cat.header.bounds.max[1] * cat.scale * 0.55;
       cx = ax = cat.x;
       cy0 = ay = chest;
       cz = az = cat.z;
@@ -2070,7 +2135,7 @@ class MarchScene {
       // Last frame's basis, deliberately: the camera has not been moved
       // yet this frame, and steering off the picture the user is
       // actually looking at is both correct and one less feedback path.
-      this.cat.update(dt, state.hills, this.basis);
+      this.cat.update(dt, state.hills, this.basis, waterY);
     } else if (this.cat) {
       this.cat.releaseKeys();                   // or it resumes mid-stride
     }
@@ -2232,6 +2297,8 @@ class MarchScene {
       uCatCapB: showCat ? this.cat.capB : ZERO_CAPS,
       uCatBound: showCat ? this.cat.capBound : ZERO_BOUND,
       uCatCaps: showCat ? this.cat.capCount : 0,
+      // And what it is doing to the water, if it is in any.
+      uCatWake: showCat ? this.cat.wake : 0,
 
       ...this.trees.uniforms(),
 

@@ -28,7 +28,7 @@ import {
 } from '../cluster.js';
 import { CANOPY_SHADE_GLSL } from '../canopy.js';
 import { RASTER_NEAR as NEAR, RASTER_FAR as FAR } from '../raster.js';
-import { TERRAIN_GLSL, terrainHeight } from '../terrain.js';
+import { TERRAIN_GLSL, terrainHeight, WATER_OFF } from '../terrain.js';
 import { parseCat, Rig, modelMatrix } from './rig.js';
 import { Driver, Sway, applyPose } from './pose.js';
 
@@ -358,6 +358,39 @@ const TURN_RATE = 3.2;   // radians/s, steering into a corner
 const TURN_RATE_COURSE = 6.0;
 const STRAFE_SCALE = 0.85;  // sidling is slower than walking, as it should be
 
+/* ── the water ──
+   Two states and a shelving bank between them, and the depth that
+   decides which is a share of the animal's own height rather than a
+   number of metres — so it means the same thing however the cat is
+   scaled and whatever the hills are set to.
+
+   Below the first figure it wades: the walk is untouched, and what makes
+   it read as wading is not animation at all but the depth buffer, since
+   the lake is drawn by the marcher and the cat by the raster pass and
+   the composite keeps whichever is nearer. The legs are behind the
+   surface, so the legs are gone.
+
+   Past the second it is swimming, which means it stops standing on the
+   ground and starts standing on the water: the body is placed against
+   the surface instead of against the height field, and from there the
+   hills underneath can do whatever they like. That is also what stops
+   the animal walking down a shelf into the dark and vanishing. */
+const SWIM_IN = 0.52;    // share of standing height where the ground lets go
+const SWIM_OUT = 0.78;   // and where it is carried entirely
+/** How deep it floats, as a share of that height. Most of the animal is
+    under: what a swimming cat keeps up is the head, the neck, the line of
+    the back and the tail — and getting this wrong in either direction is
+    the whole read, since a cat riding high is a toy in a bath and one
+    riding low is a drowning cat. */
+const SWIM_DRAFT = 0.62;
+/** Swimming is slower than walking, and it is slower for the reason it
+    looks slower — there is nothing to push against. */
+const SWIM_DRAG = 0.45;
+/** What a cat in the water does to the surface, standing still and at a
+    full stroke. Never zero while it is in there: an animal that leaves
+    the water flat is an animal standing on a photograph of it. */
+const WAKE_IDLE = 0.35;
+
 /* How far the head will turn on its own before the body has to help.
    A cat looks at things by turning its head; the body comes round only
    when the head runs out of neck. */
@@ -466,6 +499,16 @@ export class Cat {
        vertex in the rest pose sits exactly on the floor plane. */
     this.scale = 0.34;
     this.footOffset = -this.header.bounds.min[1] * this.scale;
+    /** How high its back stands, in world units. Published because the
+        water measures itself against the animal rather than in metres.
+
+        Deliberately not the bounding box: the top of that box is a tail
+        held upright, and an animal that had to be in water as deep as
+        its own raised tail before it would swim is an animal that walks
+        along the bottom of every lake in the scene. This is the same
+        figure the follow camera calls chest height, and for the same
+        reason — it is where the animal actually is. */
+    this.standH = this.footOffset + this.header.bounds.max[1] * this.scale * 0.55;
 
     this.x = 1.6;
     this.z = 1.6;
@@ -476,6 +519,14 @@ export class Cat {
     /** Signed speed along the cat's own right. Only `look` mode has it. */
     this.strafeVel = 0;
     this.floorY = 0;
+    /** Where the body is actually placed, which is the ground until the
+        water takes over. Every consumer of "how high is the cat" reads
+        this; `floorY` stays what it says it is. */
+    this.rideY = 0;
+    /** 0 on dry land, 1 afloat. */
+    this.swim = 0;
+    /** How hard it is working the surface, for the water to read. */
+    this.wake = 0;
     this.animating = true;
     this.mode = 'camera';
     /* Where the head is being pointed, relative to the body, and how
@@ -560,7 +611,7 @@ export class Cat {
     // Rebuild the placement now rather than next frame: callers turn the
     // cat in order to read where its eyes ended up, and a stale matrix
     // would hand them the eyes it had before it turned.
-    modelMatrix(this._model, this.x, this.floorY + this.footOffset, this.z, this.yaw, this.scale);
+    modelMatrix(this._model, this.x, this.rideY, this.z, this.yaw, this.scale);
   }
 
   /**
@@ -671,7 +722,7 @@ export class Cat {
    * floor is the obvious shape and it is a frame of lag between the feet
    * and the hill, which at a walk on a slope is a visible skate.
    */
-  update(dt, hills, camera) {
+  update(dt, hills, camera, waterY = WATER_OFF) {
     const d = Math.min(0.05, Math.max(0, dt));
 
     const look = this.mode === 'look';
@@ -692,9 +743,15 @@ export class Cat {
       forward = this._steerToCourse(kx, kz, d, camera);
     }
 
+    /* Last frame's answer, because this frame's is not known until the
+       cat has been moved and the ground under the new spot asked. One
+       frame of lag on a number that takes half a second to travel from
+       0 to 1 is not a thing anybody can see, and the alternative is
+       working out where it is about to be. */
+    const top = TOP_SPEED * (1 - SWIM_DRAG * this.swim);
     const ease = (v, want, input) => v + (want - v) * (1 - Math.exp(-d * (input ? ACCEL : DRAG)));
-    this.velocity = ease(this.velocity, forward * TOP_SPEED, forward);
-    this.strafeVel = ease(this.strafeVel, strafe * TOP_SPEED * STRAFE_SCALE, strafe);
+    this.velocity = ease(this.velocity, forward * top, forward);
+    this.strafeVel = ease(this.strafeVel, strafe * top * STRAFE_SCALE, strafe);
     if (Math.abs(this.velocity) < 1e-4) this.velocity = 0;
     if (Math.abs(this.strafeVel) < 1e-4) this.strafeVel = 0;
 
@@ -714,6 +771,30 @@ export class Cat {
        than on a second opinion about it. */
     this.floorY = terrainHeight(this.x, this.z, hills);
 
+    /* And how much of it the water is holding up. The depth is the same
+       one every seed in this scene is drowned by — one height field, one
+       surface, one answer — and it is compared against the animal's own
+       height so the threshold means the same thing at any scale. */
+    const deep = waterY - this.floorY;
+    const u = Math.min(1, Math.max(0,
+      (deep / this.standH - SWIM_IN) / (SWIM_OUT - SWIM_IN)));
+    this.swim = u * u * (3 - 2 * u);
+
+    /* Standing on the ground, or standing on the water. Blended by the
+       same number, so a shelving bank lifts the animal off its feet over
+       a stride or two rather than at a line. */
+    const afloat = waterY - this.standH * SWIM_DRAFT + this.footOffset;
+    this.rideY = (this.floorY + this.footOffset) * (1 - this.swim)
+               + afloat * this.swim;
+
+    /* What the surface is being told. Zero the moment the paws are dry,
+       so the lake is not being stirred by an animal standing beside it —
+       and the wetting is measured well below the swim threshold, because
+       a cat with its feet in the shallows is already making rings. */
+    const wet = Math.min(1, Math.max(0, deep / (this.standH * 0.22)));
+    this.wake = wet * (WAKE_IDLE
+      + (1 - WAKE_IDLE) * Math.min(1, this.speed / TOP_SPEED));
+
     // One turn signal for both modes, taken from the yaw that actually
     // happened rather than from whichever input caused it. The lean and
     // the tail then behave the same however the cat is being driven.
@@ -729,7 +810,7 @@ export class Cat {
     this._aimHeld = false;                  // renewed each frame or released
 
     const speed = Math.min(1, this.speed / TOP_SPEED);
-    const pose = this.driver.step(d, speed, this.turnRate);
+    const pose = this.driver.step(d, speed, this.turnRate, this.swim);
     pose.aimYaw = this._aimYaw;
     pose.aimPitch = this._aimPitch;
     pose.aimWeight = this._aimWeight;
@@ -749,9 +830,11 @@ export class Cat {
     // frames and would otherwise resolve as a smear — or a tail still
     // settling after the body has stopped.
     this.animating = this.speed !== 0 || this.turnRate !== 0
-      || this.rig.changed || this.sway.activity > 2e-3;
+      || this.rig.changed || this.sway.activity > 2e-3
+      // A floating cat is never still: it is paddling to stay where it is.
+      || this.swim > 0.01;
 
-    modelMatrix(this._model, this.x, this.floorY + this.footOffset, this.z, this.yaw, this.scale);
+    modelMatrix(this._model, this.x, this.rideY, this.z, this.yaw, this.scale);
     this._fitProxy();
     return this;
   }
