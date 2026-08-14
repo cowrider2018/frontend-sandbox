@@ -53,6 +53,7 @@ import { Laser } from './laser.js';
 import { GroundCover, isCovered } from './ground.js';
 import { Trees } from './trees.js';
 import { CANOPY_SHADE_GLSL } from './canopy.js';
+import { WIND_GLSL } from './wind.js';
 
 /* Mouse-look sensitivity. The locked figure is per device pixel and is
    the usual first-person number; the unlocked one is per canvas width,
@@ -91,6 +92,20 @@ const ZERO_BOUND = new Float32Array(4);
 /** AO weight sum for the reference 5-tap schedule; see ambientOcclusion. */
 const AO_REFERENCE = 0.1959;
 
+/** Where the wind control starts. Named because the water is tuned
+    against it — see CHOP_NORM. */
+const WIND_DEFAULT = 0.55;
+/* How fast chop comes up with the wind. Saturating and not linear: the
+   first breath of wind puts most of the slope on a lake and a gale adds
+   little to it, which is also what keeps the top of the slider from
+   turning the surface into noise the temporal filter has to argue with. */
+const CHOP_RATE = 2.1;
+/* And the scale that puts the default breeze at exactly the surface the
+   four wave amplitudes below were tuned on. Derived rather than typed,
+   so moving the slider's default moves this with it instead of quietly
+   re-tuning the lake. */
+const CHOP_NORM = 1 / (1 - Math.exp(-CHOP_RATE * WIND_DEFAULT));
+
 const FRAG_MARCH = /* glsl */`
 ${PRECISION}
 ${CONSTANTS}
@@ -103,6 +118,8 @@ ${TERRAIN_GLSL}
 ${WEATHER_GLSL}
 
 #define AO_REFERENCE ${AO_REFERENCE.toFixed(6)}
+#define CHOP_RATE ${CHOP_RATE.toFixed(4)}
+#define CHOP_NORM ${CHOP_NORM.toFixed(6)}
 
 in vec2 vUv;
 out vec4 outColor;
@@ -127,6 +144,16 @@ uniform float uErodeMax;
 // quality
 uniform int   uSteps, uAoTaps, uReflectSteps;
 uniform float uReflectLit;
+
+/* The wind, which the marcher has exactly one consumer for.
+
+   Nothing grows in here — the plants are all in the raster half — but
+   the lake is a surface the weather works on, and the field that works
+   it is the field the grass is already reading. A lake with its own
+   private chop is a lake in different weather from the meadow it is
+   sitting in, and that is visible the moment both are in frame. */
+uniform float uWind;
+${WIND_GLSL}
 
 /* ═══ primitives and the shape ════════════════════════════════════ */
 ${CLUSTER_FIELD}
@@ -281,9 +308,18 @@ vec3 groundAlbedo(vec3 p, out float rough) {
   return mix(vec3(0.024, 0.026, 0.032), uTint * 0.6, line * fade * 0.5);
 }
 
+/** A wave vector of a given length, turned off the wind by an angle.
+    Both arguments are compile-time constants at every call site, so the
+    sine and cosine are folded and this costs a multiply. */
+vec2 fetchDir(float len, float spread) {
+  float c = cos(spread), s = sin(spread);
+  return len * vec2(WIND_DIR.x * c - WIND_DIR.y * s,
+                    WIND_DIR.x * s + WIND_DIR.y * c);
+}
+
 /**
- * The surface of the water: flat, with four crossing wave trains laid
- * over its normal.
+ * The surface of the water: flat, with four wave trains laid over its
+ * normal by whatever wind is blowing across it.
  *
  * Nothing is displaced. A lake seen from eye height is almost entirely
  * reflection, and reflection is a function of the normal alone — so
@@ -298,16 +334,47 @@ vec3 waterNormal(vec2 q, float dist) {
   float fade = exp(-dist * 0.030);
   if (fade < 0.02) return vec3(0.0, 1.0, 0.0);
 
-  /* Wave vector carries the direction and the frequency together, so the
-     gradient of each term is just that vector times the cosine — the
-     same trick, and the same reason, as the hills. */
-  vec2 g = vec2(0.0), k;
-  k = vec2( 1.70,  0.60); g += k * (0.0300 * cos(dot(q, k) + uTime * 1.30));
-  k = vec2(-1.60,  2.35); g += k * (0.0140 * cos(dot(q, k) - uTime * 1.05));
-  k = vec2( 1.75, -4.70); g += k * (0.0045 * cos(dot(q, k) + uTime * 1.70));
-  k = vec2(-8.50, -2.10); g += k * (0.0012 * cos(dot(q, k) - uTime * 2.20));
+  /* How hard the wind is working the surface, and where in the gust this
+     patch of it is.
 
-  return normalize(vec3(-g.x * fade, 1.0, -g.y * fade));
+     The first factor saturates, because that is what chop does: the
+     first breath of wind puts most of the slope on a lake and the rest
+     of the slider hardly adds to it. The second is the gust itself,
+     sampled at the point on the water — the same field, arriving on the
+     same beat, as the one crossing the grass a few metres away. That is
+     the whole reason to do this: the cat's paw sliding over the lake and
+     the ripple going through the meadow are one event, and a surface
+     that chops on its own private schedule is the tell that they are
+     not.
+
+     Centred on 1 rather than added, so the gust redistributes the chop
+     instead of raising it — the lulls go glassy and the gust front takes
+     what they gave up. */
+  float breeze = (1.0 - exp(-uWind * CHOP_RATE)) * CHOP_NORM;
+  breeze *= 1.0 + 0.55 * slowGust(q);
+  /* Still air is a mirror, and that is the honest answer rather than a
+     special case: water is only rough because something is roughing it.
+     It is also eight sines cheaper than the alternative. */
+  if (breeze < 0.01) return vec3(0.0, 1.0, 0.0);
+
+  /* The trains, fanned about the wind instead of crossing at fixed
+     angles. A wave is made by the wind blowing along it, so it travels
+     downwind — but not all of them exactly, because four trains dead in
+     line is corduroy and the spread either side is what gives a real
+     fetch its interference.
+
+     Wave vector carries the direction and the frequency together, so the
+     gradient of each term is just that vector times the cosine — the
+     same trick, and the same reason, as the hills. The four lengths and
+     the four speeds are unchanged; what moved is where they point. */
+  vec2 g = vec2(0.0), k;
+  k = fetchDir(1.80, -0.38); g += k * (0.0300 * cos(dot(q, k) - uTime * 1.30));
+  k = fetchDir(2.84,  0.52); g += k * (0.0140 * cos(dot(q, k) - uTime * 1.05));
+  k = fetchDir(5.02, -0.86); g += k * (0.0045 * cos(dot(q, k) - uTime * 1.70));
+  k = fetchDir(8.75,  1.02); g += k * (0.0012 * cos(dot(q, k) - uTime * 2.20));
+
+  g *= breeze * fade;
+  return normalize(vec3(-g.x, 1.0, -g.y));
 }
 
 vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal,
@@ -807,7 +874,13 @@ export default {
         + '所以**岸線不是畫出來的**：它就是地形跟水面相交的地方，'
         + '拉「地形起伏」或拉「水位」它都會跟著動，而草、花、樹也用同一條規則決定自己有沒有被淹到。'
         + '水位是**相對於起伏**的：0.5 在一公尺的丘陵和八公尺的丘陵都是「谷底積水一半」。'
-        + '地形起伏為 0 時沒有水——平地跟水面共面，誰在前面沒有穩定的答案。' },
+        + '地形起伏為 0 時沒有水——平地跟水面共面，誰在前面沒有穩定的答案。'
+        + '水面本身沒有模擬也沒有折射：湖幾乎全是反射，而反射只是法線的函數，'
+        + '所以擾動法線就買到整個外觀，平面仍然是平面。'
+        + '**擾動它的是「風」那支滑桿**——四道波列順著風向散開行進，'
+        + '振幅隨風飽和，並被草和樹讀的**同一陣陣風**調製：'
+        + '所以掃過草原的那陣風，你會看見它掃過湖面（真實湖面上那片粗糙的暗紋）。'
+        + '把風關到 0，湖就是一面鏡子——那不是特例，是誠實的答案：**水會粗糙只因為有東西在弄粗它**。' },
     { id: 'cover', type: 'slider', label: '草的密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
     { id: 'flowers', type: 'switch', label: '花', value: false },
     { id: 'flowerClumps', type: 'slider', label: '花叢密度', min: 0.05, max: 1, step: 0.01, value: 0.62 },
@@ -816,7 +889,7 @@ export default {
     { id: 'coverRadius', type: 'slider', label: '植被視距', min: 8, max: 200, step: 1, value: 15 },
     { id: 'trees', type: 'switch', label: '樹', value: false },
     { id: 'treeDensity', type: 'slider', label: '樹的密度', min: 0.1, max: 1, step: 0.01, value: 0.6 },
-    { id: 'wind', type: 'slider', label: '風', min: 0, max: 1.4, step: 0.01, value: 0.55 },
+    { id: 'wind', type: 'slider', label: '風', min: 0, max: 1.4, step: 0.01, value: WIND_DEFAULT },
     { id: 'butterflies', type: 'slider', label: '蝴蝶', min: 0, max: 1, step: 0.01, value: 0 },
     { id: 'fireflies', type: 'slider', label: '螢火蟲', min: 0, max: 1, step: 0.01, value: 0 },
     { id: 'sparrowFlocks', type: 'slider', label: '麻雀群數', min: 0, max: 1, step: 0.01, value: 0 },
@@ -2102,6 +2175,9 @@ class MarchScene {
       uGround: covered ? 1 : 0,
       uHills: state.hills,
       uWaterY: waterY,
+      /* The same number the grass, the trees and the falling rain are
+         handed. The lake is this shader's only reader of it. */
+      uWind: state.wind,
       uRain: weather.rain,
       uSnow: weather.snow,
       uLightDir: this.lightDir,
