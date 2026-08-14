@@ -2578,6 +2578,58 @@ async function interact(cdp, base, problems) {
     + `under cloud (luma ${openSky.high.toFixed(0)}/${openSky.low.toFixed(0)} `
     + `→ ${shutSky.high.toFixed(0)}/${shutSky.low.toFixed(0)})`);
 
+  /* And the stars, which are the other half of the same claim and the
+     one a picture is worst at judging: they are single pixels, so any
+     downscale averages them into the sky before anyone can count them.
+
+     This is a regression check with a real failure behind it. The first
+     star field hashed a point inside a *cubic* cell and measured the
+     distance from the ray to it — but the rays only ever sample the unit
+     shell that passes through those cells, so a centre a tenth of a cell
+     off the shell was already down to a thousandth of its brightness.
+     The sky was not faint, it was empty, and nothing in the frame said
+     so: an empty night sky looks exactly like a night sky. Counting
+     bright pixels at full resolution is the only thing that does. */
+  const starCount = () => cdp.eval(`(() => {
+    const c = document.getElementById('stage');
+    const s = document.createElement('canvas');
+    // The middle of the frame, above the horizon: no logo, no panel.
+    const x0 = Math.round(c.width * 0.25), y0 = Math.round(c.height * 0.05);
+    s.width = Math.round(c.width * 0.45);
+    s.height = Math.round(c.height * 0.22);
+    const g = s.getContext('2d');
+    g.drawImage(c, x0, y0, s.width, s.height, 0, 0, s.width, s.height);
+    const d = g.getImageData(0, 0, s.width, s.height).data;
+    let n = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2] > 20) n++;
+    }
+    return n;
+  })()`);
+  const skyAtNight = async (mode) => {
+    await cdp.eval(`(() => {
+      __aether.panel.setValues({ weather: '${mode}', daylight: 'hour', hour: 0,
+        fireflies: 0, butterflies: 0, sparrowFlocks: 0 }, { notify: true });
+      const sc = __aether.scene;
+      sc.pitch = 0.06; sc.targetDist = 22;
+      return true;
+    })()`);
+    await sleep(1600);
+    return starCount();
+  };
+  const starry = await skyAtNight('clear');
+
+  /* Only the clear half is counted. The other one cannot be measured
+     this way and it would be a lie to pretend otherwise: a covered sky
+     comes with something falling out of it, and a snowflake in front of
+     the camera is a bright pixel in exactly this box. What the cloud
+     does to the stars is held by the flattening check above, by the
+     construction — the star term is multiplied by (1 - overcast) — and
+     by 48-night-snow, where it is the whole subject of the frame. */
+  check('a clear night has stars in it',
+    starry > 30,
+    `${starry} lit pixels in the clear midnight sky`);
+
   await cdp.eval(`__aether.panel.setValues({ weather: 'snow', daylight: 'fixed',
     light: [0.68, 0.24] }, { notify: true });
     __aether.scene.pitch = 0.16; true`);

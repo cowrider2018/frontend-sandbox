@@ -345,6 +345,14 @@ uniform vec3 uLightDir, uTint;
    somebody already thought to include something else, and the whole
    point of a shared chunk is that it goes anywhere. Six lines is a
    cheaper answer than a rule everybody has to remember. */
+/* Cells across a unit direction, how few of them hold a star, and how
+   tight one is. The last is an inverse angle: a star reaches zero at
+   1/STAR_TIGHT radians, which at this focal length is about three pixels
+   of a 900-line frame, and half its brightness inside one. */
+#define STAR_CELLS 46.0
+#define STAR_ODDS 0.9875
+#define STAR_TIGHT 240.0
+
 vec3 starHash(vec3 p) {
   p = fract(p * vec3(0.1031, 0.1030, 0.0973));
   p += dot(p, p.yxz + 33.33);
@@ -431,18 +439,50 @@ vec3 sky(vec3 rd) {
      The threshold is what keeps them sparse. Every cell has a candidate
      in it; roughly one in eighty is allowed to be a star, and which one
      is decided by the same hash that placed it, so the field is fixed to
-     the world and does not swim as the camera turns. */
+     the world and does not swim as the camera turns.
+
+     ── a star is a direction, and the first version made it a point ──
+     That version put the star at a random point *inside* the cubic cell
+     and measured the distance from the ray to it. The cells are cubes in
+     a volume; the rays only ever sample the unit shell that passes
+     through them. A centre sitting a tenth of a cell off that shell is
+     already down to a thousandth of its brightness — so the shell had to
+     catch the centre nearly exactly, and it almost never did. Counted
+     over a frame of real ray directions: the whole sky reached a quarter
+     of one star's peak and nothing else got within two per cent of it.
+     The field was not faint, it was empty, and the two or three specks
+     that did survive were the ones that had got lucky.
+
+     What is hashed now is a *direction* through the cell, and what is
+     measured is the angle to it. A star cannot be off the shell any
+     more, because it no longer has anywhere else to be.
+
+     The jitter is held to a quarter cell for the reason the size is set
+     where it is: a ray only ever asks its own cell, so a star whose
+     support ran past the cell's own footprint would be cut in half at
+     the border. A quarter of a cell of wander leaves more margin than
+     the star is wide. */
   // And no stars through cloud, which is the whole of why the weather is
   // in this function: a snowstorm at midnight had a full sky of them.
   float night = (1.0 - smoothstep(0.0, 0.62, uDay)) * (1.0 - uOvercast);
   if (night > 0.002 && rd.y > -0.02) {
-    vec3 d = rd * 46.0;
-    vec3 g = starHash(floor(d));
-    float star = pow(max(0.0, 1.0 - length(fract(d) - 0.15 - g * 0.7) * 2.6), 22.0);
-    star *= step(0.9875, g.z);
-    // Faded into the horizon haze, where there is more air to look
-    // through and where the ground is about to be in the way anyway.
-    c += vec3(0.86, 0.90, 1.0) * star * night * smoothstep(-0.02, 0.30, rd.y) * 1.5;
+    vec3 cell = floor(rd * STAR_CELLS);
+    vec3 g = starHash(cell);
+    if (g.z >= STAR_ODDS) {
+      vec3 dir = normalize(cell + 0.5 + (g - 0.5) * 0.5);
+      /* Sized in *angle*, not in pixels, which is both what a star is and
+         what keeps it from changing with the render scale. The core comes
+         out a pixel or so across at this focal length — deliberately not
+         less: a point smaller than a pixel is not a point, it is
+         something for the temporal filter to average away, which is the
+         same argument the water's ripples and the sparrow's stride are
+         made of. */
+      float star = pow(max(0.0, 1.0 - length(rd - dir) * STAR_TIGHT), 3.0);
+      // Faded into the horizon haze, where there is more air to look
+      // through and where the ground is about to be in the way anyway.
+      c += vec3(0.86, 0.90, 1.0) * star * night
+         * smoothstep(-0.02, 0.30, rd.y) * 1.5;
+    }
   }
 
   /* A soft disc so reflections have something to catch. It is the sun by
