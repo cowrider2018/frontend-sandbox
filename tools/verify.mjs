@@ -378,6 +378,27 @@ const SHOTS_PLAN = [
            return true;` }),
   ),
 
+  /* The same midnight as 45, with weather in it — and the pair is the
+     whole point, because the two frames differ by one control and what
+     has to change is the *sky*. Before this, a snowstorm at midnight
+     came with a full field of stars and a moon with a hard edge on it,
+     which is the frame nobody would have gone looking for: everything
+     under the sky had the weather and nothing in it did.
+
+     What to look for: no stars, no disc, and the gradient gone flat —
+     and the meadow below it still lit the way 45 lit it, because this
+     changes what the sky *is* and not how much light comes out of it. */
+  { name: '48-night-snow',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0'
+        + '&visibility=200&hills=4.5&water=1&waterLevel=0.9&coverRadius=70'
+        + '&butterflies=0.7&fireflies=1&sparrowFlocks=0.7'
+        + '&daylight=hour&hour=0&weather=snow',
+    settle: 3600, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.06; s.targetDist = 22;
+           return true;` },
+
   /* The meadow's population, close enough to see what each one is.
      40 is butterflies at full density from three metres away — two
      wings, no body, and every one of them at a different point in its
@@ -2503,6 +2524,65 @@ async function interact(cdp, base, problems) {
      reads as fallen rather than painted, and the way to see that it is
      doing anything is that the blooms go from the drifts and stay in the
      scoured patches. All-or-nothing here means the mottle is flat. */
+  /* ── and the sky over it ──
+     The weather used to reach everything under the sky and nothing in
+     it, so a midnight snowstorm came with a clear field of stars. What
+     an overcast sky mostly is, is the *loss of the gradient*: clear air
+     is deep overhead and pale at the horizon, and a cloud deck is a lit
+     sheet that reads nearly the same brightness everywhere. So that is
+     what is measured — two bands of sky, and the ratio between them
+     collapsing toward one — rather than a colour, which would be a
+     restatement of the constants.
+
+     Sampled down the left quarter of the frame. This is an orbit camera
+     and it always looks at the middle, so the middle is where the
+     cluster is. */
+  const skyBand = (a, b) => cdp.eval(`(() => {
+    const c = document.getElementById('stage');
+    const s = document.createElement('canvas');
+    s.width = 32; s.height = 12;
+    const g = s.getContext('2d');
+    g.drawImage(c, 0, c.height * ${a}, c.width * 0.25, c.height * (${b} - ${a}),
+                0, 0, 32, 12);
+    const d = g.getImageData(0, 0, 32, 12).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+    }
+    return sum / (d.length / 4);
+  })()`);
+  const skyTilt = async (mode) => {
+    /* Wrapped, and not for style: these run as top-level script in one
+       long-lived context, so a bare `const s` here collides with the one
+       another check declared an hour of test time ago. */
+    await cdp.eval(`(() => {
+      __aether.panel.setValues({ weather: '${mode}',
+        daylight: 'hour', hour: 12 }, { notify: true });
+      const sc = __aether.scene;
+      sc.pitch = -0.5; sc.targetDist = 20;
+      return true;
+    })()`);
+    await sleep(700);
+    const high = await skyBand(0.03, 0.13);
+    const low = await skyBand(0.42, 0.52);
+    return { high, low, tilt: high / Math.max(low, 0.001) };
+  };
+  const openSky = await skyTilt('clear');
+  const shutSky = await skyTilt('snow');
+
+  check('cloud flattens the sky it is covering',
+    openSky.tilt < 0.9
+    && Math.abs(1 - shutSky.tilt) < Math.abs(1 - openSky.tilt) * 0.5
+    && shutSky.low > openSky.low,
+    `zenith/horizon ${openSky.tilt.toFixed(2)} clear → ${shutSky.tilt.toFixed(2)} `
+    + `under cloud (luma ${openSky.high.toFixed(0)}/${openSky.low.toFixed(0)} `
+    + `→ ${shutSky.high.toFixed(0)}/${shutSky.low.toFixed(0)})`);
+
+  await cdp.eval(`__aether.panel.setValues({ weather: 'snow', daylight: 'fixed',
+    light: [0.68, 0.24] }, { notify: true });
+    __aether.scene.pitch = 0.16; true`);
+  await sleep(400);
+
   check('snow takes the drifts and leaves the scoured patches',
     snowed.flowers > 0,
     `${snowed.flowers} of ${dry.flowers} flowers still standing in the open`);

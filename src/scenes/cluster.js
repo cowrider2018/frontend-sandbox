@@ -355,6 +355,23 @@ vec3 starHash(vec3 p) {
     taken before there was a time of day still renders byte for byte. */
 uniform float uDay;
 
+/* How much cloud is between here and it, 0..1.
+
+   The weather already reaches everything under the sky and nothing in
+   it: the ground goes dark and wet, the drifts lie, something falls —
+   and above all of that, a midnight downpour under a clear starfield.
+   That is the specific frame this number exists to stop.
+
+   It arrives resolved rather than as the rain and the snow themselves,
+   and not for tidiness. This block is included by five shaders and two
+   of them pull it in *before* the weather's own uniforms; a sky that
+   reached for uRain would be a sky that compiles only where somebody
+   already thought to include something else, which is the one thing a
+   shared chunk must never be. One number, produced in JS from the mode
+   table, and an upload site that forgets it reads zero — which is fair
+   weather, and exactly the sky this scene had before. */
+uniform float uOvercast;
+
 /**
  * The light that arrives from everywhere rather than from the sun.
  *
@@ -389,6 +406,23 @@ vec3 sky(vec3 rd) {
   vec3 c = mix(bot, hor, smoothstep(0.35, 0.5, h));
   c = mix(c, top, smoothstep(0.5, 1.0, h));
 
+  /* Overcast, which is mostly the *loss of a gradient*. A clear sky is
+     deep overhead and pale at the horizon because that is where the air
+     is; a covered one is a lit sheet a kilometre up and reads almost the
+     same brightness everywhere, which is why a flattened gradient says
+     "cloud" before any colour does.
+
+     Toward the horizon's own colour rather than toward a grey of its
+     own: the horizon band is already the mixture of daylight and air
+     this sky is made of, so flattening onto it keeps every hour's
+     palette — an overcast dusk stays orange, an overcast midnight stays
+     nearly black — without a second set of constants to keep in step
+     with the first. Lifted a little, because cloud lit from above is
+     brighter than the air it replaced. */
+  if (uOvercast > 0.0) {
+    c = mix(c, hor * mix(1.0, 1.35, uDay), uOvercast * 0.85);
+  }
+
   /* Stars, and only the ones the sky is dark enough to show. Placed by
      hashing a cell of the direction itself rather than a texture: the
      sphere is being sampled by the same rays that sample everything
@@ -398,7 +432,9 @@ vec3 sky(vec3 rd) {
      in it; roughly one in eighty is allowed to be a star, and which one
      is decided by the same hash that placed it, so the field is fixed to
      the world and does not swim as the camera turns. */
-  float night = 1.0 - smoothstep(0.0, 0.62, uDay);
+  // And no stars through cloud, which is the whole of why the weather is
+  // in this function: a snowstorm at midnight had a full sky of them.
+  float night = (1.0 - smoothstep(0.0, 0.62, uDay)) * (1.0 - uOvercast);
   if (night > 0.002 && rd.y > -0.02) {
     vec3 d = rd * 46.0;
     vec3 g = starHash(floor(d));
@@ -414,15 +450,25 @@ vec3 sky(vec3 rd) {
      carries the body's colour and its strength, so the same two lines
      draw a white-hot sun, a red one at dusk, and a small pale moon. */
   float toLight = max(dot(rd, uLightDir), 0.0);
-  c += uTint * pow(toLight, 220.0) * 4.0;
+  /* The disc goes first and goes completely. A body still visible
+     through the cloud that is dimming everything else is the tell, and
+     it is a sharper one than the light level: overcast is defined by
+     there being no disc to find. */
+  c += uTint * pow(toLight, 220.0) * 4.0 * (1.0 - uOvercast);
 
   /* The halo around it, which has to tighten at night or the moon has no
      disc left. By day the wide glow is the sun's own scatter and reads
      correctly at the horizon; at night the same width spread over a sky
      that is a hundredth as bright swallows the body inside it and leaves
      a pale smear where the moon should be. Both ends interpolate from
-     uDay, so full daylight is the original two constants exactly. */
-  c += uTint * mix(0.030, 0.14, uDay) * pow(toLight, mix(26.0, 5.0, uDay));
+     uDay, so full daylight is the original two constants exactly.
+
+     Under cloud it goes the other way from the disc: it survives, and it
+     spreads. The sun behind an overcast sky is a bright region you can
+     point at without being able to say where its edge is, and that is
+     one exponent and one weight rather than a second glow. */
+  float halo = mix(0.030, 0.14, uDay) * mix(1.0, 1.8, uOvercast);
+  c += uTint * halo * pow(toLight, mix(26.0, 5.0, uDay) * mix(1.0, 0.22, uOvercast));
   return c;
 }
 `;

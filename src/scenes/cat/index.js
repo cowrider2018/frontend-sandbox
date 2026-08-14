@@ -900,6 +900,9 @@ export class Cat {
       uLightDir: env.dir,
       uTint: env.tint,
       uDay: env.day,
+      // The fur takes a sky reflection, so the cat has to know what is
+      // in the sky as well as how much of it there is.
+      uOvercast: env.weather.overcast,
       uAmbient: env.ambient,
       uFog: env.fog,
       uHills: env.hills,

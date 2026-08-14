@@ -1245,6 +1245,10 @@ export class Trees {
       uWaterY: env.waterY,
       uRain: env.weather.rain,
       uSnow: env.weather.snow,
+      // A leaf's rim is lit by the sky, so the wood has to be told what
+      // is in it — see plantUniforms, which says this once for everything
+      // that does not hand-roll its own list like this one.
+      uOvercast: env.weather.overcast,
 
       uLightDir: env.dir,
       uTint: env.tint,

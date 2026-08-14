@@ -185,6 +185,12 @@ export function plantUniforms(camera, env, opts) {
     uWaterY: env.waterY,
     uRain: env.weather.rain,
     uSnow: env.weather.snow,
+    /* And the cloud, which is none of their business except that every
+       one of them draws sky somewhere — into its fog, into a leaf's rim
+       — and a meadow fogging out into a clear horizon under an overcast
+       one is the same failure as fogging into a daytime horizon at
+       night. */
+    uOvercast: env.weather.overcast,
 
     uLightDir: env.dir,
     uTint: env.tint,

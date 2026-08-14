@@ -864,7 +864,14 @@ export default {
         + '雪是**覆蓋率不是高度**：它按坡度衰減（陡坡留不住），'
         + '並在靠近水面時收到零，否則岸邊會浮出一圈站在水上的白。'
         + '刻意**不**去抬高地形——雪只有幾公分厚，在這個尺度下看不見，'
-        + '卻會把地面賴以被行進的斜率上界弄壞。' },
+        + '卻會把地面賴以被行進的斜率上界弄壞。'
+        + '天氣原本只到**天空底下**為止，所以曾經有一格沒人會特地去找的畫面：'
+        + '**下著雪的午夜，滿天星斗。** 現在模式表有第三個數 `overcast` 進到天空裡：'
+        + '星星沒了、日月的**盤面整個消失**（陰天的定義就是找不到那個盤）、'
+        + '光暈反而變大變糊，而最要緊的是**梯度被壓平**——'
+        + '晴空是頂上深、地平線亮，陰天是一片到處差不多亮的發光板，'
+        + '那比任何顏色都更早說出「有雲」。壓平是往**地平線自己的顏色**壓，'
+        + '所以每個時刻的色盤自動保留：陰天的黃昏還是橘的，陰天的午夜還是接近全黑。' },
     { id: 'water', type: 'switch', label: '湖', value: false },
     { id: 'waterLevel', type: 'slider', label: '水位', min: 0, max: 1, step: 0.01, value: WATER_DEFAULT },
     { id: 'hintWater', type: 'hint',
@@ -2205,6 +2212,8 @@ class MarchScene {
       uWind: state.wind,
       uRain: weather.rain,
       uSnow: weather.snow,
+      // And what the weather does above the scene rather than to it.
+      uOvercast: weather.overcast,
       uLightDir: this.lightDir,
       uTint: tint,
       uDay: day,

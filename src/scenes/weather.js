@@ -47,11 +47,19 @@ import { WIND_GLSL } from './wind.js';
    names are the only place the modes exist as names; past this table
    the rest of the scene knows nothing but "how wet" and "how white". */
 
-/** @type {Record<string, {rain: number, snow: number, drops: number}>} */
+/* `overcast` is the third number and it is the sky's, not the ground's.
+   The other two say what has landed; this one says what is in the way of
+   the light — and it has to be its own figure rather than max(rain,
+   snow), because snow falls out of a lower, more solid deck than rain
+   does and neither of them is a hundred per cent of anything. It is
+   read by one function, `sky()`, and a shader that never receives it
+   gets zero, which is the fair-weather sky this scene has always had. */
+/** @type {Record<string, {rain: number, snow: number, drops: number,
+    overcast: number}>} */
 export const WEATHER = {
-  clear: { rain: 0.0, snow: 0.0, drops: 0 },
-  rain:  { rain: 1.0, snow: 0.0, drops: 4400 },
-  snow:  { rain: 0.0, snow: 1.0, drops: 2000 },
+  clear: { rain: 0.0, snow: 0.0, drops: 0,    overcast: 0.00 },
+  rain:  { rain: 1.0, snow: 0.0, drops: 4400, overcast: 0.88 },
+  snow:  { rain: 0.0, snow: 1.0, drops: 2000, overcast: 0.95 },
 };
 
 /** What the mode control offers, in the order it offers it. */
