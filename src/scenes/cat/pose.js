@@ -35,6 +35,11 @@ const SEG = 8;
 const CH_K = 240;
 const CH_C = 15;
 
+/** How far behind the base the tip is, in radians of the whirl's own
+    phase. It is the whole of the curve while the tail is turning: at
+    zero the tail is a straight rod being waved in a cone. */
+const TAIL_TRAIL = 0.70;
+
 /** Gains from body motion to tail deflection. Bigger swings wider. */
 const TAIL_GY = 0.20;  // to yaw — the sideways swish when it turns
 const TAIL_GP = 0.20;  // to pitch — the fore-and-aft float
@@ -119,14 +124,24 @@ export class Sway {
    *                        cat's world facing, not a bone, because the
    *                        turn lives in the model matrix
    * @param {number} pitch  the body's pitch
-   * @param {number} wag    the tail's own swing, above its rest roll
-   * @param {object} pose   the frame's pose, for the head's own turn
+   * @param {object} pose   the frame's pose: the head's own turn, and
+   *                        both of the things the tail is doing
    */
-  step(d, t, yaw, pitch, wag, pose) {
-    // The wag drives the same chain as the body's turn, so a deliberate
-    // swish also arrives at the tip late rather than moving the whole
-    // tail as one rigid piece.
-    this.yaw.step(yaw + wag, d);
+  step(d, t, yaw, pitch, pose) {
+    /* The swish drives the same chain as the body's turn, so a deliberate
+       flick also arrives at the tip late rather than moving the whole
+       tail as one rigid piece.
+
+       The swim's circle is deliberately *not* in here, and that was the
+       second thing tried rather than the first. Feeding both axes of it
+       into the two chains is the obvious way to make a whirling tail
+       curve, and it does not work: the chain is a spring, the stroke
+       drives it at over a hertz with a radian of throw, and what comes
+       back is not a lag but a resonance — measured at three times the
+       drive, which leaves the curve seventy degrees off the path instead
+       of trailing it. A trailing rope is a *kinematic* fact, not a
+       dynamic one, so it is written as one below. */
+    this.yaw.step(yaw + pose.tailSwish, d);
     this.pitch.step(pitch, d);
 
     // The head's absolute aim: where the body points, plus where the neck
@@ -135,16 +150,33 @@ export class Sway {
     this.headYaw.step(yaw + pose.headYaw * 0.85 + pose.aimYaw * pose.aimWeight, d);
     this.headPitch.step(pitch + pose.headPitch * 0.8 + pose.aimPitch * pose.aimWeight, d);
 
+    /* The whirl: each node points where the base was pointing a moment
+       ago, and the moment grows along the tail. That is what a rope being
+       swung round actually does, and it is why the curve lies *along* the
+       circle — the difference between two nearby points on a circle is
+       its tangent, so the deflection is tangential by construction and
+       not by tuning. */
+    const spin = pose.tailSpin;
+    const ph = pose.tailPhase;
+
     for (let i = 0; i <= SEG; i++) {
       const o = i / SEG;
-      this.nodes[i * 2] = this.pitch.lag(o) * TAIL_GP + windAx(o, t);
-      this.nodes[i * 2 + 1] = this.yaw.lag(o) * TAIL_GY + windAz(o, t);
+      let ax = this.pitch.lag(o) * TAIL_GP + windAx(o, t);
+      let az = this.yaw.lag(o) * TAIL_GY + windAz(o, t);
+      if (spin > 0.0) {
+        const back = ph - TAIL_TRAIL * o;
+        az += (Math.sin(back) - Math.sin(ph)) * spin;
+        ax += (Math.cos(back) - Math.cos(ph)) * spin;
+      }
+      this.nodes[i * 2] = ax;
+      this.nodes[i * 2 + 1] = az;
 
       // No breeze on these: a whisker is far too stiff for it, and the
       // drift that reads as life on a tail reads as a twitch on a face.
       this.whiskers[i * 2] = this.headYaw.lag(o) * WHISKER_GY;
       this.whiskers[i * 2 + 1] = this.headPitch.lag(o) * WHISKER_GP;
     }
+
     return this.nodes;
   }
 
@@ -181,18 +213,39 @@ const BOB_AMP = 0.055;    // vertical travel of the whole body per step
 /** How far back the legs sit once they are under the animal. */
 const PADDLE_BACK_HIND = 0.50;
 const PADDLE_BACK_FRONT = 0.34;
-/** What is left of the swing when it becomes a paddle. */
-const PADDLE_SWING = 0.24;
+/* What is left of the swing when it becomes a paddle — which by now is
+   very nearly all of it. What separates the two is no longer the size of
+   the travel: it is which legs go together, where they sit while they do
+   it, and how fast. A short stroke read as an animal treading water very
+   politely; this is one working. */
+const PADDLE_SWING = 0.96;
 /** The stroke a floating cat keeps up while going nowhere. Small, but
     never zero: stillness in deep water reads as a stuffed animal. */
 const PADDLE_IDLE = 0.45;
 /** Strokes per second per unit of drive. Faster than a walk and shorter,
     which is the difference between pushing on ground and on water. */
 const PADDLE_HZ = 2.60;
+/* And the tail, which stops being a rudder and becomes a propeller: it
+   sweeps a cone rather than swishing across, one turn for every two
+   strokes. Two channels ninety degrees apart is the whole of what a
+   circle is — the bone already had the axis for the second one, because
+   the sway chain was already floating it fore-and-aft.
+
+   Its own phase, and not half of the stroke's. The stroke phase is
+   wrapped at a full turn to keep it in range, and half of a wrapped
+   number jumps by half a turn every time it wraps — which would put a
+   flick in the tail once per stroke pair, at whatever moment the clock
+   happened to cross.
+
+   A full sixty degrees of cone. This is a rotor and not a rudder, and
+   the sweep is most of what says so. */
+const PADDLE_TAIL = 1.00;
 
 export class Driver {
   constructor() {
     this.phase = 0;
+    /** The tail's own, at half the stroke rate — see PADDLE_TAIL. */
+    this.tailPhase = 0;
     this.time = 0;
     this.blink = 0;
     this.nextBlink = 2.4;
@@ -207,7 +260,11 @@ export class Driver {
     this.pose = {
       headPitch: 0, headYaw: 0, headTilt: 0,
       earL: 0, earR: 0,
-      tailYaw: 0, lean: 0, bob: 0,
+      tailYaw: 0, tailPitch: 0, lean: 0, bob: 0,
+      /* The tail's two jobs, kept apart because they are driven
+         differently: the walk's sideways flick goes through the spring
+         chain, the swim's whirl is trailed kinematically. */
+      tailSwish: 0, tailSpin: 0, tailPhase: 0,
       bodyYaw: 0, bodyPitch: 0,
       eyeOpen: 1,
       // Named by diagonal, not by side: A is one hind leg plus the front
@@ -249,9 +306,12 @@ export class Driver {
        it; there is no ground to scrub on out here, and a cat treading
        water is working hardest of all. */
     const drive = Math.max(s, w * PADDLE_IDLE);
-    this.phase += d * (STRIDE_HZ + (PADDLE_HZ - STRIDE_HZ) * w)
-                * Math.PI * 2 * Math.max(drive, 0.0001);
+    const advance = d * (STRIDE_HZ + (PADDLE_HZ - STRIDE_HZ) * w)
+                  * Math.PI * 2 * Math.max(drive, 0.0001);
+    this.phase += advance;
     if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
+    this.tailPhase += advance * 0.5;
+    if (this.tailPhase > Math.PI * 2) this.tailPhase -= Math.PI * 2;
 
     const a = this.phase;
     /* The same swing, a quarter of the size, about a rest angle that has
@@ -317,15 +377,35 @@ export class Driver {
 
     // Lean into the turn, and let the tail counterweight it.
     p.lean = -this.turn * 0.16 * Math.max(s, 0.35);
-    p.tailYaw = Math.sin(t * 1.1) * 0.10 * (1 - s)      // idle drift
+    /* And in the water it goes round: sine on one axis, cosine on the
+       other, which is a circle — swept clockwise seen from behind the
+       animal, where behind is where the follow camera is.
+
+       The walk's three terms fade out as it does. They are a swish, a
+       drift and a lean into a corner, all of them side to side, and left
+       running under the circle they flatten it into an egg and add a
+       second beat at the stroke rate. The tail is doing one thing out
+       here, not four. */
+    const swish = Math.sin(t * 1.1) * 0.10 * (1 - s)     // idle drift
       + Math.sin(a + 0.6) * 0.20 * s                     // sway with the gait
       + this.turn * 0.28;                                // and swing wide on a corner
+
+    const tc = Math.cos(this.tailPhase), ts = Math.sin(this.tailPhase);
+    p.tailSwish = swish * (1 - w);
+    p.tailSpin = PADDLE_TAIL * w;
+    p.tailPhase = this.tailPhase;
+    p.tailYaw = p.tailSwish + ts * p.tailSpin;
+    p.tailPitch = tc * p.tailSpin;
 
     // The head leads the turn and lifts a little at speed — and a lot
     // more in the water, which is the one thing a swimming cat is
     // unambiguously doing.
     p.headYaw = this.turn * 0.30;
-    p.headPitch = -s * 0.10 - 0.14 * w;
+    /* And it nods with the stroke — upward, always: the oscillation is
+       taken off a sine lifted into 0..1 rather than one centred on zero,
+       so the head never dips *below* where a swimming cat holds it. It
+       is what it is doing with its neck to keep its nose clear. */
+    p.headPitch = -s * 0.10 - (0.14 + 0.05 * (0.5 + 0.5 * Math.sin(a))) * w;
     p.headTilt = Math.sin(t * 0.7) * 0.03 * (1 - s);
 
     // Ears flick back as it picks up speed, and twitch at rest.
@@ -421,6 +501,10 @@ export function applyPose(rig, p) {
   rig.rotation[B.earR * 3 + 2] = rig.userData[B.earR].base - p.earR * 0.6;
 
   rig.rotation[B.tail * 3 + 2] = TAIL_REST + p.tailYaw;
+  // The second axis of the tail's circle, added to the rest pose rather
+  // than replacing it: nothing wrote this channel before, so what is in
+  // it is what the bake put there.
+  rig.rotation[B.tail * 3] = rig.rest.rotation[B.tail * 3] + p.tailPitch;
   rig.rotation[B.bodyPivot * 3 + 2] = p.lean;
 
   // Two diagonals, half a cycle apart. Hind legs swing at the hip and

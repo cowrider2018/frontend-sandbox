@@ -1018,7 +1018,7 @@ async function checkWater() {
  * arithmetic with no GL in it, so both can simply be run.
  */
 async function checkGaits() {
-  const { Driver } = await import(new URL('../src/scenes/cat/pose.js', import.meta.url));
+  const { Driver, Sway } = await import(new URL('../src/scenes/cat/pose.js', import.meta.url));
 
   /* Correlation of two channels over a whole number of cycles, with each
      one's own mean taken out — the paddle carries a large rest offset
@@ -1028,7 +1028,8 @@ async function checkGaits() {
     const d = new Driver();
     // Long enough for the smoothed speed and the swim blend to arrive.
     for (let i = 0; i < 400; i++) d.step(1 / 60, 1, 0, swim);
-    const ch = { hipA: [], hipB: [], shoulderA: [], shoulderB: [] };
+    const ch = { hipA: [], hipB: [], shoulderA: [], shoulderB: [],
+                 tailYaw: [], tailPitch: [], headPitch: [] };
     for (let i = 0; i < 600; i++) {
       const p = d.step(1 / 60, 1, 0, swim);
       for (const k of Object.keys(ch)) ch[k].push(p[k]);
@@ -1045,12 +1046,28 @@ async function checkGaits() {
     };
     const swing = (k) => (Math.max(...ch[k]) - Math.min(...ch[k])) / 2;
     const rest = (k) => ch[k].reduce((s, x) => s + x, 0) / ch[k].length;
+    /* Rising zero crossings of a centred channel — how many times round
+       it went over the window. This is how the tail's turn is compared
+       against the stroke's without either one's phase being known. */
+    const cycles = (k) => {
+      const v = centre(ch[k]);
+      let n = 0;
+      for (let i = 1; i < v.length; i++) if (v[i - 1] <= 0 && v[i] > 0) n++;
+      return n;
+    };
     return {
       hinds: corr('hipA', 'hipB'),
       ends: corr('hipA', 'shoulderA'),
       fronts: corr('shoulderA', 'shoulderB'),
       swing: swing('hipA'),
       rest: rest('hipA'),
+      // The tail's two channels, which have to be a quarter turn apart
+      // or they are a line and not a circle.
+      round: corr('tailYaw', 'tailPitch'),
+      tailSweep: swing('tailPitch'),
+      strokes: cycles('hipA'),
+      turns: cycles('tailPitch'),
+      headLift: [Math.min(...ch.headPitch), Math.max(...ch.headPitch)],
     };
   };
 
@@ -1070,8 +1087,39 @@ async function checkGaits() {
 
   // And the two numbers that make it a paddle rather than a walk in
   // water: a much smaller travel, about a rest angle that has moved back.
-  if (!(swim.swing < walk.swing * 0.45)) {
-    bad.push(`the paddle is not short (${swim.swing.toFixed(3)} vs ${walk.swing.toFixed(3)})`);
+  /* The travel is no longer what separates the two — a paddling cat works
+     nearly as hard as a walking one — so this is a sanity band rather
+     than the claim. What makes it a paddle is the three checks above and
+     the rest angle below. */
+  if (!(swim.swing > walk.swing * 0.5 && swim.swing < walk.swing * 1.2)) {
+    bad.push(`the paddle's travel is off (${swim.swing.toFixed(3)} vs a stride of ${walk.swing.toFixed(3)})`);
+  }
+
+  /* The tail goes round rather than across, at half the stroke rate. Two
+     channels in quadrature is what makes it a circle — correlated at all
+     and it is an ellipse collapsing toward a line — and the rate is the
+     other half of the claim, since a tail keeping time with the legs
+     reads as one more leg. */
+  if (Math.abs(swim.round) > 0.06) {
+    bad.push(`the tail's two axes are not a quarter turn apart (${swim.round.toFixed(3)})`);
+  }
+  if (!(swim.tailSweep > 0.8)) bad.push(`the tail is not sweeping a rotor's cone (${swim.tailSweep.toFixed(3)})`);
+  if (Math.abs(swim.strokes - swim.turns * 2) > 1) {
+    bad.push(`the tail is not turning once per two strokes `
+      + `(${swim.strokes} strokes, ${swim.turns} turns)`);
+  }
+  if (walk.tailSweep > 0.3) bad.push(`a walking tail is circling too (${walk.tailSweep.toFixed(3)})`);
+
+  /* And the head nods, upward. Both halves: it has to move, and it must
+     never drop below where a swimming cat holds it — the oscillation is
+     taken off a sine lifted into 0..1 for exactly that reason. */
+  const [headLow, headHigh] = swim.headLift;
+  if (!(headLow < headHigh - 0.03)) {
+    bad.push(`the head is not nodding (${headLow.toFixed(3)}..${headHigh.toFixed(3)})`);
+  }
+  if (!(headHigh < walk.headLift[1] - 0.1)) {
+    bad.push(`the head is not held up in the water `
+      + `(${headHigh.toFixed(3)} against ${walk.headLift[1].toFixed(3)} ashore)`);
   }
   if (!(swim.rest < -0.3)) bad.push(`the paddling legs are not back under the body (${swim.rest.toFixed(3)})`);
   // A cat that stops paddling sinks, so the stroke has to survive
@@ -1085,6 +1133,51 @@ async function checkGaits() {
   }
   if (hi - lo < 0.02) bad.push(`a floating cat has stopped paddling (${(hi - lo).toFixed(4)})`);
 
+  /* ── and which way the tail bends while it turns ──
+     A whirling rope curves *along* its path: the tip is where the base
+     was a moment ago, and the difference between two nearby points on a
+     circle is the tangent. Bending across the path instead is the shape
+     of a tail being waved rather than swung, and it is what the first
+     version did — the deflection came out of the spring chain, and a
+     spring driven above its own frequency amplifies instead of trailing,
+     which left the curve seventy degrees off.
+
+     Measured against the direction of travel: 180° is trailing straight
+     back along the path, 90° is square across it. */
+  const chain = new Sway();
+  const drv = new Driver();
+  let clock = 0;
+  const settle = (n) => {
+    for (let i = 0; i < n; i++) {
+      const pose = drv.step(1 / 60, 1, 0, 1);
+      clock += 1 / 60;
+      chain.step(1 / 60, clock, 0, pose.bodyPitch, pose);
+    }
+  };
+  settle(600);
+  let offWorst = 0, offSum = 0, offN = 0, sweep = 0;
+  for (let i = 0; i < 240; i++) {
+    settle(1);
+    const tip = chain.count - 1;
+    const bend = [chain.nodes[tip * 2 + 1], chain.nodes[tip * 2]];
+    // Where the whirl is going: d/dphase of (sin, cos).
+    const ph = drv.tailPhase;
+    const tangent = [Math.cos(ph), -Math.sin(ph)];
+    const bl = Math.hypot(bend[0], bend[1]);
+    sweep = Math.max(sweep, bl);
+    if (bl < 1e-3) continue;
+    const cos = (bend[0] * tangent[0] + bend[1] * tangent[1]) / bl;
+    const off = Math.abs(180 - Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI);
+    offWorst = Math.max(offWorst, off);
+    offSum += off; offN++;
+  }
+  const offMean = offSum / Math.max(offN, 1);
+  if (!(offWorst < 40)) {
+    bad.push(`the tail bends across its path rather than along it `
+      + `(worst ${offWorst.toFixed(0)}° off, mean ${offMean.toFixed(0)}°)`);
+  }
+  if (!(sweep > 0.35)) bad.push(`the tail is not curving at all (${sweep.toFixed(3)})`);
+
   if (bad.length) {
     console.error('✗ the gait does not pair the legs as claimed:');
     for (const b of bad) console.error(`    ${b}`);
@@ -1092,7 +1185,9 @@ async function checkGaits() {
   }
   console.log(`▸ gaits:    walk diagonal ${walk.ends.toFixed(2)} · `
     + `paddle sides ${swim.hinds.toFixed(2)}, ends ${swim.ends.toFixed(2)}, `
-    + `travel ×${(swim.swing / walk.swing).toFixed(2)}`);
+    + `travel ×${(swim.swing / walk.swing).toFixed(2)} · `
+    + `tail ${swim.strokes}:${swim.turns} strokes per turn, quadrature ${swim.round.toFixed(2)}, `
+    + `curl ${offMean.toFixed(0)}° off its path`);
 }
 
 async function main() {

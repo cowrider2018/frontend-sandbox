@@ -823,7 +823,7 @@ export class Cat {
        be driven by — otherwise the tail would hang dead through every
        corner, which is exactly when a real one swings widest. */
     this.time += d;
-    this.sway.step(d, this.time, this.yaw, pose.bodyPitch, pose.tailYaw, pose);
+    this.sway.step(d, this.time, this.yaw, pose.bodyPitch, pose);
 
     // Anything the scene's temporal filter must not hold on to: walking,
     // but also breathing, a flicking ear, a blink — which lasts about six
