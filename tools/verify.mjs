@@ -351,17 +351,26 @@ const SHOTS_PLAN = [
          taken over from the opposite side; the sky has not gone out with
          it, because it is lit by air rather than by line of sight.
        00:00 the moon at its highest, and the stars. The one frame where
-         the fireflies are what the picture is about. */
+         the fireflies are what the picture is about.
+
+     Every population is switched on in all four, at the same setting,
+     and the hour is still the only difference — which is the second
+     claim these have to carry now: what is *alive* changes with the
+     light and not all of it the same way. Butterflies and birds in the
+     middle two, neither at midnight, and the fireflies only where there
+     is a night to find them in. Setting each shot's own creature amounts
+     would hide exactly that. */
   ...[
-    { name: '42-dawn',  hour: 6.5,  fireflies: 0 },
-    { name: '43-noon',  hour: 12.0, fireflies: 0 },
-    { name: '44-dusk',  hour: 18.3, fireflies: 0.5 },
-    { name: '45-night', hour: 0.0,  fireflies: 1 },
+    { name: '42-dawn',  hour: 6.5 },
+    { name: '43-noon',  hour: 12.0 },
+    { name: '44-dusk',  hour: 18.3 },
+    { name: '45-night', hour: 0.0 },
   ].map((s) => ({
     name: s.name,
     hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0'
         + '&visibility=200&hills=4.5&water=1&waterLevel=0.9&coverRadius=70'
-        + `&daylight=hour&hour=${s.hour}&fireflies=${s.fireflies}`,
+        + '&butterflies=0.7&fireflies=1&sparrowFlocks=0.7'
+        + `&daylight=hour&hour=${s.hour}`,
     settle: 3600, freeze: 8.0,
     pre: '__aether.scene.laser.silence(); return true;',
     poke: `const s = __aether.scene;
@@ -2746,6 +2755,50 @@ async function interact(cdp, base, problems) {
     && lifeFar.b / lifeNear.b > lifeFar.s / lifeNear.s,
     `sparrows ${lifeNear.s} → ${lifeFar.s} across the range, `
     + `where butterflies go ${lifeNear.b} → ${lifeFar.b}`);
+
+  /* ── and what time it is ──
+     Three populations, one hour, and the point is that they do not move
+     together. Noon has butterflies and birds and no fireflies; midnight
+     has the reverse and nothing else. A "wildlife" amount that had crept
+     back in — one number scaling all three — would fail here by moving
+     them the same way, and so would a day cycle that only changed the
+     light. */
+  const hourLife = async (hour) => {
+    await cdp.eval(`__aether.panel.setValues({ daylight: 'hour', hour: ${hour},
+      butterflies: 1, fireflies: 1, sparrows: 1, sparrowFlocks: 1,
+      lifeRadius: 60 }, { notify: true }); true`);
+    await sleep(360);
+    return cdp.eval(`({ b: __aether.scene.creatures.butterflies,
+      f: __aether.scene.creatures.fireflies,
+      s: __aether.scene.creatures.sparrows })`);
+  };
+  const upByDay = await hourLife(12);
+  const upByNight = await hourLife(0);
+
+  check('the hour decides what is alive, and not all of it the same way',
+    upByDay.b > 0 && upByDay.s > 0 && upByDay.f === 0
+    && upByNight.b === 0 && upByNight.s === 0 && upByNight.f > 0,
+    `noon ${upByDay.b} butterflies / ${upByDay.s} sparrows / ${upByDay.f} fireflies · `
+    + `midnight ${upByNight.b} / ${upByNight.s} / ${upByNight.f}`);
+
+  /* And the mode that has no hour in it keeps every population it always
+     had. `day` is exactly 1 with the pad in charge, which is already the
+     right answer for anything that flies by day and exactly the wrong
+     one for something nocturnal — so the firefly is the only one that
+     has to ask whether a clock exists, and this is the check that says
+     it still does. Every reference frame taken before there was a time
+     of day depends on it. */
+  await cdp.eval(`__aether.panel.setValues({ daylight: 'fixed',
+    light: [0.68, 0.24] }, { notify: true }); true`);
+  await sleep(360);
+  const untimed = await cdp.eval(`({ b: __aether.scene.creatures.butterflies,
+    f: __aether.scene.creatures.fireflies,
+    s: __aether.scene.creatures.sparrows })`);
+
+  check('a scene with no time of day has nothing nocturnal in it',
+    untimed.b > 0 && untimed.f > 0 && untimed.s > 0,
+    `fixed light: ${untimed.b} butterflies / ${untimed.f} fireflies `
+    + `/ ${untimed.s} sparrows, all of them out at once`);
 
   /* Turning the camera must not change what is in the sky.
      This is a regression, and the bug it is guarding was reported from

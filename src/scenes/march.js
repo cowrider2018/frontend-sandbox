@@ -917,6 +917,15 @@ export default {
       text: '一種一支滑桿，不是一支「生物」總量——'
         + '蝴蝶是白天看的，螢火蟲是把曝光壓下去才找得到的，'
         + '一支滑桿沒辦法同時為兩者調對。'
+        + '**而「什麼時候」是時刻在管**（天光＝指定時刻／自動循環時）：'
+        + '蝴蝶隨天亮起飛、黃昏收工；螢火蟲只在有夜的時候出現；'
+        + '麻雀不發光也不消失，牠是睡在看不進去的樹籬裡——'
+        + '所以牠淡出，而不是被派去停棲：一群的位置是從「牠在這趟行程的哪裡」推出來的，'
+        + '在黃昏把停留時間拉長就是把週期換掉，整群會在一幀之內跳到別的地方。'
+        + '三者用的是同一個 `day`，但只有螢火蟲要問「**這個場景裡有沒有時鐘**」——'
+        + '天光＝固定時 `day` 恰好是 1（那正是舊網址與舊截圖仍然成立的原因），'
+        + '而 1 是正午：對白天飛的東西已經是對的答案，對夜行的則正好相反。'
+        + '沒有時刻的場景裡沒有夜，所以裡面沒有東西是夜行的。'
         + '兩者都問地面同樣的問題：**湖上不會有**，雪地上會變少——'
         + '牠們知道岸線在哪，是因為高度場和水位只有一份答案，不是因為誰去告訴牠們。'
         + '**蝴蝶就是兩片翅膀**，沒有身體：在牠佔到的像素數下，'
@@ -2500,6 +2509,13 @@ class MarchScene {
         density: state.fireflies,
         reach: state.lifeRadius,
         time: clock.time,
+        /* The one population that needs both halves of the answer: how
+           much daylight there is, and whether anything is in charge of
+           saying so. The other two are handed `day` inside env and it is
+           1 when nothing is — which is already the right answer for
+           something that flies by day, and the wrong one for this. */
+        day,
+        timed,
         hills: state.hills,
         waterY,
         scene: this.rt.texture,

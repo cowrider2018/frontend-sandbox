@@ -62,6 +62,44 @@ import { TERRAIN_GLSL } from './terrain.js';
    exposure down to find, and a single "wildlife" slider would be a
    control that could never be set correctly for either. */
 
+/* ── and when ─────────────────────────────────────────────────────
+   The hour decides how many of each there are, and the three answers
+   are not three settings of one thing.
+
+   A butterfly is out in the sun. A firefly is a thing you can only find
+   once the sun is not. A sparrow is neither: it does not glow and it
+   does not disappear, it is asleep in a hedge, and what that looks like
+   from fifteen metres away is an empty field.
+
+   All three read the same `day` the sky is drawn from, and that number
+   is deliberately wider than the sun's own crossing — the light is still
+   in the sky after the sun is under it, and so is the flying.
+
+   The roost is a *fade* and not an errand. The tempting version sends
+   every flock to a perch at dusk, and it cannot be done from here: a
+   flock's position is derived from where it is inside a pass whose
+   period is its flight plus its stay, so lengthening the stay at dusk
+   changes the period, which changes which pass it is on, which puts the
+   whole flock somewhere else in one frame. A bird that is not visible at
+   night is the true statement anyway.
+
+   Only the firefly asks whether there is a clock at all. With the pad in
+   charge `day` is exactly 1 — which is what keeps every frame taken
+   before this file heard of an hour still true — and 1 means noon, so a
+   nocturnal population read straight off it would leave the control
+   switched on and nothing in the picture. A scene with no time of day
+   has no night in it, and nothing in it can be nocturnal. */
+const smooth = (a, b, x) => {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+};
+/** Out in the sun: up with the morning, down at dusk. */
+const dayPart = (day) => smooth(0.18, 0.55, day);
+/** Awake in the same light, and simply not visible outside it. */
+const roostPart = (day) => smooth(0.10, 0.45, day);
+/** And the other way round, where there is an hour to read. */
+const nightPart = (day, timed) => (timed ? 1 - smooth(0.10, 0.45, day) : 1);
+
 /** Butterflies at full density. Four triangles each. */
 const BUTTERFLIES = 180;
 /** Fireflies at full density. Two triangles each, and no shading. */
@@ -1302,12 +1340,17 @@ void main() {
      and briefly very bright — the duty cycle is the signal, and a
      firefly that merely pulsed would read as a bad LED.
 
-     Never quite to zero. This scene has no night to hide the meadow, so
-     a population that spent nine tenths of its life fully dark would
-     look like a handful of insects rather than a field of them; the
-     floor keeps the rest of them present as embers. */
+     The floor used to be a tenth, because this scene had no night to
+     hide the meadow in and a population that spent nine tenths of its
+     life fully dark read as a handful of insects rather than a field of
+     them — so the dark ones were kept present as embers. There is a
+     night now, and the population is only out in it, so the crutch can
+     go: what a firefly is against a dark field is the flash, and an
+     ember that never goes out is a tail light. What is left of the floor
+     is the little that keeps the field's *extent* legible between
+     flashes. */
   float pulse = pow(max(0.0, sin(t * (2.3 + h2.x * 1.7) + h.z * 6.2831)), 6.0);
-  float lit = 0.10 + 0.90 * pulse;
+  float lit = 0.03 + 0.97 * pulse;
 
   vec2 e = abs(home - c) / (uBox * 0.5);
   float edge = 1.0 - smoothstep(0.62, 1.0, max(e.x, e.y));
@@ -1416,8 +1459,16 @@ export class Creatures {
 
   drawFlies(camera, env, opts) {
     const box = reachFor('fly', opts.reach);
+    /* The hour thins the population rather than dimming it, which is the
+       same thing the density and the reach controls already do and works
+       for the same reason: every butterfly is a function of its own
+       index, so dropping the count takes the last ones off the end and
+       leaves the rest exactly where they were. Fading them out instead
+       would put a field of half-transparent insects over the meadow at
+       dusk, which is not what dusk does to a butterfly. */
     const n = Math.min(FLY_MAX, Math.round(
-      Math.max(0, Math.min(1, opts.density)) * FLY_PER_M2 * box * box));
+      Math.max(0, Math.min(1, opts.density)) * dayPart(env.day)
+      * FLY_PER_M2 * box * box));
     this.butterflies = n;
     if (!n) return 0;
 
@@ -1526,6 +1577,7 @@ export class Creatures {
     near.length = Math.min(near.length,
                            Math.max(1, Math.round(near.length * flockPart)));
 
+    const roost = roostPart(env.day);
     const L = this._flockLine, S = this._flockStop, I = this._flockInfo;
     const TM = this._flockTimes;
     let alive = 0;
@@ -1669,7 +1721,12 @@ export class Creatures {
       I[o] = size;
       I[o + 1] = T;
       I[o + 2] = phase;
-      I[o + 3] = hereFade * (1 - snow * 0.85);
+      /* And the hour, into the same fade the distance and the snow use.
+         A flock is one object as far as this term is concerned, so the
+         whole of it goes together — half a flock roosting while the
+         other half commutes is the one arrangement that is wrong at
+         both ends. */
+      I[o + 3] = hereFade * (1 - snow * 0.85) * roost;
 
       alive += Math.round(size * I[o + 3]);
     }
@@ -1697,8 +1754,11 @@ export class Creatures {
    */
   drawGlow(camera, opts) {
     const box = reachFor('glow', opts.reach);
+    // The only one of the three that has to ask whether there is a clock
+    // in the scene at all — see the note by nightPart.
     const n = Math.min(GLOW_MAX, Math.round(
-      Math.max(0, Math.min(1, opts.density)) * GLOW_PER_M2 * box * box));
+      Math.max(0, Math.min(1, opts.density)) * nightPart(opts.day, opts.timed)
+      * GLOW_PER_M2 * box * box));
     this.fireflies = n;
     if (!n) return 0;
 
