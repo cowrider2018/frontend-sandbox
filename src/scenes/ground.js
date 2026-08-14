@@ -44,7 +44,7 @@ import {
 } from './cluster.js';
 import { CAT_PROXY_GLSL } from './cat/index.js';
 import { PLANT_COMMON, FRAG_PLANT, plantUniforms } from './plant.js';
-import { terrainHeight, waterDepthAt } from './terrain.js';
+import { terrainHeight, waterDepthAt, TERRAIN_BASE } from './terrain.js';
 import { snowCoverAt } from './weather.js';
 import { CLUMP_CELL, CLUMP_R_MIN, CLUMP_R_MAX, seed } from './clumps.js';
 
@@ -166,6 +166,78 @@ const FLOWER_VERTS = 12 + PETALS * 6 + 6;
     because a flower's stem is measured against the sward it grows out of. */
 const BLADE_W = 0.013;
 const BLADE_H = 0.32;
+
+/* ── reeds ────────────────────────────────────────────────────────
+   The first thing growing on this floor that wants the water rather
+   than avoids it.
+
+   Everything else asks waterDepth one question — am I drowned — and
+   answers it three ways, but all three answers are "not here": the
+   grass tapers out over the last twelve centimetres, the flowers are
+   left unsown, the trees are never grown. So the shoreline ends up a
+   line that nothing lives on, and a lake with a mown edge is a lake
+   somebody drew.
+
+   A reed asks the identical question of the identical field and accepts
+   a *band* of answers instead of a half-plane: from a little way up the
+   bank to a little way out into the shallows. That is the whole of the
+   difference, and it is why this needs no second description of where
+   the water is.
+
+   The band is walked onto, not searched for. A cell picks the depth it
+   wants to stand in and takes a Newton step along the height field's own
+   gradient to get there — the gradient is exact and comes back from the
+   same evaluation that gave the height, so finding the waterline costs
+   two terrain samples rather than a scan. It also puts more of them
+   where the bank is shallow, because that is where a step reaches, and
+   a shallow bank is where reeds are.
+
+   Nothing clips the part that is under water. The lake is drawn by the
+   marcher and the reeds by this pass, and the composite keeps whichever
+   is nearer — so a submerged stem is behind the surface and gone, and
+   what stands above it is in front and drawn. A reed standing in a lake
+   is the depth buffer doing its job and no code at all. */
+
+/* Further than the flowers, nearer than the trees. The count grows with
+   the *length* of shoreline in view rather than with the area, so the
+   reach is cheap here in a way it is not for anything sown across the
+   open field — what it costs is the scan, and that is paid once when the
+   patch moves. */
+const REED_REACH = 0.75;
+const REED_MAX = 90.0;
+/** The shoreline scan's cell. At most one reed comes out of each. */
+const REED_CELL = 0.95;
+/* How far the patch has to move before the shore is scanned again.
+   Deliberately not the cell: the scan is the one expensive thing here —
+   tens of thousands of cells, each an evaluation of the height field —
+   and tying it to the cell would pay that every metre walked. Snapping
+   it coarsely and sowing a margin past the reach costs a ring of reeds
+   nobody sees and buys back seven scans in eight. */
+const REED_SOW_STEP = 4.0;
+/* How wide a stand of them is. Reeds grow in beds, not as a picket
+   fence: a coarse hash over this many cells thickens some stretches of
+   shore and empties others, which is the same argument the flower clumps
+   are made of and the same one extra hash. */
+const REED_STAND = 8;
+/** The band, in metres of water depth: up the bank, and out into it. */
+const REED_ABOVE = 0.26;
+const REED_BELOW = 0.42;
+const MAX_REEDS = 6144;
+/** Floats per reed; see the attribute layout in the shader. */
+const REED_STRIDE = 8;
+/* Where the rows up a stalk sit. A table rather than an even division
+   because five sixths of a reed is a straight line: three of the six are
+   spent between 0.70 and 0.92, which is the only part with a shape. */
+const REED_ROWS = [0.0, 0.32, 0.58, 0.70, 0.82, 0.92];
+/** Six rows of two, and a point on top. */
+const REED_VERTS = REED_ROWS.length * 2 + 1;
+const REED_H_MIN = 0.85;
+const REED_H_MAX = 1.55;
+/** What the wind's push is measured against, so a tall one leans further
+    than a short one and both still answer the one slider. */
+const REED_H_REF = (REED_H_MIN + REED_H_MAX) * 0.5;
+/** How many carry a seed head rather than running out to a point. */
+const HEAD_CHANCE = 0.55;
 
 /* ── shared shader ────────────────────────────────────────────────── */
 
@@ -577,6 +649,136 @@ void main() {
 }
 `;
 
+/* ── reeds ────────────────────────────────────────────────────────── */
+
+const VERT_REED = /* glsl */`
+${PRECISION}
+${CONSTANTS}
+${HASH}
+${ROTATE}
+${SIMPLEX3}
+${CLUSTER_UNIFORMS}
+${CLUSTER_FIELD}
+${CLUSTER_LAYERS}
+${CLUSTER_SHADOW}
+${CAT_PROXY_GLSL}
+${SKY}
+${GROUND_COMMON}
+
+#define REED_ROWS ${REED_ROWS.length}
+#define REED_H_REF ${REED_H_REF.toFixed(4)}
+
+uniform float uShadowSoft;
+
+/* Sown on the CPU, exactly as the flowers are and for the same reason:
+   where the waterline runs, which way to step to reach it and how deep
+   this one ended up are one answer for all thirteen vertices and the
+   same answer every frame. */
+layout(location = 0) in vec4 aReed;   // xy = where it stands, z = height, w = lean heading
+layout(location = 1) in vec4 aForm;   // x = lean, y = half-width, z = head, w = how dry
+
+const float ROW_F[REED_ROWS] = float[REED_ROWS](${REED_ROWS.map(f => f.toFixed(3)).join(', ')});
+
+/* Greyer and paler than the meadow behind it. A reed bed authored in the
+   grass's own green vanishes into it — and what says "the water is here"
+   from thirty metres away, before any single stalk can be resolved, is
+   that the band standing along that line is a different colour from the
+   field it interrupts. */
+const vec3 REED_COL = vec3(0.105, 0.140, 0.052);
+const vec3 REED_DRY = vec3(0.300, 0.245, 0.095);
+const vec3 HEAD_COL = vec3(0.150, 0.078, 0.030);
+
+void main() {
+  vColor = vec3(0.0);
+  vRound = vec3(0.0);
+  vDist = 0.0;
+
+  vec2 pos = aReed.xy;
+
+  /* Measured from where the eye is now, not from where the sowing was
+     centred — the one thing about a reed that cannot be settled on the
+     CPU, for the same reason it cannot be for a flower. */
+  float rim = 1.0 - smoothstep(uRadius * 0.72, uRadius, length(pos - uViewer));
+  if (rim <= 0.002) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+
+  float height = aReed.z * rim;
+
+  /* Stiffer than a blade and far lighter than a trunk, and a tall one
+     takes more of the gust than a short one — which is most of why a bed
+     reads as one surface travelling across rather than as a row of
+     sticks. The field is the one the grass in front of it is reading.
+
+     The travel is deliberately small. A reed is a cane: it *sways*, and
+     the first version let it fold to sixty degrees, which photographed
+     as a bank of fishing rods being cast. What says "reed" is a nearly
+     vertical stroke that is not quite vertical and not quite still. */
+  float push = uWind * (0.10 + 0.90 * gust(pos)) * 0.42 * (aReed.z / REED_H_REF);
+  vec2 own = vec2(cos(aReed.w), sin(aReed.w));
+  vec2 bendDir = normalize(own * aForm.x + WIND_DIR * push);
+  float bend = min(aForm.x + push * 0.85, 0.80);
+
+  vec2 slope;
+  vec3 root = vec3(pos.x, terrainAt(pos, slope), pos.y);
+  vec3 sward = normalize(vec3(-slope.x, 1.0, -slope.y));
+
+  int vid = gl_VertexID;
+  bool tip = vid >= REED_ROWS * 2;
+  int row = min(vid / 2, REED_ROWS - 1);
+  float f = tip ? 1.0 : ROW_F[row];
+  float side = tip ? 0.0 : float(vid & 1) * 2.0 - 1.0;
+
+  vec3 tangent;
+  vec3 p = stalk(root, height, f, bendDir, bend, tangent);
+
+  /* The head is a width, not a second object. A cattail is a stalk that
+     swells for twenty centimetres near the top and thins again above it,
+     so a profile is the honest description of one — and being part of
+     the stalk it bends with it for free, which a head welded to the tip
+     does not. */
+  float spike = smoothstep(0.66, 0.745, f) * (1.0 - smoothstep(0.875, 0.955, f));
+  float halfW = (aForm.y * (1.0 - f * 0.35) + aForm.z * spike) * rim;
+
+  vec2 perp = vec2(-bendDir.y, bendDir.x);
+  vec3 across = vec3(perp.x, 0.0, perp.y);
+  p += across * (halfW * side);
+
+  /* Biased toward the ground almost as hard as the grass is, and the
+     first version was not. Standing a reed's normal up on its own edge
+     is defensible on paper — a bed really is vertical, unlike a lawn —
+     and it photographed as a row of charred wires along the shore, which
+     is the identical failure the grass had before SWARD_BIAS existed:
+     with the sun anywhere but straight down the sunlit side of a
+     vertical ribbon is not facing anyone. What the eye reads at this
+     range is a *mass* standing in the water, and a mass is lit from
+     above. Held slightly under the grass's, so the bed keeps a little
+     more of its own shading than the sward around it. */
+  vec3 face = normalize(cross(across, tangent));
+  float sgn = dot(face, uCamPos - root) < 0.0 ? -1.0 : 1.0;
+  vec3 n = normalize(face * sgn + across * (side * 0.55)
+                   + sward * (SWARD_BIAS * 0.85));
+
+  /* Winter, not snowfall. These stand in the one place snowCover is held
+     to zero — the shore term, without which the lake wears a white rim
+     floating on its first half metre — so a reed asking how much snow
+     was lying on it would be told "none" in the middle of a blizzard and
+     stay summer green. What it should be reading is the season, and
+     uSnow is the number that says there is one. */
+  vec3 albedo = mix(REED_COL, REED_DRY, max(aForm.w, uSnow * 0.85));
+  albedo = mix(albedo, HEAD_COL, smoothstep(0.12, 0.55, spike));
+  float rough = 0.85;
+  albedo = weatherSurface(albedo, 0.0, rough);
+
+  /* Asked once, half way up, exactly as a blade asks: the shadow is the
+     expensive term and it cannot resolve a stalk, so thirteen queries
+     would buy thirteen identical answers — or, worse, a reed lit
+     unevenly along its own length. */
+  float sun = sunlight(root + vec3(0.0, height * 0.55, 0.0), uShadowSoft);
+  // Less buried in its neighbours than a blade is: the bed is open at
+  // the bottom and standing in water, not packed into a sward.
+  emit(p, shadeBlade(n, albedo, sun, mix(0.55, 1.10, f), TRANSMIT));
+}
+`;
+
 /* ── the object ───────────────────────────────────────────────────── */
 
 /** Floor styles, in the order the picker offers them. */
@@ -635,6 +837,7 @@ export class GroundCover {
     this.gl = gl;
     this.grass = new Program(gl, VERT_GRASS, FRAG_PLANT, { name: 'ground/grass' });
     this.flower = new Program(gl, VERT_FLOWER, FRAG_PLANT, { name: 'ground/flower' });
+    this.reed = new Program(gl, VERT_REED, FRAG_PLANT, { name: 'ground/reed' });
 
     /* Nothing is fetched per vertex for the grass, but something has to
        be bound: a leftover attribute array from another draw would be
@@ -655,6 +858,20 @@ export class GroundCover {
       gl.vertexAttribPointer(loc, size, gl.FLOAT, false, stride, offset);
       gl.vertexAttribDivisor(loc, 1);          // one record per flower
     }
+    // And the reeds, on the same scheme with a shorter record.
+    this.reedVao = gl.createVertexArray();
+    this.reedVbo = gl.createBuffer();
+    this._reedSown = new Float32Array(MAX_REEDS * REED_STRIDE);
+
+    gl.bindVertexArray(this.reedVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.reedVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, this._reedSown.byteLength, gl.DYNAMIC_DRAW);
+    for (const [loc, size, offset] of [[0, 4, 0], [1, 4, 16]]) {
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, size, gl.FLOAT, false, REED_STRIDE * 4, offset);
+      gl.vertexAttribDivisor(loc, 1);
+    }
+
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
@@ -667,6 +884,9 @@ export class GroundCover {
     this._jitter = new Float32Array(2);
     /** Where the sown buffer was centred, and what it was sown for. */
     this._sowKey = null;
+    /** The same, for the shoreline — a different grid and a different
+        set of answers, so a different key. */
+    this._reedKey = null;
     /** Reused, so a per-ring draw allocates nothing. */
     this._ring = { uRing: 0, uBladeVerts: BLADE_VERTS, uShadowSoft: 0, uCanopyOn: 0 };
     /** How many times the flowers have been re-sown. Watched by the tests:
@@ -675,9 +895,11 @@ export class GroundCover {
     this.sowings = 0;
     this.blades = 0;
     this.flowers = 0;
-    /** How far each kind actually reaches. One control sets all three;
+    this.reeds = 0;
+    /** How far each kind actually reaches. One control sets all of them;
         each keeps its own ratio and its own ceiling. */
     this.flowerRadius = 0;
+    this.reedRadius = 0;
     this.triangles = 0;
   }
 
@@ -798,17 +1020,136 @@ export class GroundCover {
   }
 
   /**
+   * Fill the reed buffer: every cell near enough the shore to be walked
+   * onto it, kept if the walk landed inside the band.
+   *
+   * The other two plantings are a placement followed by a rejection —
+   * scatter a seed, drop it if it drowned. This one is the reverse: the
+   * cell is *aimed* at a depth and the rejection is what happens when
+   * there is no shoreline within reach of a step. That difference is the
+   * entire reason a band a few tens of centimetres wide can be populated
+   * at all; scattering into it and throwing away the misses would spend
+   * a thousand rejections per reed and still leave gaps wherever the
+   * bank ran diagonally across a cell.
+   *
+   * @param {number} originX  the snapped patch centre
+   * @param {number} originZ
+   * @param {number} reach    how far out to look
+   * @param {number} chance   how many cells grow one
+   * @param {number} hills    the hill amplitude
+   * @param {number} surfaceY where the water stands, from waterSurfaceY
+   */
+  _sowReeds(originX, originZ, reach, chance, hills, surfaceY) {
+    const buf = this._reedSown;
+    const grad = this._reedGrad || (this._reedGrad = [0, 0]);
+
+    /* Off is not a flag here either. Water standing below the lowest
+       ground the hills can reach is water no cell can be in the band of
+       — the same honest test hasWater() makes in the shader — and it is
+       here only to skip a scan that could not have found anything. */
+    if (!(surfaceY > TERRAIN_BASE - hills)) return 0;
+
+    /* A margin of one snap step past the reach, because the eye is
+       already up to that far from the origin this was sown around and a
+       reed missing from the buffer cannot fade in. */
+    const span = Math.ceil((reach + REED_SOW_STEP) / REED_CELL);
+    const ix0 = Math.round(originX / REED_CELL);
+    const iz0 = Math.round(originZ / REED_CELL);
+    const edge = reach + REED_SOW_STEP;
+    const limit = edge * edge;
+    /* How far a cell is allowed to walk. A shore further away than this
+       belongs to a cell nearer to it, and letting them all chase it
+       would pile every reed on the same waterline and leave the cells
+       behind them bare. */
+    const cap = REED_CELL * 1.6;
+    const order = cellOrder(span);
+
+    let n = 0;
+    for (let o = 0; o < order.length && n < MAX_REEDS; o += 2) {
+      const ix = ix0 + order[o], iz = iz0 + order[o + 1];
+      /* Thicker in some stretches of shore than others. A fringe at one
+         even spacing all the way round a lake is a fence; what a bed
+         does is fill a bay and leave the next one open. */
+      const stand = 0.25 + 1.35 * seed(
+        Math.floor(ix / REED_STAND), Math.floor(iz / REED_STAND), 22);
+      if (seed(ix, iz, 11) > chance * stand) continue;
+
+      let x = (ix + seed(ix, iz, 12) * 0.90 + 0.05) * REED_CELL;
+      let z = (iz + seed(ix, iz, 13) * 0.90 + 0.05) * REED_CELL;
+      // The depth this one wants to stand in, anywhere across the band.
+      const want = -REED_ABOVE + (REED_ABOVE + REED_BELOW) * seed(ix, iz, 14);
+
+      /* Two Newton steps onto that depth. Depth is surfaceY - h, so its
+         gradient is the height field's negated — and the field hands
+         that back from the same evaluation that gave the height, which
+         is the whole reason the ground is a sum of sines.
+
+         The step runs along the gradient, which is across the shoreline;
+         nothing moves it along the shore. So neighbouring cells keep
+         their spacing where it matters and cannot collapse onto one
+         point. A hollow with no slope in it divides by nothing and comes
+         out infinite, which fails the same test that rejects a shore too
+         far to reach — no branch for the flat case. */
+      let depth = surfaceY - terrainHeight(x, z, hills, grad);
+      for (let it = 0; it < 2 && Math.abs(want - depth) > 0.02; it++) {
+        const miss = want - depth;
+        const g2 = grad[0] * grad[0] + grad[1] * grad[1];
+        const sx = -miss * grad[0] / g2, sz = -miss * grad[1] / g2;
+        if (!(sx * sx + sz * sz < cap * cap)) { depth = -1e9; break; }
+        x += sx; z += sz;
+        depth = surfaceY - terrainHeight(x, z, hills, grad);
+      }
+      // The band, tested where it actually ended up rather than where it
+      // was aimed: two steps do not always land on a curved field.
+      if (!(depth > -REED_ABOVE && depth < REED_BELOW)) continue;
+
+      const rx = x - originX, rz = z - originZ;
+      if (rx * rx + rz * rz > limit) continue;
+
+      /* The ones standing in the water are the tall ones. Not decoration:
+         it is the order a real bed grows in, and it is what keeps the
+         band from having a flat top cut across it. */
+      const wet = (depth + REED_ABOVE) / (REED_ABOVE + REED_BELOW);
+
+      const rec = n * REED_STRIDE;
+      buf[rec] = x;
+      buf[rec + 1] = z;
+      buf[rec + 2] = (REED_H_MIN + seed(ix, iz, 15) * (REED_H_MAX - REED_H_MIN))
+                   * (0.78 + 0.44 * wet);
+      buf[rec + 3] = seed(ix, iz, 16) * Math.PI * 2;     // lean heading
+      buf[rec + 4] = 0.05 + seed(ix, iz, 17) * 0.15;     // lean
+      buf[rec + 5] = 0.0055 + seed(ix, iz, 18) * 0.0035; // half-width
+      /* A head or none, and never a small one: a cattail that has not
+         swelled is a rush, and both grow here. Interpolating between
+         them would give a stalk with a bulge in it, which is neither. */
+      buf[rec + 6] = seed(ix, iz, 19) < HEAD_CHANCE
+        ? 0.0090 + seed(ix, iz, 20) * 0.0045 : 0.0;
+      buf[rec + 7] = seed(ix, iz, 21) * 0.28;            // how dry
+      n++;
+    }
+
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.reedVbo);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, buf, 0, n * REED_STRIDE);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    return n;
+  }
+
+  /**
    * Draw into the currently bound target, which must be the one the cat
    * draws into: same depth attachment, same camera, same alpha
    * convention.
    *
    * @param {object} camera  pos/right/up/fwd/focal/aspect/width/height
    * @param {object} env     the scene's light and its cluster field
-   * @param {object} opts    style, density, flowers, wind, radius, frame
-   *                          — see draw() in march.js for the full set
+   * @param {object} opts    style, density, flowers, reeds, wind, radius,
+   *                          frame — see draw() in march.js for the full set
    */
   draw(camera, env, opts) {
-    if (!isCovered(opts.style)) { this.blades = 0; this.flowers = 0; this.triangles = 0; return; }
+    if (!isCovered(opts.style)) {
+      this.blades = 0; this.flowers = 0; this.reeds = 0; this.triangles = 0;
+      return;
+    }
     const gl = this.gl;
 
     const { rings, step, radius } = coverPlan(opts.radius);
@@ -955,6 +1296,40 @@ export class GroundCover {
       this._sowKey = null;
     }
 
+    if (opts.reeds) {
+      /* Its own reach off the same control, and its own grid. The
+         shoreline is not where the flowers are, so there is nothing to
+         share with them but the height field. */
+      const reach = Math.min(radius * REED_REACH, REED_MAX);
+      this.reedRadius = reach;
+      const chance = Math.max(0, Math.min(1, opts.reedDensity));
+
+      const ox = Math.round(this._patch[0] / REED_SOW_STEP) * REED_SOW_STEP;
+      const oz = Math.round(this._patch[1] / REED_SOW_STEP) * REED_SOW_STEP;
+      /* The ground and the level are in the key for a stronger reason
+         than they are in the flowers'. Move either and the shoreline
+         itself has moved, so it is not that a different set of reeds
+         drowned — it is that the band they stand in is somewhere else.
+         The weather is not in it: nothing buries a stalk this tall, and
+         what winter does to one is a colour the shader reads. */
+      const key = `${ox}|${oz}|${chance.toFixed(3)}|${reach.toFixed(3)}`
+        + `|${env.hills.toFixed(3)}|${env.waterY.toFixed(3)}`;
+      if (key !== this._reedKey) {
+        this.reeds = this._sowReeds(ox, oz, reach, chance, env.hills, env.waterY);
+        this._reedKey = key;
+      }
+
+      if (this.reeds) {
+        gl.bindVertexArray(this.reedVao);
+        this.reed.use({ ...common, uRadius: reach, uShadowSoft: env.shadowSoft });
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, REED_VERTS, this.reeds);
+        this.triangles += this.reeds * (REED_VERTS - 2);
+      }
+    } else {
+      this.reeds = 0;
+      this._reedKey = null;
+    }
+
     gl.bindVertexArray(null);
     gl.disable(gl.DEPTH_TEST);
   }
@@ -962,8 +1337,11 @@ export class GroundCover {
   dispose() {
     this.grass.dispose();
     this.flower.dispose();
+    this.reed.dispose();
     this.gl.deleteVertexArray(this.grassVao);
     this.gl.deleteVertexArray(this.flowerVao);
     this.gl.deleteBuffer(this.flowerVbo);
+    this.gl.deleteVertexArray(this.reedVao);
+    this.gl.deleteBuffer(this.reedVbo);
   }
 }

@@ -496,6 +496,28 @@ const SHOTS_PLAN = [
            s.yaw = 0.85; s.pitch = 0.06; s.targetDist = 22;
            return true;` },
 
+  /* The reeds, which is the same shore as 36 with something living on
+     it. Two things to look at, and both are about the band rather than
+     about the stalks: it has to follow the waterline round every bay
+     instead of ringing the lake at a fixed distance from it, and it has
+     to stand *through* the surface — stems cut off by the water, not
+     floating on it and not sunk under it. The second is drawn by
+     nothing: the marcher owns the lake, this pass owns the reeds, and
+     the composite keeps whichever is nearer.
+
+     Wound out further than 36's camera so the far side of the lake is in
+     frame too, because a band that only reads correctly on the near
+     shore is a band that is following the camera. */
+  { name: '47-reeds',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&flowers=1&trees=1&cat=0'
+        + '&visibility=200&light=0.68,0.10&hills=4.5&water=1&waterLevel=0.95'
+        + '&coverRadius=70&reeds=1&wind=0.7',
+    settle: 4000, freeze: 8.0,
+    pre: '__aether.scene.laser.silence(); return true;',
+    poke: `const s = __aether.scene;
+           s.yaw = 0.85; s.pitch = 0.10; s.targetDist = 20;
+           return true;` },
+
   /* The lake, at three levels and once without it.
      What these are watching is the shoreline, because the shoreline is
      the only part of the water nobody authored: it is wherever the hills
@@ -2390,6 +2412,7 @@ async function interact(cdp, base, problems) {
       { notify: true }); true`);
     await sleep(450);
     return cdp.eval(`({ flowers: __aether.scene.ground.flowers,
+      reeds: __aether.scene.ground.reeds,
       trees: __aether.scene.trees.trees })`);
   };
 
@@ -2427,6 +2450,33 @@ async function interact(cdp, base, problems) {
   check('the water level is linear in how much it floods, not how deep it is',
     half.flowers < dry.flowers * 0.95 && half.flowers > flooded.flowers * 1.1,
     `dry ${dry.flowers} · half ${half.flowers} · full ${flooded.flowers} flowers`);
+
+  /* ── the reeds ──
+     The other three plantings avoid the water; this one wants it. So the
+     assertion is the mirror image of the one above: a lake that takes
+     flowers away has to *give* reeds, and no lake has to leave none —
+     not because a switch said so, but because there is no band for them
+     to be in. That is the property worth guarding, since the way it
+     would break is a fallback: a walk that gave up and dropped the reed
+     where the cell happened to be would put a fringe of them through the
+     middle of a dry meadow, and nothing else in the picture would say
+     so. */
+  const reeded = await sown({ reeds: true, water: true, waterLevel: 0.5 });
+  const reedsDry = await sown({ water: false });
+  check('the reeds want the water the rest of the planting avoids',
+    reeded.reeds > 40 && reedsDry.reeds === 0,
+    `${reeded.reeds} at half a lake → ${reedsDry.reeds} with no lake`);
+
+  /* And they follow the shoreline rather than ring the lake at a fixed
+     distance from wherever it was: raising the level moves the band,
+     which is a different set of reeds and not the same set slid along.
+     A cached sowing that had forgotten to key on the level would come
+     back with the identical count. */
+  const reedsHigh = await sown({ water: true, waterLevel: 1 });
+  check('moving the water moves the band they stand in',
+    reedsHigh.reeds > 0 && reedsHigh.reeds !== reeded.reeds,
+    `${reeded.reeds} at level 0.5 → ${reedsHigh.reeds} at level 1`);
+  await sown({ reeds: false, water: false });
 
   /* ── the weather ──
      Rain and snow are not two amounts of one thing, and the flowers are

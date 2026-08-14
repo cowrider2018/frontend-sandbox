@@ -886,6 +886,22 @@ export default {
     { id: 'flowerClumps', type: 'slider', label: '花叢密度', min: 0.05, max: 1, step: 0.01, value: 0.62 },
     { id: 'flowerDensity', type: 'slider', label: '叢內花密度', min: 0.1, max: 1, step: 0.01, value: 0.7 },
     { id: 'flowerSpread', type: 'slider', label: '花叢範圍', min: 0.2, max: 3, step: 0.01, value: 1 },
+    { id: 'reeds', type: 'switch', label: '蘆葦', value: false },
+    { id: 'reedDensity', type: 'slider', label: '蘆葦密度', min: 0.05, max: 1, step: 0.01, value: 0.75 },
+    { id: 'hintReeds', type: 'hint',
+      text: '**要先有湖**——蘆葦是這裡第一個「要水」而不是「躲水」的東西。'
+        + '草、花、樹問水深都只問一件事（我淹到了沒有），三種回答方式不同但答案都是「不在這裡」，'
+        + '所以岸線變成一條**沒有東西住在上面的線**，讀起來像被割草機修過。'
+        + '蘆葦問的是**同一個場的同一個問題**，只是接受一個**區間**而不是半平面：'
+        + '從岸上 26 公分到水裡 42 公分。這就是全部的差別，'
+        + '所以它不需要第二份「水在哪裡」的描述——水位或起伏一動，這條帶自己就跟著走。'
+        + '它也不是撒下去再丟掉淹死的：一個格子**挑一個自己想站的水深**，'
+        + '然後沿著高度場的梯度走一步過去（梯度是正弦的餘弦，本來就在手上）——'
+        + '所以找岸線是兩次取樣而不是一次搜尋，而且淺灘自然比陡岸長得多，那也正是蘆葦真正的分布。'
+        + '**水面下那一截不需要任何裁切**：湖是行進器畫的、蘆葦是光柵畫的，合成取近的那個，'
+        + '所以沒入水下的莖自然被水面擋掉——一根站在湖裡的蘆葦，是深度緩衝在做它的工作。'
+        + '穗不是第二個物件，是**莖的一段寬度**：香蒲就是一根在接近頂端處鼓起二十公分再收掉的莖，'
+        + '所以它跟著莖一起彎，而焊在頂端的頭不會。' },
     { id: 'coverRadius', type: 'slider', label: '植被視距', min: 8, max: 200, step: 1, value: 15 },
     { id: 'trees', type: 'switch', label: '樹', value: false },
     { id: 'treeDensity', type: 'slider', label: '樹的密度', min: 0.1, max: 1, step: 0.01, value: 0.6 },
@@ -2315,6 +2331,11 @@ class MarchScene {
         flowerClumps: state.flowerClumps,
         flowerDensity: state.flowerDensity,
         flowerSpread: state.flowerSpread,
+        /* The lake's edge. Nothing here has to tell it where that is —
+           it reads the same waterY every other planting reads, and asks
+           for a band of it instead of the dry half. */
+        reeds: Boolean(state.reeds),
+        reedDensity: state.reedDensity,
         radius: state.coverRadius,
         wind: state.wind,
         frame,
