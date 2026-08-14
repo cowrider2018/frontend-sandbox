@@ -262,20 +262,46 @@ export class Driver {
     const backH = -PADDLE_BACK_HIND * w;
     const backF = -PADDLE_BACK_FRONT * w;
 
-    // One diagonal swings while the other is planted, half a cycle apart.
-    // A hind leg and the front leg *across* from it move together — that
-    // is what a walk is, and pairing same-side legs instead gives a
-    // rocking horse.
-    const swingA = Math.sin(a), counter = -swingA;
+    /* Which legs go together — and it is not the same answer in the
+       water.
+
+       On the ground one diagonal swings while the other is planted, half
+       a cycle apart: a hind leg and the front leg *across* from it move
+       together. That is what a walk is, and pairing same-side legs
+       instead gives a rocking horse. It is an arrangement for holding an
+       animal up.
+
+       Nothing is holding this one up. What a swimming cat does instead
+       is paddle: the two sides go together and the two ends go opposite,
+       front against hind, which is an arrangement for pulling itself
+       along. The diagonal survives it in name only — A and B stop being
+       diagonals and become the front pair and the hind pair.
+
+       Crossfaded on the values rather than switched on the phase. Two of
+       the four channels have to reverse between the arrangements, and
+       mixing the values carries them through zero on the way — so the
+       gait *reorganises* as the ground lets go, instead of flipping into
+       a new one on whichever frame crossed the threshold. */
+    const swingA = Math.sin(a), swingB = -swingA;
+    const hipB = swingB + (swingA - swingB) * w;      // joins the other hip
+    const frontA = swingA + (swingB - swingA) * w;    // and moves off to meet
+    // ...the other front leg, which was already there: swingB is what a
+    // paddling front leg does, so this one channel never moves at all.
+    const frontB = swingB;
+
     p.hipA = backH + swingA * SWING_HIND * legs;
-    p.hipB = backH + counter * SWING_HIND * legs;
-    p.shoulderA = backF + swingA * SWING_FRONT * legs;
-    p.shoulderB = backF + counter * SWING_FRONT * legs;
+    p.hipB = backH + hipB * SWING_HIND * legs;
+    p.shoulderA = backF + frontA * SWING_FRONT * legs;
+    p.shoulderB = backF + frontB * SWING_FRONT * legs;
+
     // The knee trails the hip — the lower leg is still catching up when
     // the thigh has already reversed, which is what makes a walk read as
-    // jointed rather than as a pendulum.
-    p.kneeA = Math.max(0, Math.sin(a - Math.PI / 2)) * SWING_KNEE * legs;
-    p.kneeB = Math.max(0, Math.sin(a + Math.PI / 2)) * SWING_KNEE * legs;
+    // jointed rather than as a pendulum. It follows its own hip across
+    // the change of arrangement, or the leg would fold the wrong way.
+    const kneeA = Math.max(0, Math.sin(a - Math.PI / 2));
+    const kneeB = Math.max(0, Math.sin(a + Math.PI / 2));
+    p.kneeA = kneeA * SWING_KNEE * legs;
+    p.kneeB = (kneeB + (kneeA - kneeB) * w) * SWING_KNEE * legs;
 
     /* Two bobs per stride — the body rises on each diagonal, not once per
        cycle. Idle breathing takes over as the gait fades out, and the

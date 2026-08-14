@@ -1002,9 +1002,103 @@ async function checkWater() {
   }
 }
 
+/**
+ * The two gaits, and which legs go together in each.
+ *
+ * A screenshot is the wrong instrument for this twice over: the legs of
+ * a swimming cat are under the water and the water is nearer to the eye
+ * than they are, so the one arrangement that matters most is the one
+ * nothing can photograph. And the claim is about *phase* — a pair moving
+ * together or against — which is a correlation over a cycle rather than
+ * anything visible in a single frame.
+ *
+ * On the ground the pairs are diagonal, because that is what holds an
+ * animal up. In the water the sides go together and the ends go
+ * opposite, because that is what pulls one along. The driver is plain
+ * arithmetic with no GL in it, so both can simply be run.
+ */
+async function checkGaits() {
+  const { Driver } = await import(new URL('../src/scenes/cat/pose.js', import.meta.url));
+
+  /* Correlation of two channels over a whole number of cycles, with each
+     one's own mean taken out — the paddle carries a large rest offset
+     and the question is only which way the *swing* goes. +1 is together,
+     -1 is opposite. */
+  const phasing = (swim) => {
+    const d = new Driver();
+    // Long enough for the smoothed speed and the swim blend to arrive.
+    for (let i = 0; i < 400; i++) d.step(1 / 60, 1, 0, swim);
+    const ch = { hipA: [], hipB: [], shoulderA: [], shoulderB: [] };
+    for (let i = 0; i < 600; i++) {
+      const p = d.step(1 / 60, 1, 0, swim);
+      for (const k of Object.keys(ch)) ch[k].push(p[k]);
+    }
+    const centre = (v) => {
+      const m = v.reduce((s, x) => s + x, 0) / v.length;
+      return v.map((x) => x - m);
+    };
+    const corr = (a, b) => {
+      const x = centre(ch[a]), y = centre(ch[b]);
+      const dot = x.reduce((s, v, i) => s + v * y[i], 0);
+      const nx = Math.hypot(...x), ny = Math.hypot(...y);
+      return dot / Math.max(nx * ny, 1e-9);
+    };
+    const swing = (k) => (Math.max(...ch[k]) - Math.min(...ch[k])) / 2;
+    const rest = (k) => ch[k].reduce((s, x) => s + x, 0) / ch[k].length;
+    return {
+      hinds: corr('hipA', 'hipB'),
+      ends: corr('hipA', 'shoulderA'),
+      fronts: corr('shoulderA', 'shoulderB'),
+      swing: swing('hipA'),
+      rest: rest('hipA'),
+    };
+  };
+
+  const walk = phasing(0);
+  const swim = phasing(1);
+  const bad = [];
+
+  // Diagonal: the two hind legs oppose each other, and each hind leg
+  // moves with the front leg across from it.
+  if (walk.hinds > -0.98) bad.push(`walking hind legs are not opposed (${walk.hinds.toFixed(3)})`);
+  if (walk.ends < 0.98) bad.push(`walking diagonal is broken (${walk.ends.toFixed(3)})`);
+
+  // Paddle: sides together, ends opposed.
+  if (swim.hinds < 0.98) bad.push(`paddling hind legs are not together (${swim.hinds.toFixed(3)})`);
+  if (swim.fronts < 0.98) bad.push(`paddling front legs are not together (${swim.fronts.toFixed(3)})`);
+  if (swim.ends > -0.98) bad.push(`paddling ends are not opposed (${swim.ends.toFixed(3)})`);
+
+  // And the two numbers that make it a paddle rather than a walk in
+  // water: a much smaller travel, about a rest angle that has moved back.
+  if (!(swim.swing < walk.swing * 0.45)) {
+    bad.push(`the paddle is not short (${swim.swing.toFixed(3)} vs ${walk.swing.toFixed(3)})`);
+  }
+  if (!(swim.rest < -0.3)) bad.push(`the paddling legs are not back under the body (${swim.rest.toFixed(3)})`);
+  // A cat that stops paddling sinks, so the stroke has to survive
+  // standing still — which a walk's does not.
+  const idle = new Driver();
+  for (let i = 0; i < 400; i++) idle.step(1 / 60, 0, 0, 1);
+  let lo = 1e9, hi = -1e9;
+  for (let i = 0; i < 300; i++) {
+    const v = idle.step(1 / 60, 0, 0, 1).hipA;
+    lo = Math.min(lo, v); hi = Math.max(hi, v);
+  }
+  if (hi - lo < 0.02) bad.push(`a floating cat has stopped paddling (${(hi - lo).toFixed(4)})`);
+
+  if (bad.length) {
+    console.error('✗ the gait does not pair the legs as claimed:');
+    for (const b of bad) console.error(`    ${b}`);
+    throw new Error('gait check failed');
+  }
+  console.log(`▸ gaits:    walk diagonal ${walk.ends.toFixed(2)} · `
+    + `paddle sides ${swim.hinds.toFixed(2)}, ends ${swim.ends.toFixed(2)}, `
+    + `travel ×${(swim.swing / walk.swing).toFixed(2)}`);
+}
+
 async function main() {
   await lintShaders();
   await checkWater();
+  await checkGaits();
   const { server, port } = await serve();
   const base = `http://127.0.0.1:${port}/index.html`;
   console.log(`▸ serving ${ROOT}\n  ${base}`);
