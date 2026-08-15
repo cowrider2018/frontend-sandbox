@@ -220,15 +220,18 @@ const TAIL_LAY = -1.10;
    did not would read as a prop. */
 const TAIL_FLOAT = 0.55;
 
-/* Gains from body motion to tail deflection. Bigger swings wider.
+/* Gains from body motion to tail deflection. Bigger swings wider — and
+   the bake's own numbers, put back after a detour worth recording.
 
-   Doubled when the bend became an arc. The old deformation threw the tip
-   out by the whole radius times the sine of the angle; an arc integrates
-   the sine along the way instead, which for a gently growing angle is
-   about half as far. Same numbers on the way in, same swish on the way
-   out. */
-const TAIL_GY = 0.40;  // to yaw — the sideways swish when it turns
-const TAIL_GP = 0.40;  // to pitch — the fore-and-aft float
+   They were doubled when the bend became an arc, on the reasoning that
+   an arc carries the tip about half as far as the old swing did for the
+   same angle. The reasoning was sound and the number was wrong: measured
+   on the real chain, the tip travels 0.60 against the old 0.72, not
+   half. So the doubling did not restore the swish, it doubled the
+   *curvature* — an arc bend is a real bend, and twice the angle is twice
+   the curl. The tail stopped swinging and started coiling. */
+const TAIL_GY = 0.20;  // to yaw — the sideways swish when it turns
+const TAIL_GP = 0.20;  // to pitch — the fore-and-aft float
 
 /* Whiskers follow the head rather than the body, and barely move — they
    are stiff, short and light. Well under the tail's gain, or they read

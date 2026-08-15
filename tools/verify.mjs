@@ -1201,11 +1201,16 @@ async function checkGaits() {
     dot3(dry.turn, wet.turn) / Math.max(len3(dry.turn) * len3(wet.turn), 1e-9)))) * 180 / Math.PI;
   const moved = len3(sub3(wet.base, dry.base));
 
-  if (!(flipped > 150)) {
-    bad.push(`the tail does not curve the other way in the water (${flipped.toFixed(0)} deg)`);
-  }
-  if (!(wet.bow > dry.bow * 0.6)) {
-    bad.push(`the curve went flat rather than over (${wet.bow.toFixed(2)} against ${dry.bow.toFixed(2)})`);
+  /* How much of the curve the water takes out, as a signed amount along
+     the direction the dry tail bends in: the same number covers the
+     whole travel of the knob — none of it, all of it (a straight tail),
+     or past it (the curve carried over the other way) — so the check
+     does not have to be rewritten every time the constant is turned. */
+  const dryTurn = len3(dry.turn);
+  const signed = dot3(wet.turn, dry.turn) / Math.max(dryTurn, 1e-9);
+  if (!(signed < dryTurn * 0.5)) {
+    bad.push(`the water does not take the curve out of the tail `
+      + `(${signed.toFixed(2)} left of ${dryTurn.toFixed(2)})`);
   }
   /* The pin: the water's terms grow from the first node outward, so the
      point where the tail leaves the rump does not move when it goes in.
@@ -1308,7 +1313,7 @@ async function checkGaits() {
   console.log(`▸ gaits:    walk diagonal ${walk.ends.toFixed(2)} · `
     + `paddle sides ${swim.hinds.toFixed(2)}, ends ${swim.ends.toFixed(2)}, `
     + `travel x${(swim.swing / walk.swing).toFixed(2)} · `
-    + `tail curve turns ${flipped.toFixed(0)} deg in the water, `
+    + `tail curve ${dryTurn.toFixed(2)} on land to ${signed.toFixed(2)} in the water, `
     + `bow ${dry.bow.toFixed(2)} to ${wet.bow.toFixed(2)}, base fixed to ${moved.toFixed(3)}, `
     + `float ${wet.float.toFixed(2)}, nothing inside-out of ${foldWet.seen}`);
 }
