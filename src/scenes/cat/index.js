@@ -463,7 +463,7 @@ const SWIM_OUT = 0.78;   // and where it is carried entirely
     read, since a cat riding high is a toy in a bath and one riding low is
     a drowning cat. Settled by looking at it rather than by arithmetic,
     which is why it has moved three times. */
-const SWIM_DRAFT = 0.81;
+const SWIM_DRAFT = 0.6;
 /** Swimming is slower than walking, and it is slower for the reason it
     looks slower — there is nothing to push against. */
 const SWIM_DRAG = 0.45;
