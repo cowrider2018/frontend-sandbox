@@ -1744,7 +1744,13 @@ export class Creatures {
       uFlockRun: run,
       uFlockTimes: TM,
     });
-    return MAX_FLOCKS * perFlock * BIRD_VERTS;
+    /* The flocks that are actually there, not the slots there could be.
+       The ceiling is two dozen and the ground usually offers four to
+       six, and the shader throws the rest away — but a vertex thrown
+       away at the end of the shader has still run it. The slots are
+       filled from the front, so the live ones are exactly the first
+       `near.length` and the draw can simply stop there. */
+    return near.length * perFlock * BIRD_VERTS;
   }
 
   /**
