@@ -205,7 +205,7 @@ const TAIL_PIN = 0.125;
    longer than the ring's radius.
 
    The fix is a change of deformation and not of any number here. */
-const TAIL_FLIP = 2.0;
+const TAIL_FLIP = 1.0;
 /* How far back it is laid, from straight up. A taste knob, and
    deliberately not aimed at the waterline: a floating cat's rump sits
    under the surface and the tail drifts up and down as it lies there, so
