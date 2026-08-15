@@ -35,14 +35,118 @@ const SEG = 8;
 const CH_K = 240;
 const CH_C = 15;
 
-/** How far behind the base the tip is, in radians of the whirl's own
-    phase. It is the whole of the curve while the tail is turning: at
-    zero the tail is a straight rod being waved in a cone. */
-const TAIL_TRAIL = 0.70;
+/* ── the tail's own line ──
+   Where the rest pose puts the centre of the tail at each of the nine
+   nodes, measured off the mesh rather than assumed: the bake curves this
+   tail hard — nearly four tenths of its length off the chord — so a bend
+   applied about a straight axis would be bending the wrong thing.
 
-/** Gains from body motion to tail deflection. Bigger swings wider. */
-const TAIL_GY = 0.20;  // to yaw — the sideways swish when it turns
-const TAIL_GP = 0.20;  // to pitch — the fore-and-aft float
+   It exists because of *folding*. The deformation used to be "turn every
+   vertex about the bone's origin by the angle at its own outerness",
+   which is not a bend at all: a point at distance y sweeps an arc of
+   radius y, so where y·dθ/dy climbs past one the outer rings overtake
+   the inner ones and the surface creases into itself. At the walk's two
+   or three tenths of a radian that is invisible. At the whirl's two and
+   a half it is the first thing anyone sees — and it cannot be tuned
+   away, because the gradient that folds the tail *is* the bend.
+
+   So each ring is now moved rather than swung: rotated about its own
+   place on this line, and then set down on the line's bent copy, which
+   the CPU integrates one segment at a time. Rings can no longer pass
+   through each other, because nothing is being swung past anything. */
+const TAIL_AXIS = [
+  [0.0143, 0.0418, -0.0334],
+  [0.0143, 0.2930, -0.2339],
+  [0.0143, 0.6214, -0.5087],
+  [0.0140, 0.9624, -0.7912],
+  [0.0142, 1.3219, -0.9524],
+  [0.0140, 1.7075, -0.9868],
+  [0.0142, 2.0793, -0.8061],
+  [0.0140, 2.2846, -0.5308],
+  [0.0014, 2.3985, -0.1488],
+];
+
+/* The same line, chewed once at load: which way each segment runs, how
+   long it is, and the turn that would put it back in line with the
+   first — which is how the hook is taken out. */
+const TAIL_SEG = (() => {
+  const out = [null];
+  for (let i = 1; i < TAIL_AXIS.length; i++) {
+    const d = [
+      TAIL_AXIS[i][0] - TAIL_AXIS[i - 1][0],
+      TAIL_AXIS[i][1] - TAIL_AXIS[i - 1][1],
+      TAIL_AXIS[i][2] - TAIL_AXIS[i - 1][2],
+    ];
+    const len = Math.hypot(d[0], d[1], d[2]);
+    out.push({ dir: d.map((v) => v / len), len });
+  }
+  const base = out[1].dir;
+  for (let i = 1; i < out.length; i++) {
+    const u = out[i].dir;
+    // The turn from this segment onto the base one: axis and angle.
+    const ax = [u[1] * base[2] - u[2] * base[1],
+                u[2] * base[0] - u[0] * base[2],
+                u[0] * base[1] - u[1] * base[0]];
+    const sin = Math.hypot(ax[0], ax[1], ax[2]);
+    const cos = u[0] * base[0] + u[1] * base[1] + u[2] * base[2];
+    out[i].straighten = sin < 1e-6
+      ? { axis: [1, 0, 0], angle: 0 }
+      : { axis: ax.map((v) => v / sin), angle: Math.atan2(sin, cos) };
+  }
+  return out;
+})();
+
+/** Where the tail is taken to leave the body, as a share of its length.
+    Nothing inside that moves: everything grows from here outward. */
+const TAIL_PIN = 0.125;
+
+/* ── what the water does to the shape of it ──
+   Three things, applied along the chain rather than at the root, and the
+   order they are described in is the order they are built:
+
+   *Straightened.* The bake gives this tail a deep hook — four tenths of
+   its own length off the chord — which is a cat's tail at rest on land
+   and nothing like one in water. Taking it out is free here and only
+   here: a frame chain can be told to undo the rest shape segment by
+   segment, which nothing built out of two angles about a fixed origin
+   can do.
+
+   *Laid back.* From straight up to straight behind, so it lies along the
+   surface the animal is floating in.
+
+   That pair alone is the tail of a cat that has stopped: straight, back,
+   and afloat. The third is what happens when it starts working.
+
+   Both accumulate from the pin outward, so the base itself never turns —
+   which is the difference between a tail and a stick being waggled. */
+/* Straighten, and then keep going. One takes the hook out; two carries
+   it the same distance the other way, which is the whole of what the
+   water does to the shape of this tail — the same curve, reversed.
+
+   Two is not a coincidence and not a tuned number: the straightening
+   turn is exactly the one that puts each segment back in line with the
+   first, so applying it twice reflects each segment about that line. */
+const TAIL_FLIP = 2.0;
+/** From straight up to straight behind, so it lies along the surface the
+    animal is floating in. */
+const TAIL_LAY = -Math.PI / 2;
+/* And the float: a tail lying on water is never quite still. Two slow
+   sines beating against each other so it does not repeat visibly — the
+   same trick as the breeze the land tail has, and for the same reason,
+   but slower and only up and down. Water moves a floating thing on its
+   own schedule, and a tail that held one line while the surface under it
+   did not would read as a prop. */
+const TAIL_FLOAT = 0.55;
+
+/* Gains from body motion to tail deflection. Bigger swings wider.
+
+   Doubled when the bend became an arc. The old deformation threw the tip
+   out by the whole radius times the sine of the angle; an arc integrates
+   the sine along the way instead, which for a gently growing angle is
+   about half as far. Same numbers on the way in, same swish on the way
+   out. */
+const TAIL_GY = 0.40;  // to yaw — the sideways swish when it turns
+const TAIL_GP = 0.40;  // to pitch — the fore-and-aft float
 
 /* Whiskers follow the head rather than the body, and barely move — they
    are stiff, short and light. Well under the tail's gain, or they read
@@ -54,6 +158,37 @@ const TAIL_GP = 0.20;  // to pitch — the fore-and-aft float
    is under half a degree of arc on screen — correct, and invisible. */
 const WHISKER_GY = 0.12;
 const WHISKER_GP = 0.12;
+
+/* ── quaternions ──
+   Four of them and a rotate, written out rather than pulled in: the tail
+   is a chain of frames now and Euler angles cannot carry a twist along
+   one. Same convention as everywhere else here — (x, y, z, w). */
+const qMul = (a, b, out) => {
+  const ax = a[0], ay = a[1], az = a[2], aw = a[3];
+  const bx = b[0], by = b[1], bz = b[2], bw = b[3];
+  out[0] = aw * bx + ax * bw + ay * bz - az * by;
+  out[1] = aw * by - ax * bz + ay * bw + az * bx;
+  out[2] = aw * bz + ax * by - ay * bx + az * bw;
+  out[3] = aw * bw - ax * bx - ay * by - az * bz;
+  return out;
+};
+/** A turn about one of the three axes: 0 = x, 1 = y, 2 = z. */
+const qAxis = (axis, angle, out) => {
+  out[0] = out[1] = out[2] = 0;
+  out[axis] = Math.sin(angle * 0.5);
+  out[3] = Math.cos(angle * 0.5);
+  return out;
+};
+const qRot = (q, v, out) => {
+  const x = q[0], y = q[1], z = q[2], w = q[3];
+  const tx = 2 * (y * v[2] - z * v[1]);
+  const ty = 2 * (z * v[0] - x * v[2]);
+  const tz = 2 * (x * v[1] - y * v[0]);
+  out[0] = v[0] + w * tx + y * tz - z * ty;
+  out[1] = v[1] + w * ty + z * tx - x * tz;
+  out[2] = v[2] + w * tz + x * ty - y * tx;
+  return out;
+};
 
 class Chain {
   constructor() {
@@ -110,8 +245,16 @@ export class Sway {
         so they trail a turn of the neck the body never made. */
     this.headYaw = new Chain();
     this.headPitch = new Chain();
-    /** (ax, az) per node for the tail, packed for a `vec2[]` uniform. */
-    this.nodes = new Float32Array((SEG + 1) * 2);
+    /** Per node: how its ring is turned, and where it has been carried
+        to from where the bake left it. Two halves of one arc — either one
+        alone is a crease. */
+    this.qs = new Float32Array((SEG + 1) * 4);
+    this.bend = new Float32Array((SEG + 1) * 3);
+    // Scratch for the walk along the chain, so a frame allocates nothing.
+    this._q = new Float64Array(4);
+    this._tmp = new Float64Array(4);
+    this._acc = new Float64Array(4);
+    this._v = new Float64Array(3);
     /** (ay, az) per node for the whiskers, for one side of the face. */
     this.whiskers = new Float32Array((SEG + 1) * 2);
     this.count = SEG + 1;
@@ -150,34 +293,94 @@ export class Sway {
     this.headYaw.step(yaw + pose.headYaw * 0.85 + pose.aimYaw * pose.aimWeight, d);
     this.headPitch.step(pitch + pose.headPitch * 0.8 + pose.aimPitch * pose.aimWeight, d);
 
-    /* The whirl: each node points where the base was pointing a moment
-       ago, and the moment grows along the tail. That is what a rope being
-       swung round actually does, and it is why the curve lies *along* the
-       circle — the difference between two nearby points on a circle is
-       its tangent, so the deflection is tangential by construction and
-       not by tuning. */
-    const spin = pose.tailSpin;
-    const ph = pose.tailPhase;
+    /* ── the tail, as a chain of frames ──
+       Each node carries a rotation and the place its ring has been moved
+       to, and the ring is set down there rather than swung about the
+       bone's origin. That distinction is the whole of why this is not
+       two angles any more: swinging a ring about a point a long way off
+       drags it along an arc of that radius, and where the angle climbs
+       faster than one radian per unit of radius the outer rings overtake
+       the inner ones and the surface creases through itself. On this
+       mesh that is unavoidable — the last three nodes sit at 2.23, 2.35
+       and 2.40 from the origin, so there is almost no radius between
+       them to spread an angle over, and the fold shows up even at the
+       angles a walk uses.
 
-    for (let i = 0; i <= SEG; i++) {
+       Positions here are integrated from tangents instead. Nothing is
+       swung past anything, so nothing can fold, at any angle.
+
+       What the water does, in the order it is built:
+         flipped  the bake's deep hook is turned through itself and
+                  comes out curving the other way
+         laid     from straight up to straight behind, along the surface
+
+       Both grow from the pin outward, so the tail leaves the rump
+       pointing exactly where it always did. */
+    const water = pose.tailWater;
+
+    const q = this._q, tmp = this._tmp, acc = this._acc, v = this._v;
+    q[0] = q[1] = q[2] = 0; q[3] = 1;
+    this.qs[0] = 0; this.qs[1] = 0; this.qs[2] = 0; this.qs[3] = 1;
+    this.bend[0] = this.bend[1] = this.bend[2] = 0;
+    this.whiskers[0] = this.headYaw.lag(0) * WHISKER_GY;
+    this.whiskers[1] = this.headPitch.lag(0) * WHISKER_GP;
+
+    let cx = 0, cy = 0, cz = 0;
+    for (let i = 1; i <= SEG; i++) {
       const o = i / SEG;
-      let ax = this.pitch.lag(o) * TAIL_GP + windAx(o, t);
-      let az = this.yaw.lag(o) * TAIL_GY + windAz(o, t);
-      if (spin > 0.0) {
-        const back = ph - TAIL_TRAIL * o;
-        az += (Math.sin(back) - Math.sin(ph)) * spin;
-        ax += (Math.cos(back) - Math.cos(ph)) * spin;
+      const seg = TAIL_SEG[i];
+
+      const u = Math.max(0.0, (o - TAIL_PIN) / (1.0 - TAIL_PIN));
+      const grow = u * u * (3.0 - 2.0 * u);
+
+      q[0] = q[1] = q[2] = 0; q[3] = 1;
+      if (water > 0.0) {
+        // Through the straight and out the other side.
+        const st = seg.straighten;
+        const a = st.angle * water * TAIL_FLIP * 0.5;
+        const sn = Math.sin(a);
+        tmp[0] = st.axis[0] * sn; tmp[1] = st.axis[1] * sn;
+        tmp[2] = st.axis[2] * sn; tmp[3] = Math.cos(a);
+        qMul(tmp, q, q);
+
+        /* And laid back onto the water, from the pin outward — with the
+           surface lifting and dropping the end of it as it goes. */
+        const float = (Math.sin(t * 0.62) * 0.7 + Math.sin(t * 0.41 + 1.3) * 0.3)
+                    * TAIL_FLOAT;
+        qMul(qAxis(0, (TAIL_LAY + float) * water * grow, tmp), q, acc);
+        q[0] = acc[0]; q[1] = acc[1]; q[2] = acc[2]; q[3] = acc[3];
       }
-      this.nodes[i * 2] = ax;
-      this.nodes[i * 2 + 1] = az;
+
+      /* And the walk's own chain on top, outermost, so that on dry land
+         this is exactly the swish it always was — with the difference
+         that it is now integrated rather than swung, which is what takes
+         the crease out of that too. */
+      qMul(qAxis(2, this.yaw.lag(o) * TAIL_GY + windAz(o, t), tmp), q, acc);
+      qMul(qAxis(0, this.pitch.lag(o) * TAIL_GP + windAx(o, t), tmp), acc, q);
+
+      this.qs[i * 4] = q[0];
+      this.qs[i * 4 + 1] = q[1];
+      this.qs[i * 4 + 2] = q[2];
+      this.qs[i * 4 + 3] = q[3];
+
+      // Where that leaves this segment, and where its ring ends up.
+      v[0] = seg.dir[0] * seg.len;
+      v[1] = seg.dir[1] * seg.len;
+      v[2] = seg.dir[2] * seg.len;
+      qRot(q, v, acc);
+      cx += acc[0] - v[0];
+      cy += acc[1] - v[1];
+      cz += acc[2] - v[2];
+      this.bend[i * 3] = cx;
+      this.bend[i * 3 + 1] = cy;
+      this.bend[i * 3 + 2] = cz;
 
       // No breeze on these: a whisker is far too stiff for it, and the
       // drift that reads as life on a tail reads as a twitch on a face.
       this.whiskers[i * 2] = this.headYaw.lag(o) * WHISKER_GY;
       this.whiskers[i * 2 + 1] = this.headPitch.lag(o) * WHISKER_GP;
     }
-
-    return this.nodes;
+    return this.qs;
   }
 
   /** How much the chains are still doing, for the temporal filter. */
@@ -225,27 +428,9 @@ const PADDLE_IDLE = 0.45;
 /** Strokes per second per unit of drive. Faster than a walk and shorter,
     which is the difference between pushing on ground and on water. */
 const PADDLE_HZ = 2.60;
-/* And the tail, which stops being a rudder and becomes a propeller: it
-   sweeps a cone rather than swishing across, one turn for every two
-   strokes. Two channels ninety degrees apart is the whole of what a
-   circle is — the bone already had the axis for the second one, because
-   the sway chain was already floating it fore-and-aft.
-
-   Its own phase, and not half of the stroke's. The stroke phase is
-   wrapped at a full turn to keep it in range, and half of a wrapped
-   number jumps by half a turn every time it wraps — which would put a
-   flick in the tail once per stroke pair, at whatever moment the clock
-   happened to cross.
-
-   A full sixty degrees of cone. This is a rotor and not a rudder, and
-   the sweep is most of what says so. */
-const PADDLE_TAIL = 1.00;
-
 export class Driver {
   constructor() {
     this.phase = 0;
-    /** The tail's own, at half the stroke rate — see PADDLE_TAIL. */
-    this.tailPhase = 0;
     this.time = 0;
     this.blink = 0;
     this.nextBlink = 2.4;
@@ -260,11 +445,12 @@ export class Driver {
     this.pose = {
       headPitch: 0, headYaw: 0, headTilt: 0,
       earL: 0, earR: 0,
-      tailYaw: 0, tailPitch: 0, lean: 0, bob: 0,
+      tailYaw: 0, tailWater: 0, lean: 0, bob: 0,
       /* The tail's two jobs, kept apart because they are driven
          differently: the walk's sideways flick goes through the spring
-         chain, the swim's whirl is trailed kinematically. */
-      tailSwish: 0, tailSpin: 0, tailPhase: 0,
+         chain, the swim's lean does not — a chain driven at the stroke
+         rate resonates rather than trails. */
+      tailSwish: 0,
       bodyYaw: 0, bodyPitch: 0,
       eyeOpen: 1,
       // Named by diagonal, not by side: A is one hind leg plus the front
@@ -310,8 +496,6 @@ export class Driver {
                   * Math.PI * 2 * Math.max(drive, 0.0001);
     this.phase += advance;
     if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
-    this.tailPhase += advance * 0.5;
-    if (this.tailPhase > Math.PI * 2) this.tailPhase -= Math.PI * 2;
 
     const a = this.phase;
     /* The same swing, a quarter of the size, about a rest angle that has
@@ -390,12 +574,13 @@ export class Driver {
       + Math.sin(a + 0.6) * 0.20 * s                     // sway with the gait
       + this.turn * 0.28;                                // and swing wide on a corner
 
-    const tc = Math.cos(this.tailPhase), ts = Math.sin(this.tailPhase);
     p.tailSwish = swish * (1 - w);
-    p.tailSpin = PADDLE_TAIL * w;
-    p.tailPhase = this.tailPhase;
-    p.tailYaw = p.tailSwish + ts * p.tailSpin;
-    p.tailPitch = tc * p.tailSpin;
+    /* How much of the tail the water has. One number: it flips the bake's
+       hook and lays the tail back along the surface, and there is nothing
+       else the water does to it. */
+    p.tailWater = w;
+    // The bone carries the walk's flick and nothing else.
+    p.tailYaw = p.tailSwish;
 
     // The head leads the turn and lifts a little at speed — and a lot
     // more in the water, which is the one thing a swimming cat is
@@ -500,11 +685,14 @@ export function applyPose(rig, p) {
   rig.rotation[B.earL * 3 + 2] = rig.userData[B.earL].base + p.earL * 0.6;
   rig.rotation[B.earR * 3 + 2] = rig.userData[B.earR].base - p.earR * 0.6;
 
+  /* The bone carries the walk's flick and nothing else: everything the
+     water does to this tail is done along the chain, where it can be
+     grown from the first node outward instead of turned at the root. */
+  /* The bone itself only ever carries the walk's swish. The swim's whirl
+     is not here at all — see the note by TAIL_FLIP: a tail that turns
+     from its root swings the part of itself that is inside the animal,
+     and what has to stay still is exactly that part. */
   rig.rotation[B.tail * 3 + 2] = TAIL_REST + p.tailYaw;
-  // The second axis of the tail's circle, added to the rest pose rather
-  // than replacing it: nothing wrote this channel before, so what is in
-  // it is what the bake put there.
-  rig.rotation[B.tail * 3] = rig.rest.rotation[B.tail * 3] + p.tailPitch;
   rig.rotation[B.bodyPivot * 3 + 2] = p.lean;
 
   // Two diagonals, half a cycle apart. Hind legs swing at the hip and

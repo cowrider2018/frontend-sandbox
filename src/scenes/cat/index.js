@@ -137,8 +137,13 @@ uniform vec3 uCamPos, uRight, uUp, uFwd;
 uniform float uFocal, uAspect;
 uniform vec2 uJitter;
 
-/** Deflection at each node: the tail's chain, and the whiskers' own. */
-uniform vec2 uSway[SWAY_N];
+/** The tail, as a frame per node: how the ring is turned, and where it
+    has been carried to from where the bake left it. The pair of them is
+    an arc; either one alone is a crease. */
+uniform vec4 uSwayQ[SWAY_N];
+uniform vec3 uSwayBend[SWAY_N];
+/** The whiskers keep the two angles: they barely move, and a stiff pair
+    of hairs has no length to fold along. */
 uniform vec2 uWhisker[SWAY_N];
 
 out vec3 vNormal;
@@ -158,6 +163,48 @@ vec2 sampleChain(vec2 chain[SWAY_N], float o) {
   int hi = min(lo + 1, SWAY_N - 1);
   return mix(chain[lo], chain[hi], x - i);
 }
+
+/** The same walk along a vec3 chain: where this ring has been moved to,
+    and the line it sat on before anything moved. */
+vec3 sampleBend(vec3 chain[SWAY_N], float o) {
+  float x = o * float(SWAY_N - 1);
+  float i = floor(x);
+  int lo = int(i);
+  int hi = min(lo + 1, SWAY_N - 1);
+  return mix(chain[lo], chain[hi], x - i);
+}
+
+/** And along the frames. Straight lerp and normalise: neighbouring nodes
+    are a fraction of a turn apart, where the difference between that and
+    a proper slerp is far under a pixel. */
+vec4 sampleFrame(float o) {
+  float x = o * float(SWAY_N - 1);
+  float i = floor(x);
+  int lo = int(i);
+  int hi = min(lo + 1, SWAY_N - 1);
+  return normalize(mix(uSwayQ[lo], uSwayQ[hi], x - i));
+}
+
+/** Turn a point by a quaternion. */
+vec3 qRot(vec4 q, vec3 v) {
+  return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+/* The tail's rest centreline, at the same nine nodes — measured off this
+   mesh, because the bake curves the tail and a bend applied about a
+   straight axis would be bending something that is not there. Kept in
+   step with the copy in pose.js, which is where it is explained. */
+const vec3 TAIL_AXIS[SWAY_N] = vec3[SWAY_N](
+  vec3(0.0143, 0.0418, -0.0334),
+  vec3(0.0143, 0.2930, -0.2339),
+  vec3(0.0143, 0.6214, -0.5087),
+  vec3(0.0140, 0.9624, -0.7912),
+  vec3(0.0142, 1.3219, -0.9524),
+  vec3(0.0140, 1.7075, -0.9868),
+  vec3(0.0142, 2.0793, -0.8061),
+  vec3(0.0140, 2.2846, -0.5308),
+  vec3(0.0014, 2.3985, -0.1488)
+);
 
 vec3 rotZ(vec3 p, float a) {
   float c = cos(a), s = sin(a);
@@ -184,14 +231,47 @@ vec3 rotY(vec3 p, float a) {
  * mirrored in their local frames is what makes them trail the *same*
  * way in the world.
  */
-vec3 swayRotate(vec3 p, float o, int group) {
+/**
+ * Where a point of a soft part ends up.
+ *
+ * Split from the one that does normals the moment the tail's bend
+ * stopped being a pure rotation. A point is carried — turned about its
+ * own place on the tail's line and then set down where that place has
+ * moved to — and a normal is a direction, so it can only be turned.
+ * Running a normal through the carry adds the whole translation to it,
+ * which is not a small error: it points every normal on the tail at the
+ * same place in space, and the fur's shading and its markings go with
+ * them.
+ */
+vec3 swayPoint(vec3 p, float o, int group) {
   if (group == SWAY_TAIL) {
-    vec2 a = sampleChain(uSway, o);
-    return rotX(rotZ(p, a.y), a.x);
+    /* An arc, not a swing. Turning every vertex about the bone's origin
+       is the obvious way to bend a tail and it folds: a point at distance
+       y from that origin travels an arc of radius y, so wherever the
+       angle climbs faster than one radian per unit of y the outer rings
+       overtake the inner ones and the surface creases through itself. It
+       is invisible at the walk's fraction of a radian and unmissable at
+       the whirl's two and a half.
+
+       So each ring turns about *its own* place on the tail's line, and is
+       then set down on the bent copy of that line, which the CPU walks
+       one segment at a time. Nothing is swung past anything, so nothing
+       can fold; and a run of zero angles leaves every ring exactly where
+       the bake put it. */
+    vec3 axis = sampleBend(TAIL_AXIS, o);
+    return qRot(sampleFrame(o), p - axis) + axis + sampleBend(uSwayBend, o);
   }
   vec2 a = sampleChain(uWhisker, o);
   if (group == SWAY_WHISKER_L) a = -a;
   return rotY(rotZ(p, a.y), a.x);
+}
+
+/** The turn out of the same deformation, with the carry left off. */
+vec3 swayNormal(vec3 n, float o, int group) {
+  if (group == SWAY_TAIL) return qRot(sampleFrame(o), n);
+  vec2 a = sampleChain(uWhisker, o);
+  if (group == SWAY_WHISKER_L) a = -a;
+  return rotY(rotZ(n, a.y), a.x);
 }
 
 void main() {
@@ -213,8 +293,8 @@ void main() {
      them. Everything else is group 0 and skips it. */
   float o = aNormal.w;
   if (group != SWAY_NONE) {
-    local = swayRotate(local, o, group);
-    normal = swayRotate(normal, o, group);
+    local = swayPoint(local, o, group);
+    normal = swayNormal(normal, o, group);
   }
 
   vec4 world = uModel * (bone * vec4(local, 1.0));
@@ -378,11 +458,12 @@ const STRAFE_SCALE = 0.85;  // sidling is slower than walking, as it should be
 const SWIM_IN = 0.52;    // share of standing height where the ground lets go
 const SWIM_OUT = 0.78;   // and where it is carried entirely
 /** How deep it floats, as a share of that height. Most of the animal is
-    under: what a swimming cat keeps up is the head, the neck, the line of
-    the back and the tail — and getting this wrong in either direction is
-    the whole read, since a cat riding high is a toy in a bath and one
-    riding low is a drowning cat. */
-const SWIM_DRAFT = 0.62;
+    under: what a swimming cat keeps up is the head, the neck and the line
+    of the back — and getting this wrong in either direction is the whole
+    read, since a cat riding high is a toy in a bath and one riding low is
+    a drowning cat. Settled by looking at it rather than by arithmetic,
+    which is why it has moved three times. */
+const SWIM_DRAFT = 0.81;
 /** Swimming is slower than walking, and it is slower for the reason it
     looks slower — there is nothing to push against. */
 const SWIM_DRAG = 0.45;
@@ -976,7 +1057,8 @@ export class Cat {
       uFocal: camera.focal,
       uAspect: camera.aspect,
       uJitter: this._jitter,
-      uSway: this.sway.nodes,
+      uSwayQ: this.sway.qs,
+      uSwayBend: this.sway.bend,
       uWhisker: this.sway.whiskers,
 
       // The scene's light, and the field it has to cast through.
