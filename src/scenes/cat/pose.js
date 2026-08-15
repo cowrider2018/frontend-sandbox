@@ -124,13 +124,23 @@ const TAIL_SEG = (() => {
   }
   out[1].turn = { axis: [1, 0, 0], angle: 0 };
 
-  /* And how far each segment may be turned before the tube folds — not
-     as a promise, because it does not hold: see the note by TAIL_FLIP.
-     A ring of radius r carried along a line that turns dθ over a length
-     ds sweeps its inside edge back by r·dθ while the line goes forward
-     by ds, so past r·dθ/ds = 1 the surface passes through itself. This
-     tail is a fifth of a unit thick against segments of about the same,
-     so the margin is thin everywhere and gone in the middle. */
+  /* And how far each segment is allowed to turn. This is the rule the
+     whole file is built around and it is not negotiable: a ring of
+     radius r carried along a line that turns dθ over a length ds sweeps
+     its inside edge backwards by r·dθ while the line goes forward by ds,
+     so once r·dθ/ds passes one the inside of the bend travels further
+     back than the segment travels forward and the surface passes through
+     itself. Equivalently, and the way a rigger would say it: the radius
+     a thing is bent to may not go below the radius of the thing.
+
+     So every segment carries a ceiling, and everything that bends this
+     tail is put through it — not the flip alone, but whatever the flip,
+     the lay-back, the drift and the walk's own swish add up to. Ask for
+     more and the tail stops bending rather than tearing.
+
+     Nine tenths of the limit, because the rings between two nodes are
+     blended rather than placed exactly, and the blend needs somewhere to
+     be wrong. */
   for (let i = 1; i < out.length; i++) {
     out[i].maxTurn = 0.9 * out[i].len / TAIL_RADIUS;
   }
@@ -327,6 +337,7 @@ export class Sway {
     this._tmp = new Float64Array(4);
     this._acc = new Float64Array(4);
     this._carry = new Float64Array(4);
+    this._prevQ = new Float64Array(4);
     this._v = new Float64Array(3);
     /** (ay, az) per node for the whiskers, for one side of the face. */
     this.whiskers = new Float32Array((SEG + 1) * 2);
@@ -401,8 +412,10 @@ export class Sway {
     this.whiskers[0] = this.headYaw.lag(0) * WHISKER_GY;
     this.whiskers[1] = this.headPitch.lag(0) * WHISKER_GP;
 
+    const prev = this._prevQ;
+    prev[0] = prev[1] = prev[2] = 0; prev[3] = 1;
     let cx = 0, cy = 0, cz = 0;
-    let laid = 0, lastGrow = 0;
+    let laid = 0;
     for (let i = 1; i <= SEG; i++) {
       const o = i / SEG;
       const seg = TAIL_SEG[i];
@@ -417,13 +430,7 @@ export class Sway {
          its own turns rather than rotated as a whole. */
       if (water > 0.0) {
         const tn = seg.turn;
-        /* Held to what a segment of this thickness can carry. It is not
-           enough on its own — the pivot is the node, so a vertex out at
-           the far end of a segment turns about a lever longer than the
-           radius this limit is built from — but it is the half of the
-           problem that has a closed form. */
-        const want = -tn.angle * water * TAIL_FLIP;
-        const a = Math.max(-seg.maxTurn, Math.min(seg.maxTurn, want)) * 0.5;
+        const a = -tn.angle * water * TAIL_FLIP * 0.5;
         const sn = Math.sin(a);
         tmp[0] = tn.axis[0] * sn; tmp[1] = tn.axis[1] * sn;
         tmp[2] = tn.axis[2] * sn; tmp[3] = Math.cos(a);
@@ -437,15 +444,8 @@ export class Sway {
            and dropping the end of it as it lies there. */
         const float = (Math.sin(t * 0.62) * 0.7 + Math.sin(t * 0.41 + 1.3) * 0.3)
                     * TAIL_FLOAT;
-        /* The lay-back is spread over the whole tail rather than applied
-           at one joint, so its own share of the turn per segment is small
-           — but it is added to the flip's, and the pair of them have to
-           clear the same limit. */
-        const lay = (TAIL_LAY + float) * water;
-        const step = lay * (grow - lastGrow);
-        const room = seg.maxTurn - Math.abs(-seg.turn.angle * water * TAIL_FLIP);
-        const held = Math.max(-Math.max(room, 0), Math.min(Math.max(room, 0), step));
-        laid += held;
+        // Spread over the whole tail rather than applied at one joint.
+        laid = (TAIL_LAY + float) * water * grow;
         qMul(qAxis(0, laid, tmp), q, acc);
         q[0] = acc[0]; q[1] = acc[1]; q[2] = acc[2]; q[3] = acc[3];
       }
@@ -456,6 +456,24 @@ export class Sway {
          the crease out of that too. */
       qMul(qAxis(2, this.yaw.lag(o) * TAIL_GY + windAz(o, t), tmp), q, acc);
       qMul(qAxis(0, this.pitch.lag(o) * TAIL_GP + windAx(o, t), tmp), acc, q);
+
+      /* And now the rule, applied to whatever all of that came to. The
+         turn this segment is actually making is the frame it ends at
+         against the one before it; if that is more than the segment can
+         carry, the axis is kept and the angle is cut back to the
+         ceiling. Everything upstream is free to ask for anything —
+         nothing downstream of here can fold. */
+      tmp[0] = -prev[0]; tmp[1] = -prev[1]; tmp[2] = -prev[2]; tmp[3] = prev[3];
+      qMul(tmp, q, acc);                      // the segment's own turn
+      const half = Math.acos(Math.min(1, Math.abs(acc[3])));
+      if (half * 2 > seg.maxTurn) {
+        const sn = Math.sin(half);
+        const k = sn > 1e-9 ? Math.sin(seg.maxTurn * 0.5) / sn : 0;
+        const w = Math.cos(seg.maxTurn * 0.5) * (acc[3] < 0 ? -1 : 1);
+        acc[0] *= k; acc[1] *= k; acc[2] *= k; acc[3] = w;
+        qMul(prev, acc, q);
+      }
+      prev[0] = q[0]; prev[1] = q[1]; prev[2] = q[2]; prev[3] = q[3];
 
       this.qs[i * 4] = q[0];
       this.qs[i * 4 + 1] = q[1];
@@ -478,7 +496,6 @@ export class Sway {
       // drift that reads as life on a tail reads as a twitch on a face.
       this.whiskers[i * 2] = this.headYaw.lag(o) * WHISKER_GY;
       this.whiskers[i * 2 + 1] = this.headPitch.lag(o) * WHISKER_GP;
-      lastGrow = grow;
     }
     return this.qs;
   }

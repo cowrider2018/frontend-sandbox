@@ -1140,6 +1140,12 @@ async function checkGaits() {
   /* The tail's rest centreline at its nodes, as pose.js measures it off
      the mesh. Kept in step with the table there: reading a shorter one
      against a longer chain silently compares the wrong nodes. */
+  const bin = await readFile(join(ROOT, 'src', 'scenes', 'cat', 'cat.bin'));
+  const cat = parseCat(bin.buffer.slice(bin.byteOffset, bin.byteOffset + bin.byteLength));
+  const meshRig = new Rig(cat.header);
+  const tailBone = meshRig.bone('tail');
+  const skin = cat.colors.get(cat.header.skins[0]);
+
   const AXIS = [
     [0.0143, 0.0418, -0.0334], [0.0143, 0.1674, -0.1336], [0.0143, 0.3348, -0.2673],
     [0.0143, 0.4601, -0.3679], [0.0143, 0.6222, -0.5078], [0.0140, 0.8239, -0.6916],
@@ -1208,6 +1214,86 @@ async function checkGaits() {
   if (!(moved < 0.01)) {
     bad.push(`the tail's base moves when it goes in (${moved.toFixed(3)} units)`);
   }
+  /* ── and none of it turns the surface inside out ──
+     The one thing a bend must never do. A ring of radius r carried along
+     a line that turns dθ over a length ds sweeps its inside edge back by
+     r·dθ while the line goes forward by ds, so past r·dθ/ds = 1 the
+     inside of the bend travels further back than the segment travels
+     forward and the mesh passes through itself. pose.js holds every
+     segment under that ceiling; this is the check that the ceiling is
+     doing its job, taken on the tail's own triangles rather than on the
+     numbers going in.
+
+     A triangle is compared against its own rest normal *carried by the
+     same frame*, which is the part that took three tries to get right.
+     Compared against the rest normal where it lay, every triangle in the
+     stretch where the tail has turned through more than a right angle
+     reports itself inside-out — 353 of them, in a band that moved with
+     nothing and stayed put through four different deformations, because
+     it was a property of the measurement. */
+  const foldSurvey = (wet) => {
+    const drv = new Driver();
+    const chain = new Sway();
+    let clock = 0;
+    for (let i = 0; i < 400; i++) {
+      const pose = drv.step(1 / 60, 0, 0, wet);
+      clock += 1 / 60;
+      chain.step(1 / 60, clock, 0, pose.bodyPitch, pose);
+    }
+    const qAt = (o) => {
+      const k = Math.min(Math.round(Math.min(o, 1) * (AXIS.length - 1)), AXIS.length - 1);
+      return [chain.qs[k * 4], chain.qs[k * 4 + 1], chain.qs[k * 4 + 2], chain.qs[k * 4 + 3]];
+    };
+    const spin = (q, v) => {
+      const t = [2 * (q[1] * v[2] - q[2] * v[1]),
+                 2 * (q[2] * v[0] - q[0] * v[2]),
+                 2 * (q[0] * v[1] - q[1] * v[0])];
+      return [v[0] + q[3] * t[0] + q[1] * t[2] - q[2] * t[1],
+              v[1] + q[3] * t[1] + q[2] * t[0] - q[0] * t[2],
+              v[2] + q[3] * t[2] + q[0] * t[1] - q[1] * t[0]];
+    };
+    // The shader's own skinning: placed by each of its two nodes, blended.
+    const move = (p, o) => {
+      const x = Math.min(o, 1) * (AXIS.length - 1);
+      const i = Math.floor(x), t = x - i;
+      const at = (k) => {
+        const kk = Math.min(k, AXIS.length - 1);
+        const a = AXIS[kk];
+        const r = spin([chain.qs[kk * 4], chain.qs[kk * 4 + 1],
+                        chain.qs[kk * 4 + 2], chain.qs[kk * 4 + 3]], sub3(p, a));
+        return [r[0] + a[0] + chain.bend[kk * 3],
+                r[1] + a[1] + chain.bend[kk * 3 + 1],
+                r[2] + a[2] + chain.bend[kk * 3 + 2]];
+      };
+      const A = at(i), B = at(i + 1);
+      return [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t];
+    };
+
+    let inside = 0, seen = 0;
+    for (let k = 0; k < cat.index.length; k += 3) {
+      const idx = [cat.index[k], cat.index[k + 1], cat.index[k + 2]];
+      if ((skin[idx[0] * 4 + 3] & 31) !== tailBone) continue;
+      const P = idx.map((v) => [cat.position[v * 3], cat.position[v * 3 + 1], cat.position[v * 3 + 2]]);
+      const O = idx.map((v) => cat.normal[v * 4 + 3] / 32767);
+      const n0 = cross3(sub3(P[1], P[0]), sub3(P[2], P[0]));
+      if (len3(n0) < 1e-9) continue;
+      const M = P.map((v, j) => move(v, O[j]));
+      const n1 = cross3(sub3(M[1], M[0]), sub3(M[2], M[0]));
+      if (len3(n1) < 1e-12) continue;
+      const carried = spin(qAt((O[0] + O[1] + O[2]) / 3), n0);
+      seen++;
+      if (dot3(carried, n1) < 0) inside++;
+    }
+    return { inside, seen };
+  };
+
+  const foldDry = foldSurvey(0);
+  const foldWet = foldSurvey(1);
+  if (foldDry.inside || foldWet.inside) {
+    bad.push(`the tail folds through itself: ${foldDry.inside} triangles on land, `
+      + `${foldWet.inside} in the water, of ${foldWet.seen}`);
+  }
+
   /* And it drifts while it lies there. A floating tail that held one
      line would read as a prop rather than as something in water. */
   if (!(wet.float > 0.10)) {
@@ -1224,7 +1310,7 @@ async function checkGaits() {
     + `travel x${(swim.swing / walk.swing).toFixed(2)} · `
     + `tail curve turns ${flipped.toFixed(0)} deg in the water, `
     + `bow ${dry.bow.toFixed(2)} to ${wet.bow.toFixed(2)}, base fixed to ${moved.toFixed(3)}, `
-    + `float ${wet.float.toFixed(2)}`);
+    + `float ${wet.float.toFixed(2)}, nothing inside-out of ${foldWet.seen}`);
 }
 
 async function main() {
