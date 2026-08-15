@@ -174,15 +174,26 @@ vec3 sampleBend(vec3 chain[SWAY_N], float o) {
   return mix(chain[lo], chain[hi], x - i);
 }
 
-/** And along the frames. Straight lerp and normalise: neighbouring nodes
-    are a fraction of a turn apart, where the difference between that and
-    a proper slerp is far under a pixel. */
-vec4 sampleFrame(float o) {
+/** Along the frames, at constant speed. Not a lerp: reversing this
+    tail's own curve puts most of a radian between neighbouring nodes,
+    and a lerp crosses that at a rate that speeds up in the middle — the
+    ring at the middle of a segment ends up turned further than it has
+    travelled, which is a pinch you can see. */
+vec4 qSlerp(vec4 a, vec4 b, float t) {
+  float d = dot(a, b);
+  if (d < 0.0) { b = -b; d = -d; }
+  if (d > 0.9995) return normalize(mix(a, b, t));
+  float th = acos(d);
+  return (a * sin((1.0 - t) * th) + b * sin(t * th)) / sin(th);
+}
+
+/** The node a vertex hangs off, how far past it it sits, and the turn
+    that has been applied there. */
+vec4 tailFrame(float o, out int node) {
   float x = o * float(SWAY_N - 1);
   float i = floor(x);
-  int lo = int(i);
-  int hi = min(lo + 1, SWAY_N - 1);
-  return normalize(mix(uSwayQ[lo], uSwayQ[hi], x - i));
+  node = int(i);
+  return qSlerp(uSwayQ[node], uSwayQ[min(node + 1, SWAY_N - 1)], x - i);
 }
 
 /** Turn a point by a quaternion. */
@@ -258,8 +269,23 @@ vec3 swayPoint(vec3 p, float o, int group) {
        one segment at a time. Nothing is swung past anything, so nothing
        can fold; and a run of zero angles leaves every ring exactly where
        the bake put it. */
-    vec3 axis = sampleBend(TAIL_AXIS, o);
-    return qRot(sampleFrame(o), p - axis) + axis + sampleBend(uSwayBend, o);
+    /* Hung off the node below it rather than off an interpolated point.
+       The two are the same thing at a node and not between them, and
+       that difference is a fold in the surface: interpolating the pivot
+       and the offset walks the ring along the *chord* between two nodes
+       while the turn takes it along the arc, so every segment ends up
+       with a crease at each end of it. Rotating the vertex's own offset
+       from the node it belongs to lets the turn draw the arc itself.
+
+       It joins up exactly, and not approximately: the chain is
+       integrated as C(i+1) = C(i) + q(i+1)·(A(i+1) − A(i)), which is the
+       same statement as this line evaluated at the far end of a segment.
+       So the two segments either side of a node agree on where that node
+       is, to the bit. */
+    int node;
+    vec4 q = tailFrame(o, node);
+    vec3 a = TAIL_AXIS[node];
+    return qRot(q, p - a) + a + uSwayBend[node];
   }
   vec2 a = sampleChain(uWhisker, o);
   if (group == SWAY_WHISKER_L) a = -a;
@@ -268,7 +294,10 @@ vec3 swayPoint(vec3 p, float o, int group) {
 
 /** The turn out of the same deformation, with the carry left off. */
 vec3 swayNormal(vec3 n, float o, int group) {
-  if (group == SWAY_TAIL) return qRot(sampleFrame(o), n);
+  if (group == SWAY_TAIL) {
+    int node;
+    return qRot(tailFrame(o, node), n);
+  }
   vec2 a = sampleChain(uWhisker, o);
   if (group == SWAY_WHISKER_L) a = -a;
   return rotY(rotZ(n, a.y), a.x);

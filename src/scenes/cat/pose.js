@@ -127,9 +127,12 @@ const TAIL_PIN = 0.125;
    turn is exactly the one that puts each segment back in line with the
    first, so applying it twice reflects each segment about that line. */
 const TAIL_FLIP = 2.0;
-/** From straight up to straight behind, so it lies along the surface the
-    animal is floating in. */
-const TAIL_LAY = -Math.PI / 2;
+/* How far back it is laid, from straight up. A taste knob, and
+   deliberately not aimed at the waterline: a floating cat's rump sits
+   under the surface and the tail drifts up and down as it lies there, so
+   "along the water" is not a height anything here can be held to. What
+   this is for is how far back the tail reads, and it is turned by eye. */
+const TAIL_LAY = -1.10;
 /* And the float: a tail lying on water is never quite still. Two slow
    sines beating against each other so it does not repeat visibly — the
    same trick as the breeze the land tail has, and for the same reason,
