@@ -31,7 +31,15 @@ const TAIL_REST = -0.15;  // tail's resting roll
 
    Constants are the model's own, so the tail moves the way it always
    did. K: bigger is stiffer and snappier. C: bigger settles sooner. */
-const SEG = 8;
+/* Nodes along a soft part. Sixteen segments and not eight, and the
+   number is load-bearing rather than a comfort: the turn a segment
+   carries is what folds a tube. Reversing this tail's own curve put 30
+   to 37 degrees on each of eight segments, and at that rate the rotation
+   applied across a segment outruns the segment — the inside of the bend
+   turns further than it travels, and the surface passes through itself.
+   Counted on the tail's own triangles, eight segments turned 355 of 3456
+   of them inside out. Halving the angle takes the margin back. */
+const SEG = 16;
 const CH_K = 240;
 const CH_C = 15;
 
@@ -56,15 +64,29 @@ const CH_C = 15;
    through each other, because nothing is being swung past anything. */
 const TAIL_AXIS = [
   [0.0143, 0.0418, -0.0334],
-  [0.0143, 0.2930, -0.2339],
-  [0.0143, 0.6214, -0.5087],
-  [0.0140, 0.9624, -0.7912],
-  [0.0142, 1.3219, -0.9524],
-  [0.0140, 1.7075, -0.9868],
-  [0.0142, 2.0793, -0.8061],
-  [0.0140, 2.2846, -0.5308],
+  [0.0143, 0.1674, -0.1336],
+  [0.0143, 0.3348, -0.2673],
+  [0.0143, 0.4601, -0.3679],
+  [0.0143, 0.6222, -0.5078],
+  [0.0140, 0.8239, -0.6916],
+  [0.0140, 0.9426, -0.7806],
+  [0.0141, 1.0988, -0.8711],
+  [0.0143, 1.2850, -0.9439],
+  [0.0140, 1.5485, -0.9984],
+  [0.0140, 1.7333, -0.9876],
+  [0.0140, 1.8596, -0.9510],
+  [0.0141, 2.0868, -0.8062],
+  [0.0139, 2.2143, -0.6736],
+  [0.0140, 2.2832, -0.5405],
+  [0.0142, 2.3377, -0.3679],
   [0.0014, 2.3985, -0.1488],
 ];
+
+/** How thick the tail is, measured off the mesh: the mean distance of
+    its vertices from its own centreline, which is nearly the same all
+    the way along. It is what decides how far the thing can be bent —
+    see maxTurn. */
+const TAIL_RADIUS = 0.215;
 
 /* The same line, chewed once at load: which way each segment runs, how
    long it is, and the turn that would put it back in line with the
@@ -80,21 +102,41 @@ const TAIL_SEG = (() => {
     const len = Math.hypot(d[0], d[1], d[2]);
     out.push({ dir: d.map((v) => v / len), len });
   }
-  const base = out[1].dir;
-  for (let i = 1; i < out.length; i++) {
-    const u = out[i].dir;
-    // The turn from this segment onto the base one: axis and angle.
-    const ax = [u[1] * base[2] - u[2] * base[1],
-                u[2] * base[0] - u[0] * base[2],
-                u[0] * base[1] - u[1] * base[0]];
+  /* And how much each segment turns off the one before it. Off the one
+     before it, and not off the first one, which is the difference
+     between a well-posed number and a useless one: by the far end this
+     tail has turned most of the way round, so the turn onto the *base*
+     segment is close to half a circle and the axis it is taken about is
+     the cross product of two nearly opposite vectors — which is a
+     direction made of rounding error. Neighbouring nodes then disagree
+     about which way to go and the surface tears. From one segment to the
+     next it is twenty degrees about a well-conditioned axis. */
+  for (let i = 2; i < out.length; i++) {
+    const a = out[i - 1].dir, b = out[i].dir;
+    const ax = [a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0]];
     const sin = Math.hypot(ax[0], ax[1], ax[2]);
-    const cos = u[0] * base[0] + u[1] * base[1] + u[2] * base[2];
-    out[i].straighten = sin < 1e-6
+    const cos = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    out[i].turn = sin < 1e-9
       ? { axis: [1, 0, 0], angle: 0 }
       : { axis: ax.map((v) => v / sin), angle: Math.atan2(sin, cos) };
   }
+  out[1].turn = { axis: [1, 0, 0], angle: 0 };
+
+  /* And how far each segment may be turned before the tube folds — not
+     as a promise, because it does not hold: see the note by TAIL_FLIP.
+     A ring of radius r carried along a line that turns dθ over a length
+     ds sweeps its inside edge back by r·dθ while the line goes forward
+     by ds, so past r·dθ/ds = 1 the surface passes through itself. This
+     tail is a fifth of a unit thick against segments of about the same,
+     so the margin is thin everywhere and gone in the middle. */
+  for (let i = 1; i < out.length; i++) {
+    out[i].maxTurn = 0.9 * out[i].len / TAIL_RADIUS;
+  }
   return out;
 })();
+
 
 /** Where the tail is taken to leave the body, as a share of its length.
     Nothing inside that moves: everything grows from here outward. */
@@ -119,13 +161,40 @@ const TAIL_PIN = 0.125;
 
    Both accumulate from the pin outward, so the base itself never turns —
    which is the difference between a tail and a stick being waggled. */
-/* Straighten, and then keep going. One takes the hook out; two carries
-   it the same distance the other way, which is the whole of what the
-   water does to the shape of this tail — the same curve, reversed.
+/* How far the curve is carried the other way, in units of the turn the
+   bake put there. One takes the hook out and leaves a straight tail; two
+   carries it the same distance the other way, which is the same curve
+   reversed — and that is what the water does to this tail.
 
-   Two is not a coincidence and not a tuned number: the straightening
-   turn is exactly the one that puts each segment back in line with the
-   first, so applying it twice reflects each segment about that line. */
+   It is applied to each segment's turn *off the one before it*, walked
+   along the chain, so the shape is rebuilt rather than rotated. The
+   first version reflected each segment about the *base* segment, which
+   is ill-conditioned by the far end — the turn onto the base is nearly
+   half a circle there and its axis is the cross product of two nearly
+   opposite vectors.
+
+   ── the surface still folds, and this is what is known ──
+   Counted on the tail's own triangles, through the deformation the
+   shader applies (tools/verify.mjs has the survey; on land it is clean):
+
+     in water   353 of 3456 inside-out, in a band at three fifths along
+
+   Three things have been ruled out by measurement rather than argument.
+   It is not the conditioning above: rebuilding from each segment's own
+   turn changed the count by two. It is not the segment count: sixteen
+   segments instead of eight changed it by twelve. It is not the tip's
+   cap: freezing the last stretch changed nothing.
+
+   What it tracks is the turn a segment carries against its own length
+   and the tail's thickness. At rest this tail already sits near that
+   limit — it is a fat tube curled tightly — and every one of the water's
+   terms adds to it, the flip most of all, since reversing a curve turns
+   the rings through twice the shape's own curvature. Straightening alone
+   (TAIL_FLIP = 1) folds more, not less, which says the pivot is part of
+   it too: a vertex at the far end of a segment turns about a lever
+   longer than the ring's radius.
+
+   The fix is a change of deformation and not of any number here. */
 const TAIL_FLIP = 2.0;
 /* How far back it is laid, from straight up. A taste knob, and
    deliberately not aimed at the waterline: a floating cat's rump sits
@@ -257,6 +326,7 @@ export class Sway {
     this._q = new Float64Array(4);
     this._tmp = new Float64Array(4);
     this._acc = new Float64Array(4);
+    this._carry = new Float64Array(4);
     this._v = new Float64Array(3);
     /** (ay, az) per node for the whiskers, for one side of the face. */
     this.whiskers = new Float32Array((SEG + 1) * 2);
@@ -322,6 +392,9 @@ export class Sway {
     const water = pose.tailWater;
 
     const q = this._q, tmp = this._tmp, acc = this._acc, v = this._v;
+    // What the chain has turned through so far, before this node's own.
+    const carry = this._carry;
+    carry[0] = carry[1] = carry[2] = 0; carry[3] = 1;
     q[0] = q[1] = q[2] = 0; q[3] = 1;
     this.qs[0] = 0; this.qs[1] = 0; this.qs[2] = 0; this.qs[3] = 1;
     this.bend[0] = this.bend[1] = this.bend[2] = 0;
@@ -329,6 +402,7 @@ export class Sway {
     this.whiskers[1] = this.headPitch.lag(0) * WHISKER_GP;
 
     let cx = 0, cy = 0, cz = 0;
+    let laid = 0, lastGrow = 0;
     for (let i = 1; i <= SEG; i++) {
       const o = i / SEG;
       const seg = TAIL_SEG[i];
@@ -336,21 +410,43 @@ export class Sway {
       const u = Math.max(0.0, (o - TAIL_PIN) / (1.0 - TAIL_PIN));
       const grow = u * u * (3.0 - 2.0 * u);
 
-      q[0] = q[1] = q[2] = 0; q[3] = 1;
+      /* Carried on from the segment before it: each one's own turn, run
+         backwards. Written into the frame *before* whatever the previous
+         node accumulated, because the axis it is taken about is a
+         direction in the rest tail — the shape is being rebuilt out of
+         its own turns rather than rotated as a whole. */
       if (water > 0.0) {
-        // Through the straight and out the other side.
-        const st = seg.straighten;
-        const a = st.angle * water * TAIL_FLIP * 0.5;
+        const tn = seg.turn;
+        /* Held to what a segment of this thickness can carry. It is not
+           enough on its own — the pivot is the node, so a vertex out at
+           the far end of a segment turns about a lever longer than the
+           radius this limit is built from — but it is the half of the
+           problem that has a closed form. */
+        const want = -tn.angle * water * TAIL_FLIP;
+        const a = Math.max(-seg.maxTurn, Math.min(seg.maxTurn, want)) * 0.5;
         const sn = Math.sin(a);
-        tmp[0] = st.axis[0] * sn; tmp[1] = st.axis[1] * sn;
-        tmp[2] = st.axis[2] * sn; tmp[3] = Math.cos(a);
-        qMul(tmp, q, q);
+        tmp[0] = tn.axis[0] * sn; tmp[1] = tn.axis[1] * sn;
+        tmp[2] = tn.axis[2] * sn; tmp[3] = Math.cos(a);
+        qMul(carry, tmp, acc);
+        carry[0] = acc[0]; carry[1] = acc[1]; carry[2] = acc[2]; carry[3] = acc[3];
+      }
+      q[0] = carry[0]; q[1] = carry[1]; q[2] = carry[2]; q[3] = carry[3];
 
-        /* And laid back onto the water, from the pin outward — with the
-           surface lifting and dropping the end of it as it goes. */
+      if (water > 0.0) {
+        /* And laid back, from the pin outward — with the water lifting
+           and dropping the end of it as it lies there. */
         const float = (Math.sin(t * 0.62) * 0.7 + Math.sin(t * 0.41 + 1.3) * 0.3)
                     * TAIL_FLOAT;
-        qMul(qAxis(0, (TAIL_LAY + float) * water * grow, tmp), q, acc);
+        /* The lay-back is spread over the whole tail rather than applied
+           at one joint, so its own share of the turn per segment is small
+           — but it is added to the flip's, and the pair of them have to
+           clear the same limit. */
+        const lay = (TAIL_LAY + float) * water;
+        const step = lay * (grow - lastGrow);
+        const room = seg.maxTurn - Math.abs(-seg.turn.angle * water * TAIL_FLIP);
+        const held = Math.max(-Math.max(room, 0), Math.min(Math.max(room, 0), step));
+        laid += held;
+        qMul(qAxis(0, laid, tmp), q, acc);
         q[0] = acc[0]; q[1] = acc[1]; q[2] = acc[2]; q[3] = acc[3];
       }
 
@@ -382,6 +478,7 @@ export class Sway {
       // drift that reads as life on a tail reads as a twitch on a face.
       this.whiskers[i * 2] = this.headYaw.lag(o) * WHISKER_GY;
       this.whiskers[i * 2 + 1] = this.headPitch.lag(o) * WHISKER_GP;
+      lastGrow = grow;
     }
     return this.qs;
   }
@@ -425,9 +522,16 @@ const PADDLE_BACK_FRONT = 0.34;
    it, and how fast. A short stroke read as an animal treading water very
    politely; this is one working. */
 const PADDLE_SWING = 0.96;
-/** The stroke a floating cat keeps up while going nowhere. Small, but
-    never zero: stillness in deep water reads as a stuffed animal. */
-const PADDLE_IDLE = 0.45;
+/* The stroke a floating cat keeps up while going nowhere. Small, but
+   never zero: stillness in deep water reads as a stuffed animal.
+
+   One number for two things, and that is the point rather than a
+   shortcut: the drive scales the swing *and* advances the phase, so a
+   cat treading water paddles both shorter and slower than one going
+   somewhere. Those are the same fact about an animal doing less work,
+   and splitting them into two knobs would make it possible to set them
+   against each other. */
+const PADDLE_IDLE = 0.22;
 /** Strokes per second per unit of drive. Faster than a walk and shorter,
     which is the difference between pushing on ground and on water. */
 const PADDLE_HZ = 2.60;

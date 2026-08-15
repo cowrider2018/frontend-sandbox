@@ -1137,11 +1137,18 @@ async function checkGaits() {
      because what has to be true is about the shape that comes out. And
      it cannot be photographed: the tail of a swimming cat is behind
      water that is nearer to the eye than it is. */
+  /* The tail's rest centreline at its nodes, as pose.js measures it off
+     the mesh. Kept in step with the table there: reading a shorter one
+     against a longer chain silently compares the wrong nodes. */
   const AXIS = [
-    [0.0143, 0.0418, -0.0334], [0.0143, 0.2930, -0.2339], [0.0143, 0.6214, -0.5087],
-    [0.0140, 0.9624, -0.7912], [0.0142, 1.3219, -0.9524], [0.0140, 1.7075, -0.9868],
-    [0.0142, 2.0793, -0.8061], [0.0140, 2.2846, -0.5308], [0.0014, 2.3985, -0.1488],
+    [0.0143, 0.0418, -0.0334], [0.0143, 0.1674, -0.1336], [0.0143, 0.3348, -0.2673],
+    [0.0143, 0.4601, -0.3679], [0.0143, 0.6222, -0.5078], [0.0140, 0.8239, -0.6916],
+    [0.0140, 0.9426, -0.7806], [0.0141, 1.0988, -0.8711], [0.0143, 1.2850, -0.9439],
+    [0.0140, 1.5485, -0.9984], [0.0140, 1.7333, -0.9876], [0.0140, 1.8596, -0.9510],
+    [0.0141, 2.0868, -0.8062], [0.0139, 2.2143, -0.6736], [0.0140, 2.2832, -0.5405],
+    [0.0142, 2.3377, -0.3679], [0.0014, 2.3985, -0.1488],
   ];
+
   const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
   const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
   const len3 = (a) => Math.hypot(a[0], a[1], a[2]);
@@ -1163,7 +1170,7 @@ async function checkGaits() {
       // Past the first couple of seconds only: the tail is still going
       // into the water before that, and the range would be the ramp
       // rather than the drift.
-      if (clock > 2) lift.push(chain.bend[SEG_TIP * 3 + 1]);
+      if (clock > 2) lift.push(chain.bend[(AXIS.length - 1) * 3 + 1]);
     }
     const P = AXIS.map((a, i) => [
       a[0] + chain.bend[i * 3], a[1] + chain.bend[i * 3 + 1], a[2] + chain.bend[i * 3 + 2],
@@ -1175,13 +1182,12 @@ async function checkGaits() {
     }
     const chord = sub3(P[P.length - 1], P[0]);
     const u = chord.map((v) => v / len3(chord));
-    const rel = sub3(P[4], P[0]);
+    const rel = sub3(P[Math.floor(P.length / 2)], P[0]);
     const along = dot3(rel, u);
     const bow = [rel[0] - u[0] * along, rel[1] - u[1] * along, rel[2] - u[2] * along];
     return { base: P[1], turn, bow: len3(bow),
              float: Math.max(...lift) - Math.min(...lift) };
   };
-  const SEG_TIP = 8;
 
   const dry = tailShape(0);
   const wet = tailShape(1);
