@@ -158,12 +158,23 @@ ${WEATHER_GLSL}
 
 /* How fast the bed loses its detail, per metre of water travelled.
 
-   Deliberately faster than the extinction above: detail has to be gone
-   while the bed is still visible, or there is no blurred stage at all
-   and the shallows go straight from a crisp meadow floor to nothing.
-   At a quarter metre the fine grain is 63 per cent gone and the bed is
-   still 38 per cent visible, which is the window this exists for. */
-#define WATER_BLUR_RATE 4.0
+   Slower than the extinction above, and the first version had it faster
+   for an argument that turned out to be self-defeating. The reasoning
+   was that detail has to go while the bed is still visible or there is
+   no blurred stage at all — true as far as it goes, but it ignored what
+   the detail is *for*. The refraction offset is a fraction of a metre;
+   the only thing in the ground with a wavelength short enough to show a
+   shift that size is the same fine grain this term takes away. Blur it
+   at 4.0 and the shallows do go soft, and they take the refraction with
+   them: the offset is still computed, still correct, and lands entirely
+   inside a colour that no longer varies over the distance it moved.
+
+   At 1.2 the wading depth in 50-lake-shallows keeps about three
+   quarters of its grain, which is enough for the chop to visibly drag
+   the bed around, and the softening arrives over the half metre after
+   it — still ahead of the extinction, which is all the original
+   argument actually required. */
+#define WATER_BLUR_RATE 1.2
 
 in vec2 vUv;
 out vec4 outColor;
