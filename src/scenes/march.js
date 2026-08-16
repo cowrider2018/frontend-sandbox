@@ -325,8 +325,8 @@ vec3 groundAlbedo(vec3 p, out float rough) {
        That is not a special case for the bed: the bed *is* wet, and the
        clarity term is already fading it out of sight by the time the
        difference could be argued with. */
-    float damp = smoothstep(-0.32, -0.01, waterDepth(p.xz));
-    soil *= mix(1.0, 0.66, damp);
+    float damp = smoothstep(-0.45, -0.01, waterDepth(p.xz));
+    soil *= mix(1.0, 0.55, damp);
     rough = mix(rough, 0.46, damp * 0.85);
     /* And whatever fell on it. Applied here rather than at every call
        site because there are three of them now — the soil under the eye,

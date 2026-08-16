@@ -479,6 +479,23 @@ void main() {
   albedo = mix(albedo, GRASS_DRY, dry * f);
   albedo *= mix(0.80, 1.20, h1.z);
 
+  /* And the shore, which is where this actually shows.
+
+     The soil goes dark and smooth for the last half metre before the
+     water — but the soil is not what anyone is looking at down there.
+     The sward is: a blade is one of a hundred thousand, and what reads
+     from thirty metres away is their colour, not the dirt between them.
+     Wetting the ground and leaving the grass bright over it puts the
+     whole band under a lawn and hides it, which is exactly what the
+     first version did.
+
+     Same field and the same question the taper up at the top of this
+     shader already asks, over a range four times as wide: the taper is
+     about the blades standing *in* the water and this is about the
+     ground they are walking out of, which reaches further inland than
+     the lake does. */
+  albedo *= mix(1.0, 0.58, smoothstep(-0.55, 0.0, waterDepth(base)));
+
   /* The blade takes the weather the soil under it took, out of the same
      function — a rained-on meadow whose grass stayed bright over dark
      wet ground is the specific wrongness this prevents. Snow is fed in
