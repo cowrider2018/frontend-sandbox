@@ -682,18 +682,29 @@ out vec4 outColor;
 uniform sampler2D uSrc;
 uniform sampler2D uHistory;
 uniform sampler2D uMesh;
-uniform float uBlend, uMeshOn;
+/** How much history to keep: the first for the marched half, the second
+    for whatever the rasterised half put in front of it. */
+uniform float uBlend, uBlendMesh;
+uniform float uMeshOn;
 
 void main() {
   vec4 scene = texture(uSrc, vUv);
   vec3 col = scene.rgb;
+  float keep = uBlend;
 
   if (uMeshOn > 0.5) {
     vec4 mesh = texture(uMesh, vUv);
-    if (mesh.a < scene.a) col = mesh.rgb;
+    /* The depth comparison that composites the two halves also says
+       which of them a pixel is, and that is worth more than the
+       composite: a meadow in wind is a reason to distrust the history
+       *of the meadow*, not of the sky above it or the lake beside it.
+       One blend for the whole frame threw the accumulation away
+       everywhere the grass happened to be moving — which, with the
+       default wind, is every frame the cover is switched on. */
+    if (mesh.a < scene.a) { col = mesh.rgb; keep = uBlendMesh; }
   }
 
-  outColor = vec4(mix(col, texture(uHistory, vUv).rgb, uBlend), 1.0);
+  outColor = vec4(mix(col, texture(uHistory, vUv).rgb, keep), 1.0);
 }
 `;
 
@@ -1137,6 +1148,7 @@ class MarchScene {
     this.width = 2;
     this.height = 2;
     this.moving = 1;
+    this.movingMesh = 1;
     this.time = 0;
     this.frameCount = 0;
 
@@ -1469,7 +1481,11 @@ class MarchScene {
     const prevDist = this.dist;
     this.dist += (this.targetDist - this.dist) * (1 - Math.exp(-clock.wallDt * 8));
     if (Math.abs(prevDist - this.dist) > 1e-4) moved = true;
+    /* Both are settled here and nowhere else: this runs once a frame and
+       everything that adds to them runs after it. The camera's own
+       motion belongs to both halves — it moves every pixel there is. */
     this.moving = moved ? 1 : 0;
+    this.movingMesh = 0;
 
     const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
     const cyw = Math.cos(this.yaw), syw = Math.sin(this.yaw);
@@ -2152,10 +2168,16 @@ class MarchScene {
        there means what it always meant: strike the surface. Read by the
        pointer handlers, which have no state either. */
     this._catView = showCat && state.camera === 'follow';
+    let reskinned = false;
     if (showCat) {
-      // Changing the colourway invalidates the accumulated history the
-      // same way moving does — the pixels change without the cat having.
-      if (this.cat.setSkin(state.skin)) this.moving = 1;
+      /* Changing the colourway invalidates the accumulated history the
+         same way moving does — the pixels change without the cat having.
+
+         Held until after the camera has been updated rather than set
+         here, because that is where both of these are settled for the
+         frame: written now, it was overwritten a dozen lines later and
+         the swap smeared for a few frames every time. */
+      reskinned = this.cat.setSkin(state.skin);
       this._feedLook(pointer);
       // Last frame's basis, deliberately: the camera has not been moved
       // yet this frame, and steering off the picture the user is
@@ -2167,10 +2189,22 @@ class MarchScene {
 
     this._updateCamera(state, clock, pointer);
 
-    // A cat that moved invalidates the accumulated history, exactly like
-    // a travelling ripple does — and "moved" includes breathing and
-    // blinking, not just walking.
-    if (showCat && this.cat.animating) this.moving = 1;
+    /* A cat that moved invalidates the accumulated history, exactly like
+       a travelling ripple does — and "moved" includes breathing and
+       blinking, not just walking.
+
+       Which half it invalidates is the question, and the animal answers
+       it twice. Where it *is* changes the marched half too, because the
+       shadow it throws lands there; what it is doing with its ribs and
+       its tail changes only the triangles it is made of. So a walking cat
+       stops the whole frame accumulating and a breathing one stops only
+       itself — the capsules do drift a hair as it breathes, and that
+       hair is a soft shadow's worth of ghosting against a whole frame of
+       aliasing. */
+    if (reskinned) this.movingMesh = 1;
+    if (showCat && this.cat.animating) this.movingMesh = 1;
+    if (showCat && (this.cat.speed !== 0 || this.cat.turnRate !== 0
+                    || this.cat.swim > 0.01)) this.moving = 1;
 
     /* The light, from whichever control the mode put in charge.
 
@@ -2263,8 +2297,19 @@ class MarchScene {
     if (rippleActive) this.moving = 1;
 
     /* Grass in wind never holds still, so the accumulation buffer must
-       not be allowed to believe it does. */
-    if ((covered || wooded) && state.wind > 0.001) this.moving = 1;
+       not be allowed to believe it does — but only about the grass. The
+       blades are triangles and they cast nothing into the marched half,
+       so the sky, the cluster, the hills and the lake can go on
+       converging while the meadow blows.
+
+       A wood is not the same case and is kept whole: its shadow map is
+       read by the floor the marcher draws, so leaves moving in the wind
+       move pixels on the marched side of the composite. */
+    if (covered && state.wind > 0.001) this.movingMesh = 1;
+    if (wooded && state.wind > 0.001) this.moving = 1;
+    /* And the lake, which is marched: its normal is a function of the
+       wind and the clock, so a windy surface is never twice the same. */
+    if (state.water && state.wind > 0.001) this.moving = 1;
 
     /* The wood is grown and its shadow map drawn before anything is
        shaded, because everything that follows reads it: the floor here,
@@ -2530,7 +2575,12 @@ class MarchScene {
 
     // Temporal blend is dialled back while anything moves, or the jitter
     // turns into a smear.
+    /* Anything that moves the marched half has moved the rasterised one
+       as well — the camera at least — so the mesh's own limit is the
+       lower of the two. */
     const blend = this.moving ? Math.min(state.taa, 0.55) : state.taa;
+    const blendMesh = (this.moving || this.movingMesh)
+      ? Math.min(state.taa, 0.55) : state.taa;
 
     this.history.write.bind();
     this.accum.use({
@@ -2539,6 +2589,7 @@ class MarchScene {
       uMesh: this.meshRT.texture,
       uMeshOn: raster ? 1 : 0,
       uBlend: blend,
+      uBlendMesh: blendMesh,
     });
     tri.draw();
     this.history.swap();

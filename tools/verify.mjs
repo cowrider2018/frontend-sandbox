@@ -3469,12 +3469,31 @@ async function interact(cdp, base, problems) {
     await sleep(120);
     still = await cdp.eval(`__aether.scene.moving`);
   }
-  await cdp.eval(`__aether.panel.setValues({ wind: 0.8 }, { notify: true }); true`);
+  await cdp.eval(`__aether.panel.setValues({ wind: 0.8, ground: 'grass',
+    trees: false, water: false }, { notify: true }); true`);
   await sleep(400);
-  const blowing = await cdp.eval(`__aether.scene.moving`);
-  check('wind stops the accumulation buffer from settling',
-    still === 0 && blowing === 1,
-    `moving ${still} with no wind, ${blowing} with wind`);
+  const blowing = await cdp.eval(`({ scene: __aether.scene.moving,
+    mesh: __aether.scene.movingMesh })`);
+
+  /* Wind stops the *meadow* settling, and leaves the rest of the frame
+     alone. The blades are triangles that cast nothing into the marched
+     half, so the sky, the cluster, the hills and the lake go on
+     converging while the grass blows — which they did not when one blend
+     covered the whole frame, and with the default wind that was every
+     frame the cover was on. */
+  check('wind stops the meadow settling and lets the rest of the frame converge',
+    still === 0 && blowing.mesh === 1 && blowing.scene === 0,
+    `with wind: marched ${blowing.scene}, rasterised ${blowing.mesh}`);
+
+  /* A wood is the exception and is kept whole: the floor the marcher
+     draws reads the canopy's shadow map, so leaves moving in the wind
+     move pixels on the marched side of the composite. */
+  await cdp.eval(`__aether.panel.setValues({ trees: true }, { notify: true }); true`);
+  await sleep(500);
+  const wooded = await cdp.eval(`__aether.scene.moving`);
+  check('a wood in wind moves the marched half too, through its shadow',
+    wooded === 1, `moving ${wooded} with the wood on`);
+  await cdp.eval(`__aether.panel.setValues({ trees: false }, { notify: true }); true`);
 
   /* reset puts back everything: parameters, camera and the URL. It used
      to do only half of that, with the other half hidden in a separate
