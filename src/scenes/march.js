@@ -310,6 +310,24 @@ vec3 groundAlbedo(vec3 p, out float rough) {
        a thin meadow into stubble on a ploughed field. */
     vec3 soil = mix(vec3(0.016, 0.030, 0.011), vec3(0.046, 0.086, 0.026), broad);
     rough = 0.94;
+
+    /* And the shore, which until now went straight from dry meadow to
+       water with nothing in between — a waterline with no width.
+
+       Ground within a few centimetres of the surface is wet ground, and
+       wet ground is the two things this scene already knows how to say:
+       darker, and less rough. It costs one height sample the shading has
+       already taken, and it lands exactly where it can be seen — the
+       grass tapers into the last twelve centimetres before the water, so
+       the soil is what is showing there.
+
+       It carries on under the water rather than stopping at the line.
+       That is not a special case for the bed: the bed *is* wet, and the
+       clarity term is already fading it out of sight by the time the
+       difference could be argued with. */
+    float damp = smoothstep(-0.32, -0.01, waterDepth(p.xz));
+    soil *= mix(1.0, 0.66, damp);
+    rough = mix(rough, 0.46, damp * 0.85);
     /* And whatever fell on it. Applied here rather than at every call
        site because there are three of them now — the soil under the eye,
        the bed under the water, and the bounce — and a lake whose floor
