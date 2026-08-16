@@ -136,6 +136,35 @@ ${WEATHER_GLSL}
 #define WAKE_FALL 0.50
 #define WAKE_AMP 0.080
 
+/* Air into water, as the ratio refract() wants: 1 / 1.33.
+
+   The one number that makes the bed behave. It bounds itself, which is
+   the property worth knowing here — a ray arriving dead along the
+   surface still leaves the interface at 48.8 degrees off vertical, so
+   the refracted ray can never travel further sideways than 1.14 times
+   the depth, and the horizontal offset below needs no clamp to stay on
+   the lake. Snell does the clamping. */
+#define WATER_IOR 0.751880
+
+/* How fast each channel goes out, per metre of water. Was one number
+   for all three, which is a lake made of grey glass: the thing that
+   says water rather than "dark" is that red dies first and the last
+   colour left standing before the bed vanishes is blue-green.
+
+   Weighted against luminance the three come to 2.13, which is the 2.1
+   they replace — so the depth at which the bed disappears is unchanged
+   and only its colour on the way out is new. */
+#define WATER_EXTINCT vec3(3.1, 1.9, 1.6)
+
+/* How fast the bed loses its detail, per metre of water travelled.
+
+   Deliberately faster than the extinction above: detail has to be gone
+   while the bed is still visible, or there is no blurred stage at all
+   and the shallows go straight from a crisp meadow floor to nothing.
+   At a quarter metre the fine grain is 63 per cent gone and the bed is
+   still 38 per cent visible, which is the window this exists for. */
+#define WATER_BLUR_RATE 4.0
+
 in vec2 vUv;
 out vec4 outColor;
 
@@ -290,8 +319,23 @@ ${CANOPY_SHADE_GLSL}
  * does not read the bed is a lake with a painted-on shoreline. It only
  * ever looks at xz, which is why the surface point can be handed to it
  * in place of the bed point underneath.
+ *
+ * The blur argument is how much of the fine grain to drop, 0 on dry
+ * land — no back-ticks in here, this is inside a template literal. Water is
+ * the only caller that ever asks for any, and what it is asking for is
+ * a low-pass and not a softening: losing the high frequencies *is* what
+ * blur is, so the cheap honest implementation is to fade the fine term
+ * toward its own mean and leave the broad one alone. It costs one mix.
+ *
+ * The alternative — sampling this function several times around the
+ * point and averaging — is a genuine blur and costs several times two
+ * 3D simplex evaluations plus a snow cover, per water pixel. The
+ * stochastic version of that (one jittered tap, resolved by the
+ * temporal filter) is cheaper still and is not available here: a lake
+ * in any wind pins the moving flag, which caps the accumulation blend at 0.55,
+ * and a single jittered tap under that cap is visible noise.
  */
-vec3 groundAlbedo(vec3 p, out float rough) {
+vec3 groundAlbedo(vec3 p, float blur, out float rough) {
   /* Soil, once there is a meadow standing on it.
      The grid is a reference surface — a ruled, faintly polished plane
      that says where the floor is. Grass growing out of a ruled plane
@@ -303,6 +347,12 @@ vec3 groundAlbedo(vec3 p, out float rough) {
   if (uGround > 0.5) {
     float broad = snoise(vec3(p.x * 0.42, 3.7, p.z * 0.42)) * 0.5 + 0.5;
     float fine = snoise(vec3(p.x * 3.10, 8.1, p.z * 3.10)) * 0.5 + 0.5;
+    /* A third of a metre per cycle, which is the only frequency here
+       small enough for water to take away. The broad term is nearly two
+       and a half metres across and survives to the depth the extinction
+       has already finished it off at, so blurring it would be spending
+       an instruction under a colour nobody can see through. */
+    fine = mix(fine, 0.5, blur);
     /* Green, not brown. There is no instance budget that puts a blade
        over every square centimetre, so what shows between them has to
        be the same colour as what is standing in it — a dark sward seen
@@ -452,8 +502,22 @@ vec3 waterNormal(vec2 q, float dist) {
   return normalize(vec3(-g.x, 1.0, -g.y));
 }
 
-vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal,
-              out float snowOut) {
+/**
+ * The ray direction and the lit flag are here for the water and nothing
+ * else: the bed is read along the refracted ray, which needs the
+ * direction the eye came in on, and the flag is the same one shadeDirect
+ * already carries to say whether this is the primary ray or the
+ * reflection bounce.
+ *
+ * The bounce does not refract. That is not an approximation anyone can
+ * catch — it is the lake seen in the lake, at a fraction of a weight,
+ * through a second surface that is itself rippling — and it matters
+ * because this whole function is inlined twice. Everything added below
+ * would otherwise be paid for twice against an instruction ceiling this
+ * shader has already hit once.
+ */
+vec3 material(vec3 p, vec3 n, vec3 rd, float mat, bool lit,
+              out float rough, out float metal, out float snowOut) {
   /* Reported back rather than recomputed by the caller. The shading needs
      it too — snow's shaded side is lit almost entirely by the sky, which
      is a change to the *fill* and not to the albedo — and snowCover is a
@@ -461,25 +525,69 @@ vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal,
      per pixel for an answer that was already on the stack. */
   snowOut = 0.0;
   /* Water.
-     Not simulated, not refracted. Two things sell a lake and this is
-     both of them: the shallows show the bed and the deeps do not, and
-     the surface is smooth enough that the reflection bounce main() was
-     already firing lands on it. The second one is why there is no
-     reflection code here — the water is simply the first surface in this
-     scene polished enough to use the one that already existed. */
+     Not simulated. Three things sell a lake and this is all of them:
+     the shallows show the bed and show it *bent*, the bed goes soft and
+     then goes out over the first half metre, and the surface is smooth
+     enough that the reflection bounce main() was already firing lands
+     on it. The last one is why there is no reflection code here — the
+     water is simply the first surface in this scene polished enough to
+     use the one that already existed. */
   if (mat > 2.5) {
     metal = 0.0;
     rough = 0.045;
 
     float d = max(waterDepth(p.xz), 0.0);
-    // How far down you can see. The one number between a puddle and a
-    // lake, and the reason the shoreline needs no geometry: the bed
-    // fades out of view over the first half metre by itself.
-    float clarity = 1.0 - exp(-d * 2.1);
+
+    /* Where the bed actually is, as opposed to straight down.
+
+       The surface is a plane and the bed is a height field, so the
+       refracted ray does not have to be marched: it has to be crossed
+       with a horizontal plane one depth below, and that is a divide.
+       The offset it produces is the whole of what reads as refraction —
+       not the displacement itself, which at these depths is a few
+       centimetres, but the fact that it *moves*, because the normal it
+       is computed from is the same one the four wave trains are already
+       tilting. The chop wobbles the bed for free.
+
+       The shoreline needs no protection from this. The offset scales
+       with the depth and the depth is zero at the water's edge, so the
+       sample walks back to the surface point exactly where sampling dry
+       ground would start to show.
+
+       Skipped when the ray is not descending, which is the only way
+       refract() can be handed a geometry it has no answer for: a camera
+       below the surface looking up. The lake is drawn from above and
+       this costs a compare. */
+    vec2 bedXZ = p.xz;
+    float path = d;
+    if (lit && rd.y < -1e-3) {
+      vec3 rr = refract(rd, n, WATER_IOR);
+      float k = d / max(-rr.y, 0.5);
+      bedXZ += rr.xz * k;
+      path = k;
+    }
+
+    /* How far down you can see, per channel now. The one number between
+       a puddle and a lake, and the reason the shoreline needs no
+       geometry: the bed fades out of view over the first half metre by
+       itself.
+
+       Driven by the vertical depth and not the path length, which is
+       the shallower of the two claims and deliberately so — it is the
+       curve the lake was tuned on, and the blur below is the new thing
+       here, not the visibility. */
+    vec3 clarity = 1.0 - exp(-d * WATER_EXTINCT);
+
+    /* The blur *is* driven by the path, because that is the distance
+       the light actually travelled through water, and at a grazing
+       angle it is half again the depth. Bounded by the same Snell
+       argument the offset is: it can never exceed 1.52 depths, so this
+       needs no clamp either. */
+    float blur = 1.0 - exp(-path * WATER_BLUR_RATE);
 
     float bedRough;
     // Wet, so darker than the same ground in air.
-    vec3 bed = groundAlbedo(p, bedRough) * 0.55;
+    vec3 bed = groundAlbedo(vec3(bedXZ.x, p.y, bedXZ.y), blur, bedRough) * 0.55;
     vec3 deep = vec3(0.014, 0.043, 0.055);
     return mix(bed, deep, clarity);
   }
@@ -487,7 +595,7 @@ vec3 material(vec3 p, vec3 n, float mat, out float rough, out float metal,
   if (mat > 1.5) {
     metal = 0.0;
     snowOut = snowCover(p.xz);
-    return groundAlbedo(p, rough);
+    return groundAlbedo(p, 0.0, rough);
   }
 
   // body: iridescent, driven by the angle between normal and view
@@ -547,7 +655,7 @@ vec3 shadeDirect(vec3 ro, vec3 rd, float t, float mat, bool lit,
   nOut = n;
 
   float rough, metal, snow;
-  vec3 albedo = material(p, n, mat, rough, metal, snow);
+  vec3 albedo = material(p, n, rd, mat, lit, rough, metal, snow);
   roughOut = rough;
 
   vec3 l = uLightDir;

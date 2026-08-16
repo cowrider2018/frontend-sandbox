@@ -551,6 +551,64 @@ const SHOTS_PLAN = [
            s.yaw = 0.85; s.pitch = 0.06; s.targetDist = 22;
            return true;` },
 
+  /* The shallows, which is the one thing every lake shot above is at the
+     wrong angle to see.
+
+     33 through 36 all look across the water from roughly eye height, and
+     at that angle a lake is its reflection — which is the honest picture
+     of a lake and exactly why none of them can photograph what is
+     happening *under* the surface. This one leans over the edge: close,
+     pitched down, and at a level that leaves a wide shelf of shallow
+     water rather than a shoreline that drops away.
+
+     Three things show here and nowhere else. The bed is displaced along
+     the refracted ray, so it does not sit directly under the surface
+     point — visible as an offset between where the shore reads on the
+     bed and where the waterline actually is. The bed loses its fine
+     grain before it loses its light, so there is a band of soft bed
+     between the crisp shallows and the dark. And what is left of the bed
+     at the far edge of visibility is blue-green, because red went first.
+
+     Wind on, because the displacement is computed from the same normal
+     the wave trains tilt: a still lake refracts, but it refracts by a
+     constant, and a constant offset is not something the eye reads as
+     water. The motion is the tell.
+
+     The camera gets there by standing the cat there, which is the only
+     way it can: the orbit rig eases its centre back to the origin every
+     frame, so a poke that moves it is undone before the shot is taken.
+     Follow mode aims at the animal, and the animal can be put anywhere.
+
+     Where it is put was solved rather than eyeballed — (-2.5, -22.5) is
+     0.21 m under at this level, and every point within a couple of
+     metres of it is between 0.02 and 0.6, so the frame is a shelf and
+     not a ledge. It is a wading depth, not a swimming one, which is
+     what keeps the animal small in frame and the water the subject.
+
+     Exposed up rather than lit differently, and the distinction matters
+     if this shot is ever re-tuned. The other lake shots look *across*
+     the water, where the low side-light is what puts a reflection on it.
+     This one looks into it, and what it needs is not a different sun but
+     more of the frame above the noise floor: the bed is the darkest
+     surface in the scene, seen through a medium that is subtracting from
+     it. Moving the light instead was tried and made the whole frame
+     darker, the meadow included, which is the tell that the exposure and
+     not the sun was the thing in the way.
+
+     The clock runs, for 49's reason: a frozen frame catches a cat that
+     has not noticed the water yet. */
+  { name: '50-lake-shallows',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&hills=4.5&water=1'
+        + '&waterLevel=0.72&coverRadius=50&visibility=140&wind=0.5'
+        + '&camera=follow&daylight=hour&hour=11&exposure=2.4',
+    settle: 3200,
+    pre: `const c = __aether.scene.cat;
+          c.x = -2.5; c.z = -22.5; c.yaw = 2.2; c.velocity = 0;
+          __aether.scene.laser.silence(); return true;`,
+    poke: `const s = __aether.scene;
+           s.pitch = 0.55; s.targetDist = 7;
+           return true;` },
+
   /* The reeds, which is the same shore as 36 with something living on
      it. Two things to look at, and both are about the band rather than
      about the stalks: it has to follow the waterline round every bay
