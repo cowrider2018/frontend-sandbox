@@ -609,6 +609,44 @@ const SHOTS_PLAN = [
            s.pitch = 0.55; s.targetDist = 7;
            return true;` },
 
+  /* The reflection, which is the other half of the surface and which no
+     shot in this file could see either.
+
+     50 looks straight down and is the right picture of what is under the
+     water, which is exactly why it has no reflection in it at all: at
+     that angle water's fresnel is 0.025, the weight lands under the skip
+     threshold, and the bounce never fires. That is not a gap in the
+     shot, it is what a lake looks like from above.
+
+     So this is the same lake from the other extreme — eye almost on the
+     surface, where the fresnel runs to nearly one and the water hands
+     itself over to the mirror. The wind is off, which is not a special
+     case but the honest limit: water is only rough because something is
+     roughing it, and a still lake is a mirror. The trees are on because
+     a reflection needs something to be a reflection *of*; sky alone
+     reflected in water is just more sky.
+
+     The animal is put at the deepest point rather than in the shallows,
+     and for the reflection that is the whole difference. From the shore
+     the only water low enough in frame to see is water with sky directly
+     above it, and sky reflected in water is indistinguishable from
+     water. Out here there is 12 to 16 metres of open surface in every
+     direction, so whichever way the camera turns the far bank — and the
+     trees standing on it — is what sits above the water and therefore
+     what lands in it. Depth helps twice: past a metre or so the bed is
+     gone entirely, and a dark surface is what a reflection shows on. */
+  { name: '51-lake-mirror',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&trees=1&hills=4.5'
+        + '&water=1&waterLevel=0.72&coverRadius=50&visibility=140&wind=0'
+        + '&camera=follow&daylight=hour&hour=11&exposure=1.8',
+    settle: 3200,
+    pre: `const c = __aether.scene.cat;
+          c.x = -17.5; c.z = -14; c.yaw = 2.2; c.velocity = 0;
+          __aether.scene.laser.silence(); return true;`,
+    poke: `const s = __aether.scene;
+           s.pitch = 0.03; s.targetDist = 6;
+           return true;` },
+
   /* The reeds, which is the same shore as 36 with something living on
      it. Two things to look at, and both are about the band rather than
      about the stalks: it has to follow the waterline round every bay

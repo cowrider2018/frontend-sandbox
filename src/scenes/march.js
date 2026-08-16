@@ -756,7 +756,27 @@ void main() {
 
   if (mat > 0.5 && uReflect > 0.0) {
     float fresnel = pow(1.0 - max(dot(n, -rd), 0.0), 5.0);
-    float amount = uReflect * mix(0.12, 0.72, 1.0 - rough) * (0.25 + fresnel * 0.75);
+    /* Water reflects on its own curve, and it is the real one: Schlick
+       from an F0 of 0.02, which is what water is.
+
+       The shared expression was written for the spheres and the ground,
+       where a roughness-weighted floor with a mild fresnel on top is a
+       fair approximation and nothing looks wrong. Handed to a lake it
+       says two things that are visibly false at once. Looking straight
+       down it mixes about a tenth of the sky into the water, so the
+       deeps never quite go dark and the bed is always competing with a
+       haze that is not there. Looking along the surface it stops at
+       0.38, when the honest answer at that angle is nearly all of it —
+       and a lake is *mostly* seen at that angle, which is why this is
+       the single largest change to how the water reads.
+
+       It costs nothing. It is a different expression, not more work,
+       and the trace it guards fires slightly less often than before:
+       overhead water now lands under the 0.02 skip threshold, which is
+       exactly where the bounce was buying the least. */
+    float amount = mat > 2.5
+      ? uReflect * (0.02 + 0.98 * fresnel)
+      : uReflect * mix(0.12, 0.72, 1.0 - rough) * (0.25 + fresnel * 0.75);
     // Below this the bounce cannot move an 8-bit channel; skip the
     // entire second trace.
     if (amount > 0.02) {
