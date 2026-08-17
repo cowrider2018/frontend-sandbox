@@ -754,6 +754,24 @@ void trace(vec3 ro, vec3 rd, int steps, out float t, out float mat) {
   if (tw > 0.0 && (mat < 0.5 || tw < t)) { t = tw; mat = 3.0; }
 }
 
+/**
+ * A world point, back to the uv it was drawn at.
+ *
+ * The exact inverse of the ray main() builds, which is what makes it
+ * usable for reading another pass's target: both halves of the frame
+ * were rendered through this camera, so a point on one can be looked up
+ * in the other. Only the water asks, and only about points it has
+ * already established are in front of it.
+ */
+vec2 projectUV(vec3 q) {
+  vec3 v = q - uCamPos;
+  float z = dot(v, uFwd);
+  float aspect = uResolution.x / uResolution.y;
+  vec2 ndc = vec2(dot(v, uRight) * uFocal / (z * aspect),
+                  dot(v, uUp) * uFocal / z);
+  return ndc * 0.5 + 0.5;
+}
+
 void main() {
   vec2 ndc = vUv * 2.0 - 1.0;
   float aspect = uResolution.x / uResolution.y;
@@ -794,6 +812,34 @@ void main() {
     vec4 sunk = texture(uMesh, vUv);
     if (sunk.a > t && sunk.a < 9000.0) {
       float under = max(uWaterY - (uCamPos.y + rd.y * sunk.a), 0.0);
+
+      /* And now bend it, which is the half of refraction the bed cannot
+         show. The bed's offset is computed analytically because the bed
+         is a height field this shader owns; a leg is a triangle in a
+         texture, so the only way to bend it is to read that texture
+         somewhere else.
+
+         Where is one step of the obvious iteration: the straight-down
+         sample says how deep the thing is, the refracted ray is walked
+         to that depth, and the point it lands on is projected back to a
+         uv. One step is enough because the correction is small and its
+         error is second order — the depth used to aim is wrong only by
+         however far the object slopes across the offset.
+
+         It has to be checked before it is believed. A displaced sample
+         can walk off the object, past the shoreline, or outside the
+         frame entirely, and the sample sitting there is a bank or a sky
+         that was never under any water. Failing that test is not an
+         error worth handling twice: the undisplaced sample is right
+         where the offset is small, which is exactly where the shallow
+         water is that this is for. */
+      vec3 rr = refract(rd, n, WATER_IOR);
+      vec2 uv2 = projectUV(p + rr * (under / max(-rr.y, 0.5)));
+      if (all(greaterThan(uv2, vec2(0.0))) && all(lessThan(uv2, vec2(1.0)))) {
+        vec4 bent = texture(uMesh, uv2);
+        if (bent.a > t && bent.a < 9000.0) sunk = bent;
+      }
+
       col = mix(sunk.rgb, col, 1.0 - exp(-under * WATER_EXTINCT));
     }
   }
