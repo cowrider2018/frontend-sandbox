@@ -358,9 +358,9 @@ vec3 starHash(vec3 p) {
   p += dot(p, p.yxz + 33.33);
   return fract((p.xxy + p.yxx) * p.zyx);
 }
-/** How much daylight is in the sky, 0..1. One is the sky this scene has
-    always had; the fixed-light mode uploads exactly that, so a frame
-    taken before there was a time of day still renders byte for byte. */
+/** How much daylight is in the sky, 0..1. One is full day, and the
+    fixed-light mode uploads exactly that — so the pad still lights a
+    daytime meadow, and only the hour can bring a night on. */
 uniform float uDay;
 
 /* How much cloud is between here and it, 0..1.
@@ -399,36 +399,155 @@ uniform float uOvercast;
  */
 uniform vec3 uAmbient;
 
+/* ── the clear sky, and why it used to be grey ────────────────────
+   There was one daytime palette: a horizon band at (0.110, 0.121,
+   0.149), a slightly bluer zenith above it, and a night set to lerp
+   toward. Two complaints came out of that, and they are the same
+   mistake seen from either end.
+
+   It was grey. Those three channels sit within a fifth of each other,
+   and a horizon that desaturated is what haze looks like, not what air
+   looks like. Worse, the horizon band *is* the sky in this scene: the
+   eye is fifteen metres up looking along a meadow, so what fills the
+   frame is h just above 0.5, and the zenith colour — which was blue,
+   and was fine — was almost never on screen to say so.
+
+   And it did not move. uDay is a daylight number: it crosses from 0 to
+   1 while the sun is within a few degrees of the horizon and then sits
+   at 1 for eleven hours. Every hour between breakfast and tea uploaded
+   the identical sky, which is precisely the span of the day an eye is
+   best at reading the time of.
+
+   So the sky now hangs off two numbers instead of one. uDay still says
+   whether there is a day at all, and uLightDir.y — the sine of the lit
+   body's elevation — says how low it is, which unlike uDay is moving
+   the whole time the sun is up.
+
+   ── four colours, not two ───────────────────────────────────────
+   Noon and dusk each get a zenith and a horizon. The dusk pair is the
+   sky *away* from the sun: violet overhead, mauve at the far horizon.
+   The half that actually burns is not in this table at all, because it
+   is not a palette entry — it is a place in the sky, and it is added
+   below where it can be aimed at the sun's own bearing. Folding it in
+   here instead was the first attempt and it turns the whole dome
+   orange at dusk, including the quarter of it behind you, which reads
+   as a colour grade rather than as a sunset.
+
+   ── and how bright, which was the other half of it ──────────────
+   The old daytime sky peaked at 0.15 of linear white. Through an
+   exposure of 1.25 and an ACES curve that is about 0.2 on the wire —
+   a fifth of the way up an eight-bit ramp, which is *dimmer than the
+   sunlit grass under it*. That is the whole reason noon read as an
+   overcast evening no matter what hue it was given: a sky darker than
+   the ground it lights is a sky after sunset, and the eye knows it
+   before it has looked at anything else.
+
+   These are set by working the tonemap backwards from where the sky
+   should land on the wire — roughly 0.47 at the horizon and 0.34
+   overhead at noon, so the sky is the brightest thing in the frame
+   again and the meadow sits against it rather than above it. */
+const vec3 NOON_TOP = vec3(0.082, 0.180, 0.430);
+const vec3 NOON_HOR = vec3(0.195, 0.265, 0.390);
+const vec3 NOON_BOT = vec3(0.045, 0.060, 0.090);
+
+const vec3 DUSK_TOP = vec3(0.042, 0.046, 0.115);
+const vec3 DUSK_HOR = vec3(0.105, 0.092, 0.140);
+const vec3 DUSK_BOT = vec3(0.024, 0.019, 0.026);
+
+/* The night set, unchanged: the same sky with the air taken out of it,
+   a horizon barely brighter than the zenith, because at night what
+   lights the low sky is the ground and this ground is dark. */
+const vec3 NIGHT_TOP = vec3(0.006, 0.009, 0.022);
+const vec3 NIGHT_HOR = vec3(0.012, 0.016, 0.030);
+const vec3 NIGHT_BOT = vec3(0.004, 0.005, 0.010);
+
+/** The low sun's glow along the horizon it is sitting on. Additive, so
+    it is light arriving on top of the air rather than a replacement
+    for it, which is also what it is. */
+const vec3 LOW_GLOW = vec3(0.55, 0.200, 0.055);
+
 vec3 sky(vec3 rd) {
   float h = rd.y * 0.5 + 0.5;
 
-  /* Two palettes and a lerp. The day one is the original set, unchanged
-     and unchangeable — every reference shot in the project is measured
-     against it. The night one is the same sky with the air taken out of
-     it: a horizon barely brighter than the zenith, because at night what
-     lights the low sky is the ground, and this ground is dark. */
-  vec3 top = mix(vec3(0.006, 0.009, 0.022), vec3(0.045, 0.062, 0.10), uDay);
-  vec3 hor = mix(vec3(0.012, 0.016, 0.030), vec3(0.110, 0.121, 0.149), uDay);
-  vec3 bot = mix(vec3(0.004, 0.005, 0.010), vec3(0.015, 0.016, 0.022), uDay);
+  /* How low the body lighting the scene is, and how much that should
+     count for. One at the horizon, gone by the time the sun is forty
+     degrees up — so the warm end arrives over the hour or so either
+     side of sunrise and sunset rather than snapping on at the moment
+     of it. uDay gates it because after dark this same direction
+     belongs to the moon, and a moonrise does not turn the sky orange.
+
+     It reads uLightDir rather than the hour, so the fixed-light mode
+     gets it too: drop the pad's light to the horizon and the sky goes
+     with it, which is the answer to a question that mode used to give
+     the wrong one to — a raking light under a noon sky. */
+  float low = 1.0 - smoothstep(-0.02, 0.62, uLightDir.y);
+  float warm = low * smoothstep(0.0, 0.45, uDay);
+
+  vec3 top = mix(mix(NOON_TOP, DUSK_TOP, warm), NIGHT_TOP, 1.0 - uDay);
+  vec3 hor = mix(mix(NOON_HOR, DUSK_HOR, warm), NIGHT_HOR, 1.0 - uDay);
+  vec3 bot = mix(mix(NOON_BOT, DUSK_BOT, warm), NIGHT_BOT, 1.0 - uDay);
 
   vec3 c = mix(bot, hor, smoothstep(0.35, 0.5, h));
   c = mix(c, top, smoothstep(0.5, 1.0, h));
 
-  /* Overcast, which is mostly the *loss of a gradient*. A clear sky is
-     deep overhead and pale at the horizon because that is where the air
-     is; a covered one is a lit sheet a kilometre up and reads almost the
-     same brightness everywhere, which is why a flattened gradient says
-     "cloud" before any colour does.
+  /* And the burning quarter. Two factors: which way this ray is
+     looking compared with the sun's bearing, and how near the horizon
+     it is. Both are needed — the bearing alone paints a warm column
+     all the way to the zenith, and the height alone paints a warm ring
+     right round the field.
 
-     Toward the horizon's own colour rather than toward a grey of its
-     own: the horizon band is already the mixture of daylight and air
-     this sky is made of, so flattening onto it keeps every hour's
-     palette — an overcast dusk stays orange, an overcast midnight stays
-     nearly black — without a second set of constants to keep in step
-     with the first. Lifted a little, because cloud lit from above is
-     brighter than the air it replaced. */
+     The bearing is taken flat, from xz only, so a ray climbing away
+     from a sun at the horizon keeps its bearing instead of falling off
+     the moment it gains height.
+
+     Both falloffs are much sharper than the first pass at this, and
+     for a reason worth writing down: a cosine and a square reach a
+     tenth of their peak only at right angles to the sun, and the first
+     version accordingly put a quarter of full sunrise into the sky
+     *behind the camera*. The frame came out as one pink wash with a
+     brighter patch in it — a colour grade, not a sunrise. What makes a
+     low sun read is the contrast between the half of the sky it is
+     burning and the half that has already gone violet, so the glow now
+     reaches zero about a hundred degrees off the sun's bearing and is
+     gone fifteen degrees up. Both ends are where they are because the
+     thing has to *end* somewhere the eye can see it ending.
+
+     It goes in before the cloud below, so that overcast covers it. A
+     sunset burning through a rainstorm was the tell that this term had
+     been bolted on after the weather rather than into the sky. */
+  if (warm > 0.002) {
+    vec2 rh = rd.xz, lh = uLightDir.xz;
+    float rl = length(rh), ll = length(lh);
+    float az = (rl > 1e-4 && ll > 1e-4) ? dot(rh, lh) / (rl * ll) : 0.0;
+    float toward = smoothstep(-0.30, 1.0, az);
+    float band = exp(-max(rd.y, 0.0) * 6.5) * smoothstep(-0.35, -0.02, rd.y);
+    c += LOW_GLOW * warm * toward * toward * band;
+  }
+
+  /* Overcast, which is two things at once, and the older version only
+     had one of them.
+
+     It is the *loss of a gradient*. A clear sky is deep overhead and
+     pale at the horizon because that is where the air is; a covered one
+     is a lit sheet a kilometre up and reads almost the same brightness
+     everywhere, which is why a flattened gradient says "cloud" before
+     any colour does.
+
+     And it is the loss of the *hue*. What makes a sky blue is the air;
+     what makes cloud white is water, which scatters every wavelength
+     alike. Flattening onto the horizon band alone — which is what this
+     did — was invisible back when that band was already near-neutral,
+     and it is the reason it was: a grey clear sky and a grey overcast
+     one are the same picture, so the weather had nothing left to say.
+     Now that clear weather is blue, the deck has to desaturate or rain
+     arrives as a blue sheet. A little of the hour's own colour is kept
+     rather than none, so an overcast dusk still leans warm and an
+     overcast midnight is still nearly black, without a second set of
+     constants to keep in step with the first. Lifted, because cloud lit
+     from above is brighter than the air it replaced. */
   if (uOvercast > 0.0) {
-    c = mix(c, hor * mix(1.0, 1.35, uDay), uOvercast * 0.85);
+    vec3 deck = mix(vec3(dot(hor, vec3(0.30, 0.59, 0.11))), hor, 0.40);
+    c = mix(c, deck * mix(1.0, 1.12, uDay), uOvercast * 0.85);
   }
 
   /* Stars, and only the ones the sky is dark enough to show. Placed by
