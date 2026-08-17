@@ -202,6 +202,24 @@ ${WEATHER_GLSL}
    lake changes hue at the moment the camera crosses it. */
 #define WATER_DEEP vec3(0.014, 0.043, 0.055)
 
+/* And the rate that same water fogs at when the eye is inside it.
+
+   Deliberately not WATER_EXTINCT, and the difference is not a fudge.
+   That one was fitted to a whole phenomenon — how fast a *bed* stops
+   being visible through a surface — and the light doing that makes the
+   trip twice, arrives at a dark soil albedo, and leaves through a
+   surface that is reflecting most of it away. Reading it as a per-metre
+   extinction of the medium is reading more into it than was ever put
+   in: at 3.1 per metre a swimmer could not see their own hands.
+
+   This is the same water asked the other question, which is a single
+   trip toward things that are lit. Roughly a fifth of the other, in the
+   same proportions, so red still goes first and the last colour left is
+   blue-green — the hue is shared even though the distance is not. Puts
+   useful visibility at about three metres, which is a lake rather than
+   the swimming pool a literal reading would give. */
+#define WATER_FOG vec3(0.62, 0.38, 0.32)
+
 in vec2 vUv;
 out vec4 outColor;
 
@@ -258,6 +276,14 @@ uniform float uCatWake;
    to 1e4, so an empty pixel is not a very distant object. */
 uniform sampler2D uMesh;
 uniform float uMeshOn;
+
+/* Whether the eye itself is under the surface.
+
+   Answered in JS, where it is one height sample a frame rather than one
+   per pixel, and where the answer is already half known: the same
+   waterY every pass is handed, against the camera the same function
+   just placed. */
+uniform float uCamUnder;
 
 /* ═══ primitives and the shape ════════════════════════════════════ */
 ${CLUSTER_FIELD}
@@ -944,6 +970,25 @@ void main() {
       vec3 refl = shadeDirect(ro2, rd2, tHit, matHit, uReflectLit > 0.5, p2, n2, rough2);
       col = mix(col, refl, min(amount, 0.9));
     }
+  }
+
+  /* And the water the eye is inside, if it is inside any.
+
+     Applied to every pixel and not only to the lake, which is the whole
+     point: under the surface the water is not a thing in the scene, it
+     is the medium the scene is being seen through. The bed, the cat,
+     the far bank, the light coming down — all of it arrives through
+     however many metres of it the ray crossed, so all of it fogs. A
+     version that tinted only the surface would be a camera wearing
+     goggles.
+
+     Sky is included by the same argument rather than in spite of it. It
+     is written at 1e4, so it fogs out completely, and that is correct:
+     from below there is no sky except through the surface, and the
+     surface is drawn by the branch above. Clamped only to keep the
+     exponent finite. */
+  if (uCamUnder > 0.5) {
+    col = mix(col, WATER_DEEP, 1.0 - exp(-min(t, 400.0) * WATER_FOG));
   }
 
   // Alpha carries scene depth, so the additive flare pass can hide
@@ -2841,6 +2886,15 @@ class MarchScene {
          float rather than a missing texture. */
       uMesh: this.meshRT.texture,
       uMeshOn: raster ? 1 : 0,
+      /* Whether the eye is in the lake. Both halves of the test matter:
+         below the surface, and over ground the surface actually covers
+         — otherwise a camera standing in a dry valley lower than the
+         waterline elsewhere in the world would fill with water. It is
+         the same pair of questions waterDepth asks, asked once here
+         rather than once per pixel. */
+      uCamUnder: (waterY > this.basis.pos[1]
+        && terrainHeight(this.basis.pos[0], this.basis.pos[2], state.hills) < waterY)
+        ? 1 : 0,
       /* The same number the grass, the trees and the falling rain are
          handed. The lake is this shader's only reader of it. */
       uWind: state.wind,
