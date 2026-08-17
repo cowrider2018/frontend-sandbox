@@ -647,27 +647,32 @@ const SHOTS_PLAN = [
            s.pitch = 0.03; s.targetDist = 6;
            return true;` },
 
-  /* The camera under the surface, looking up at it.
+  /* The camera under the surface, looking up at it — the Snell window.
 
-     Not because the scene supports being down here — it does not, and
-     this shot is not a claim that it should. The water's normal always
-     points up, its clarity is measured downward, and its fresnel is
-     written for an eye in the air; none of that is true from below, and
-     making it true is a feature nobody has asked for.
+     Refraction runs the other way from down here and the result is not
+     a variation on the view from above, it is a different picture with
+     a hard edge in the middle of it. The whole 180-degree hemisphere
+     above the water arrives inside a cone of 97 degrees, twice
+     asin(1/1.333), and outside that cone the surface is a mirror
+     showing the bed.
 
-     What this exists for is the weaker promise: that the wrong picture
-     stays *still*. Everything drawn here that reads the water was
-     written assuming the eye is above it, so every one of them is one
-     unguarded expression away from a frame that crawls — a refract()
-     handed a normal on the wrong side, a depth that goes negative and
-     is clamped to zero, an aim that falls back to a distance the
-     subject is nowhere near. Those do not look like small errors. They
-     look like the scene coming apart.
+     What to look for is the boundary, because nothing draws it. Inside
+     it, sky; outside it, the lake's own floor reflected back down;
+     between them a line that exists only because refract() stops
+     returning a direction. It should be visibly *wrinkled* rather than
+     circular — the wind is on, and every wave tilts the normal that the
+     critical angle is measured against. A perfectly round window in a
+     wind is the tell that the normal stopped being read.
 
-     So this is a regression shot, and what it is watching is stability
-     rather than correctness. If someone eventually renders the
-     underside properly, this is the frame to re-measure. Until then it
-     fails when a wrong picture starts moving. */
+     The brightest thing in frame has to be inside the window, and the
+     rim brighter still: every near-horizontal direction in the world
+     lands on that circle, so the horizon arrives compressed into it.
+
+     What is not here is the bank and the trees. Reading those would
+     mean sampling the raster half through a compression of tens to one,
+     where a screen-space tap misses far more often than it lands. Sky
+     and the horizon band carry the effect; the silhouettes were not
+     worth a frame full of holes. */
   { name: '52-underwater',
     hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&trees=1&hills=4.5'
         + '&water=1&waterLevel=0.72&coverRadius=50&visibility=140&wind=0.4'
@@ -679,8 +684,15 @@ const SHOTS_PLAN = [
     pre: `const c = __aether.scene.cat;
           c.x = -17.5; c.z = -14; c.yaw = 2.2; c.velocity = 0;
           __aether.scene.laser.silence(); return true;`,
+    /* Steeper than the drag limit, deliberately: clamp() guards the
+       pointer, not this, and the window is a cone about straight up.
+       At the interactive limit of -0.35 the line of sight is 70 degrees
+       off vertical — outside the 48.6 the window subtends — so only its
+       rim clips the top of frame. -0.9 puts the centre of the view
+       inside it. The distance comes down to match, or the eye ends up
+       below a bed that is only 3.4 m under the surface here. */
     poke: `const s = __aether.scene;
-           s.pitch = -0.34; s.targetDist = 5;
+           s.pitch = -0.9; s.targetDist = 3;
            return true;` },
 
   /* The reeds, which is the same shore as 36 with something living on

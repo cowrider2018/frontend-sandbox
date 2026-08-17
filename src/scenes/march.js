@@ -837,8 +837,51 @@ void main() {
   float t, mat;
   trace(uCamPos, rd, uSteps, t, mat);
 
+  /* The surface has two sides and they are not variations on each
+     other, so this is a branch rather than a correction.
+
+     From below, the whole 180-degree hemisphere above the water is
+     squeezed into a cone of 97 degrees — twice asin(1/1.333) — and
+     outside that cone the surface is a mirror. Neither half is drawn.
+     Both fall out of refract():
+
+     Inside the cone it returns a direction that has already been
+     compressed, so handing it to sky() puts the entire sky into the
+     window without a cone ever being computed. The bright rim is not
+     drawn either — it is every near-horizontal direction in the world
+     landing on the same circle, which is what a real Snell window does
+     with the horizon.
+
+     Outside it the ratio takes the root of a negative number and GLSL
+     specifies the result as zero. That is total internal reflection
+     announcing itself, and the answer to it is the bounce below, at
+     full weight instead of a fresnel one.
+
+     Resolved as two flags rather than in a function of its own, and
+     that is a hard constraint and not a preference: a second call site
+     for the mirror would inline trace() and shadeDirect() a third time.
+     Written that way first, it stopped compiling inside 90 seconds —
+     this shader has hit the D3D instruction ceiling with two.
+
+     The normal is negated for refract and left alone for reflect. Both
+     are right: refract needs the normal on the incident side, which
+     from down here is the water, and reflect is symmetric in it. */
+  bool fromBelow = mat > 2.5 && rd.y > 1e-3;
+  bool snellWindow = false;
+
   vec3 p, n; float rough;
-  vec3 col = shadeDirect(uCamPos, rd, t, mat, true, p, n, rough);
+  vec3 col;
+  if (fromBelow) {
+    p = uCamPos + rd * max(t, 0.0);
+    n = waterNormal(p.xz, t);
+    rough = 0.045;
+    vec3 through = refract(rd, -n, 1.0 / WATER_IOR);
+    snellWindow = dot(through, through) > 0.5;
+    // Outside the window this is a placeholder the mirror overwrites.
+    col = snellWindow ? sky(through) : WATER_DEEP;
+  } else {
+    col = shadeDirect(uCamPos, rd, t, mat, true, p, n, rough);
+  }
 
   /* And whatever is standing in the water.
      The bed this shader draws is the ground, and the ground is the only
@@ -933,7 +976,12 @@ void main() {
     }
   }
 
-  if (mat > 0.5 && uReflect > 0.0) {
+  /* This is also the mirror for the view from below, which is why it
+     can run with uReflect at zero: total internal reflection is not a
+     reflection effect anyone chose to switch on, it is where the light
+     goes. Inside the window it is skipped entirely — there the surface
+     transmits and nothing comes back off it. */
+  if (mat > 0.5 && (uReflect > 0.0 || fromBelow) && !snellWindow) {
     float fresnel = pow(1.0 - max(dot(n, -rd), 0.0), 5.0);
     /* Water reflects on its own curve, and it is the real one: Schlick
        from an F0 of 0.02, which is what water is.
@@ -953,14 +1001,19 @@ void main() {
        and the trace it guards fires slightly less often than before:
        overhead water now lands under the 0.02 skip threshold, which is
        exactly where the bounce was buying the least. */
-    float amount = mat > 2.5
+    float amount = fromBelow ? 1.0
+      : mat > 2.5
       ? uReflect * (0.02 + 0.98 * fresnel)
       : uReflect * mix(0.12, 0.72, 1.0 - rough) * (0.25 + fresnel * 0.75);
     // Below this the bounce cannot move an 8-bit channel; skip the
     // entire second trace.
     if (amount > 0.02) {
       vec3 rd2 = reflect(rd, n);
-      vec3 ro2 = p + n * 0.02;
+      /* Off the surface along the ray when the eye is under it: the
+         normal points up, so nudging along it from below would put the
+         start above the water and the downward ray would meet the
+         surface again immediately. */
+      vec3 ro2 = fromBelow ? p + rd2 * 0.02 : p + n * 0.02;
       // Deliberately not named mat2 — that is a built-in type name, and
       // shadowing it is a syntax error rather than a warning.
       float tHit, matHit;
@@ -968,7 +1021,10 @@ void main() {
 
       vec3 p2, n2; float rough2;
       vec3 refl = shadeDirect(ro2, rd2, tHit, matHit, uReflectLit > 0.5, p2, n2, rough2);
-      col = mix(col, refl, min(amount, 0.9));
+      /* The 0.9 ceiling keeps a lit surface from disappearing into its
+         own reflection. Total internal reflection is exempt, because
+         there the surface genuinely returns everything. */
+      col = mix(col, refl, fromBelow ? amount : min(amount, 0.9));
     }
   }
 
