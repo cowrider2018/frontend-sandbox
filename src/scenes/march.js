@@ -2464,72 +2464,6 @@ class MarchScene {
       waterY,
     });
 
-    BLEND.none(gl);
-    this.rt.bind();
-    this.march.use({
-      uCamPos: this.basis.pos,
-      uRight: this.basis.right,
-      uUp: this.basis.up,
-      uFwd: this.basis.fwd,
-      uResolution: [this.rt.width, this.rt.height],
-      uFocal: 1.5,
-      uTime: clock.time,
-      uBlend: state.blend,
-      uDisplace: state.displace,
-      uRough: state.rough,
-      uFloorMix: 0.6,
-      uGround: covered ? 1 : 0,
-      uHills: state.hills,
-      uWaterY: waterY,
-      /* The same number the grass, the trees and the falling rain are
-         handed. The lake is this shader's only reader of it. */
-      uWind: state.wind,
-      uRain: weather.rain,
-      uSnow: weather.snow,
-      // And what the weather does above the scene rather than to it.
-      uOvercast: weather.overcast,
-      uLightDir: this.lightDir,
-      uTint: tint,
-      uDay: day,
-      uAmbient: ambient,
-      uReflect: state.reflect,
-      uFog: fog,
-      uAO: state.ao,
-      uShadowSoft: state.shadow,
-
-      uBallPos: this.ballPos,
-      uBalls: this.ballCount,
-      uBound: this.bound,
-
-      // The cat, as the shadow and occlusion queries see it.
-      uCatCapA: showCat ? this.cat.capA : ZERO_CAPS,
-      uCatCapB: showCat ? this.cat.capB : ZERO_CAPS,
-      uCatBound: showCat ? this.cat.capBound : ZERO_BOUND,
-      uCatCaps: showCat ? this.cat.capCount : 0,
-      // And what it is doing to the water, if it is in any.
-      uCatWake: showCat ? this.cat.wake : 0,
-
-      ...this.trees.uniforms(),
-
-      uRipples: this.ripples,
-      uRippleTo: this.rippleTo,
-      uRippleOn: rippleActive > 0 ? 1 : 0,
-      uRippleAmp: state.rippleAmp,
-      uRippleSpeed: state.rippleSpeed,
-      uRippleFreq: state.rippleFreq,
-      uRippleTight: 5.0,
-      uRippleGlow: state.flash,
-      uErodeMax: this.erodeMax,
-      uErode: state.erode,
-
-      uSteps: Math.round(state.steps),
-      uShadowSteps: Math.round(state.shadowSteps),
-      uAoTaps: Math.round(state.aoTaps),
-      uReflectSteps: Math.round(state.reflectSteps),
-      uShadowNoise: state.shadowNoise ? 1 : 0,
-      uReflectLit: state.reflectLit ? 1 : 0,
-    });
-    tri.draw();
 
     /* ── the rasterised half ──
        Its own target, its own depth buffer, the same camera basis. The
@@ -2542,6 +2476,15 @@ class MarchScene {
        a picture of it. */
     if (raster) {
       this.meshRT.bind();
+      /* State first, and the depth mask is not optional: a depth clear
+         is masked by it exactly as a depth write is, so leaving it false
+         from the march below silently keeps last frame's depth buffer
+         and this pass starts culling against a frame that is gone. That
+         reads as things going missing, not as anything depth-shaped. */
+      BLEND.none(gl);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LESS);
+      gl.depthMask(true);
       gl.clearColor(0, 0, 0, 1e4);
       gl.clearDepth(1);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -2711,6 +2654,83 @@ class MarchScene {
         empty.drawTriangles(birdVerts);
       }
     }
+
+    /* The march runs after the raster half, not before it, so that the
+       water can read the target the raster half just wrote. Nothing in
+       that half reads this one, which is what makes the order free to
+       choose; see the water in material().
+
+       The depth state is put back explicitly because the pass above
+       leaves it on, and this is a fullscreen triangle that must not be
+       depth-tested against whatever the last mesh wrote. */
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    BLEND.none(gl);
+    this.rt.bind();
+    this.march.use({
+      uCamPos: this.basis.pos,
+      uRight: this.basis.right,
+      uUp: this.basis.up,
+      uFwd: this.basis.fwd,
+      uResolution: [this.rt.width, this.rt.height],
+      uFocal: 1.5,
+      uTime: clock.time,
+      uBlend: state.blend,
+      uDisplace: state.displace,
+      uRough: state.rough,
+      uFloorMix: 0.6,
+      uGround: covered ? 1 : 0,
+      uHills: state.hills,
+      uWaterY: waterY,
+      /* The same number the grass, the trees and the falling rain are
+         handed. The lake is this shader's only reader of it. */
+      uWind: state.wind,
+      uRain: weather.rain,
+      uSnow: weather.snow,
+      // And what the weather does above the scene rather than to it.
+      uOvercast: weather.overcast,
+      uLightDir: this.lightDir,
+      uTint: tint,
+      uDay: day,
+      uAmbient: ambient,
+      uReflect: state.reflect,
+      uFog: fog,
+      uAO: state.ao,
+      uShadowSoft: state.shadow,
+
+      uBallPos: this.ballPos,
+      uBalls: this.ballCount,
+      uBound: this.bound,
+
+      // The cat, as the shadow and occlusion queries see it.
+      uCatCapA: showCat ? this.cat.capA : ZERO_CAPS,
+      uCatCapB: showCat ? this.cat.capB : ZERO_CAPS,
+      uCatBound: showCat ? this.cat.capBound : ZERO_BOUND,
+      uCatCaps: showCat ? this.cat.capCount : 0,
+      // And what it is doing to the water, if it is in any.
+      uCatWake: showCat ? this.cat.wake : 0,
+
+      ...this.trees.uniforms(),
+
+      uRipples: this.ripples,
+      uRippleTo: this.rippleTo,
+      uRippleOn: rippleActive > 0 ? 1 : 0,
+      uRippleAmp: state.rippleAmp,
+      uRippleSpeed: state.rippleSpeed,
+      uRippleFreq: state.rippleFreq,
+      uRippleTight: 5.0,
+      uRippleGlow: state.flash,
+      uErodeMax: this.erodeMax,
+      uErode: state.erode,
+
+      uSteps: Math.round(state.steps),
+      uShadowSteps: Math.round(state.shadowSteps),
+      uAoTaps: Math.round(state.aoTaps),
+      uReflectSteps: Math.round(state.reflectSteps),
+      uShadowNoise: state.shadowNoise ? 1 : 0,
+      uReflectLit: state.reflectLit ? 1 : 0,
+    });
+    tri.draw();
 
     // Temporal blend is dialled back while anything moves, or the jitter
     // turns into a smear.
