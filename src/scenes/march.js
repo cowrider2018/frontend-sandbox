@@ -195,6 +195,13 @@ ${WEATHER_GLSL}
    pulled back toward where the eye expects it. */
 #define WATER_BEND 0.5
 
+/* What is left when the bed is gone: the colour of water with nothing
+   behind it. Was a local in material(), and is a #define now because a
+   second reader is arriving — an eye under the surface is looking
+   through the same water and has to fog toward the same colour, or the
+   lake changes hue at the moment the camera crosses it. */
+#define WATER_DEEP vec3(0.014, 0.043, 0.055)
+
 in vec2 vUv;
 out vec4 outColor;
 
@@ -635,8 +642,7 @@ vec3 material(vec3 p, vec3 n, vec3 rd, float mat, bool lit,
     float bedRough;
     // Wet, so darker than the same ground in air.
     vec3 bed = groundAlbedo(vec3(bedXZ.x, p.y, bedXZ.y), blur, bedRough) * 0.55;
-    vec3 deep = vec3(0.014, 0.043, 0.055);
-    return mix(bed, deep, clarity);
+    return mix(bed, WATER_DEEP, clarity);
   }
 
   if (mat > 1.5) {
