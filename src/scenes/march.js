@@ -92,6 +92,61 @@ const ZERO_BOUND = new Float32Array(4);
 /** AO weight sum for the reference 5-tap schedule; see ambientOcclusion. */
 const AO_REFERENCE = 0.1959;
 
+/* ── the world above the water ──────────────────────────────────────
+   A single upward pass, read only by the Snell window.
+
+   The window needs to know what is standing above the surface, and the
+   frame's own raster target cannot tell it. That target was drawn from
+   under the water, so a floating animal hides its own back behind its
+   belly, and it spans the camera's 67 degrees where the window spans
+   180. Neither is a precision problem; the information was never
+   recorded. So it gets recorded, once, by pointing a very wide camera
+   straight up from the surface.
+
+   Nothing needed a new shader for this. The cover, the wood and the cat
+   all take a camera object and read its focal, so a second camera with
+   a short focal and an upward basis is the whole of it — the same
+   geometry, submitted again, through a different lens.
+
+   The focal is set by the lowest thing that has to appear, and that is
+   lower than it first seems. 0.30 was the first guess — 147 degrees,
+   which sounds generous until it is written as an elevation: it sees
+   nothing below 16.5 degrees above the horizontal. A tree up the bank
+   clears that. A cat floating two metres away subtends eight, and every
+   blade of grass on the shore rather less, so the first version found
+   trees and nothing else.
+
+   0.15 was measured and missed by nothing: it puts the cat at an ndc
+   radius of 1.005, just outside the lens. 0.12 opens to 6.8 degrees of
+   elevation and takes it comfortably. Lower still is possible on paper
+   and not worth it in practice: a straight perspective spends its
+   resolution unevenly as it approaches its own limit, and the last few
+   degrees before the horizon are also where the window compresses
+   hardest, so a silhouette missing there reads as haze, not a hole.
+
+   That unevenness is worth stating because it happens to be the right
+   way round. A pixel near the centre of this target covers about a
+   degree and a quarter; one near its edge covers a twentieth of that.
+   The centre is straight up, which is sky. The edge is the horizon,
+   which is where the window crushes everything and needs the detail. */
+
+/* What saves the near plane from being a problem is the eye sitting on
+   the surface itself. Anything below the waterline is behind this
+   camera and clips away on its own — which is exactly the half the
+   window must not see, discarded without a test. */
+const ABOVE_SIZE = 768;
+const ABOVE_FOCAL = 0.12;
+/* Straight up, with a right-handed basis around it: right cross up is
+   forward. Fixed rather than derived from the view, because the shader
+   indexes this target by world direction — a basis that turned with the
+   camera would make every lookup depend on where the eye was pointing. */
+const ABOVE_FWD = new Float32Array([0, 1, 0]);
+const ABOVE_RIGHT = new Float32Array([1, 0, 0]);
+const ABOVE_UP = new Float32Array([0, 0, -1]);
+/** This pass is never resolved by the temporal filter, so it is never
+    jittered — the shader samples it by direction, not by pixel. */
+const ZERO_JITTER = new Float32Array(2);
+
 /** Where the wind control starts. Named because the water is tuned
     against it — see CHOP_NORM. */
 const WIND_DEFAULT = 0.55;
@@ -220,22 +275,14 @@ ${WEATHER_GLSL}
    the swimming pool a literal reading would give. */
 #define WATER_FOG vec3(0.62, 0.38, 0.32)
 
-/* How many steps the window spends searching the rasterised half.
-
-   Not a quality control, because it is not on the quality curve: it is
-   paid only while the camera is under water, which no preset knows how
-   to predict and no shot but one ever does.
-
-   The count is set by both ends of the search having to work at once. A
-   cat wading a metre away is thirty centimetres of subject, and a
-   search that spends four steps crossing it walks straight through the
-   middle — which is what the first version did, and it looked like
-   torn geometry rather than like too few samples. A tree ten metres up
-   the bank needs the same search to still be going. Sixteen steps could
-   have one or the other. Twenty-eight, starting at five centimetres and
-   growing a fifth each time, reach about fifty metres with six steps
-   inside the first half metre. */
-#define WINDOW_STEPS 28
+#define ABOVE_FOCAL ${ABOVE_FOCAL.toFixed(4)}
+/* Steps the window spends walking the upward pass. Fewer than the
+   screen-space search needed: that one was hunting through a target
+   where most of what it wanted was missing, and spent its budget
+   failing. This one is resolving parallax against a target that has the
+   answer, so it only has to be fine enough near the surface, where the
+   parallax is. */
+#define ABOVE_STEPS 20
 
 in vec2 vUv;
 out vec4 outColor;
@@ -301,6 +348,12 @@ uniform float uMeshOn;
    waterY every pass is handed, against the camera the same function
    just placed. */
 uniform float uCamUnder;
+
+/* The world above the surface, drawn upward from it, and where it was
+   drawn from. Read only inside the Snell window. */
+uniform sampler2D uAbove;
+uniform float uAboveOn;
+uniform vec3 uAboveEye;
 
 /* ═══ primitives and the shape ════════════════════════════════════ */
 ${CLUSTER_FIELD}
@@ -841,98 +894,95 @@ vec2 projectUV(vec3 q) {
 }
 
 /**
- * Search the rasterised half along a world ray, and return what it hit.
+ * A world direction, into the upward pass.
  *
- * The window above the water needs this and nothing else does. Grass,
- * trees and the cat are triangles, so the marched world the bounce
- * traces cannot see them — but they are already drawn, by this same
- * camera, sitting at their straight-line positions in uMesh. Nothing
- * has to be rendered again. What has to happen is that they are found
- * somewhere other than where they were drawn, because refraction moved
- * them.
- *
- * A single tap cannot do that. It would need the distance to the object
- * in order to project it, and the distance is the thing being looked
- * for; guess it and the compression of the window turns a small error
- * into a large one. So this walks instead: points along the ray, each
- * projected back to the uv it would have been drawn at, each compared
- * against the depth actually recorded there. Where the recorded depth
- * catches up with the distance walked, the ray has met the surface that
- * was drawn.
- *
- * The steps grow. Near the surface a metre matters and far away it does
- * not, and a fixed step spends its whole budget in the first few metres
- * or steps straight over a cat.
- *
- * Returns false, rather than a colour, when the ray leaves the frame.
- * That is the honest answer and it is a common one: uMesh holds 67
- * degrees of the world and the window holds 180, so everything toward
- * the rim was simply never drawn. No amount of searching finds it, and
- * pretending otherwise by clamping to the edge would smear the border
- * pixels across the entire horizon.
+ * The inverse of the fixed basis that pass was shot with: forward is
+ * straight up, right is +x, up is -z. Returns false below the horizon
+ * and outside the lens, which is the same answer — that direction was
+ * not recorded and no sample of this target can speak for it.
  */
-bool findInMesh(vec3 ro, vec3 rd, out vec3 hit) {
+bool aboveUV(vec3 dir, out vec2 uv) {
+  if (dir.y <= 1e-3) return false;
+  vec2 ndc = vec2(dir.x, -dir.z) * (ABOVE_FOCAL / dir.y);
+  /* Square rather than round, because the target is square: a circular
+     cutoff throws away the corners, and the corners are the widest
+     angles this lens reaches — the lowest elevations, which is where
+     the things standing on the shore are. */
+  if (any(greaterThan(abs(ndc), vec2(1.0)))) return false;
+  uv = ndc * 0.5 + 0.5;
+  return true;
+}
+
+/**
+ * What is standing above the water along a ray leaving the surface.
+ *
+ * A search rather than a lookup, and the difference is parallax. One
+ * target answers for every ray, but the rays do not share an origin:
+ * the window's entry points are spread over a disc about as wide as the
+ * camera is deep, while the target was shot from one point at the
+ * middle of it. Asking it by direction alone therefore reads the right
+ * object from the wrong place — and for a cat two metres off, floating
+ * thirty centimetres proud of the water, "the wrong place" is open sky.
+ * The first version did exactly that, returned nothing, and looked like
+ * the pass had failed when it had merely been asked the wrong question.
+ *
+ * Walking the ray fixes it, because each point along it is a *position*
+ * and can be projected honestly. The depth recorded where it lands says
+ * whether the ray has passed behind something, and a sign change in
+ * that comparison is the crossing.
+ *
+ * This is the same search the screen-space attempt used, pointed at a
+ * target that can actually answer: shot from the surface, so nothing
+ * hides behind its own submerged half, and 166 degrees wide where the
+ * frame's own raster target was 67. The method was never the problem.
+ */
+bool findAbove(vec3 ro, vec3 rd, out vec3 hit) {
   hit = vec3(0.0);
-  float s = 0.06, step = 0.05, prev = 0.0;
-  /* The ray starts at the surface, in front of everything drawn above
-     it. What is being watched for is the moment that stops being true. */
+  float s = 0.10, step = 0.11, prev = 0.0;
   bool inFront = true;
-  for (int i = 0; i < WINDOW_STEPS; i++) {
+  for (int i = 0; i < ABOVE_STEPS; i++) {
     vec3 q = ro + rd * s;
-    vec2 uv = projectUV(q);
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return false;
+    vec2 uv;
+    /* Not a failure — a step this pass has nothing to say about, which
+       the first few always are. Both this ray and that camera start on
+       the surface, so the earliest samples sit almost level with the
+       eye that recorded them and the direction between them is nearly
+       horizontal, outside any lens. Returning here instead of walking
+       on ended the search before it had risen far enough to ask a real
+       question, which read as the pass finding nothing anywhere. */
+    if (!aboveUV(normalize(q - uAboveEye), uv)) {
+      inFront = true;
+      prev = s;
+      s += step;
+      step *= 1.20;
+      continue;
+    }
 
-    vec4 m = texture(uMesh, uv);
-    float d = length(q - uCamPos);
-    /* Crossing, not proximity — and the difference is the whole
-       reliability of this search.
+    vec4 a = texture(uAbove, uv);
+    float d = length(q - uAboveEye);
+    bool behind = a.a < 9000.0 && a.a < d;
 
-       Asking whether the recorded depth lands inside a narrow band
-       around this point looks equivalent and is not: once a step
-       overshoots a surface, the recorded depth is *below* the band, and
-       every step after that only makes the gap wider. The ray is blind
-       from then on and walks its remaining budget for nothing. Those
-       blinded rays were the holes — the search was not too coarse so
-       much as unable to recover from being too coarse.
-
-       A sign change cannot miss that way. The ray begins in front of
-       everything above the surface; the step where it stops being in
-       front is the step that crossed something.
-
-       1e4 is the cleared value: empty sky rather than a far object. */
-    bool behind = m.a < 9000.0 && m.a < d;
-
-    /* Submerged geometry crosses too, and must not count. The raster
-       target holds the whole animal, the half under the surface
-       included, and that half sits nearer the eye than anything the
-       window is looking for — so a ray walking up past a floating cat
-       crosses its submerged belly first. Reconstructing where the
-       recorded surface actually is settles which world it belongs to:
-       along the direction this point was projected in, at the recorded
-       distance. Below the waterline it is the lake's, and the submerged
-       pass has already drawn it.
-
-       The thickness limit is what keeps a crossing from being a
-       coincidence. A ray passing metres behind a blade of grass has
-       crossed it in screen space and not in the world, and without a
-       limit the window fills with near objects smeared along their own
-       silhouettes. */
-    vec3 seen = uCamPos + normalize(q - uCamPos) * m.a;
-    if (behind && inFront && seen.y > uWaterY && d - m.a < 1.2 + s * 0.5) {
-      /* Halve back into the gap that was stepped over. The step here is
-         a large fraction of a cat, so the difference between the first
-         point behind the surface and the surface itself is the
-         difference between a shape and a streak. */
+    /* No waterline test here, unlike the screen-space version. This
+       target was drawn from the surface looking up, so everything below
+       the water was behind its near plane and clipped itself away. The
+       check that version needed does not exist because the case cannot
+       arise. */
+    if (behind && inFront && d - a.a < 1.0 + s * 0.4) {
       float lo = prev, hi = s;
       for (int j = 0; j < 4; j++) {
         float mid = (lo + hi) * 0.5;
         vec3 qm = ro + rd * mid;
-        vec4 mm = texture(uMesh, projectUV(qm));
-        vec3 sm = uCamPos + normalize(qm - uCamPos) * mm.a;
-        if (mm.a < 9000.0 && sm.y > uWaterY && mm.a <= length(qm - uCamPos)) hi = mid;
-        else lo = mid;
+        vec2 um;
+        if (!aboveUV(normalize(qm - uAboveEye), um)) { lo = mid; continue; }
+        vec4 am = texture(uAbove, um);
+        if (am.a < 9000.0 && am.a < length(qm - uAboveEye)) hi = mid; else lo = mid;
       }
-      hit = texture(uMesh, projectUV(ro + rd * hi)).rgb;
+      vec2 uf;
+      if (aboveUV(normalize(ro + rd * hi - uAboveEye), uf)) {
+        hit = texture(uAbove, uf).rgb;
+        return true;
+      }
+      hit = a.rgb;
       return true;
     }
     inFront = !behind;
@@ -942,6 +992,7 @@ bool findInMesh(vec3 ro, vec3 rd, out vec3 hit) {
   }
   return false;
 }
+
 
 void main() {
   vec2 ndc = vUv * 2.0 - 1.0;
@@ -1170,9 +1221,25 @@ void main() {
          transmitted ray does this: the mirrored one is pointing back
          down into the lake, where the submerged pass has already had
          its say. */
-      if (fromBelow && windowOut && uMeshOn > 0.5) {
+      /* And what is standing above the surface, from the pass that was
+         shot up through it.
+
+         The screen-space search this replaces is gone rather than kept
+         as a fallback, and that is the finding rather than a cleanup.
+         Both were asked the same question and they disagreed most where
+         it mattered: straight up, where the upward pass correctly
+         reports empty sky — a cat floating two metres off is not
+         overhead — and the search reported the cat, because a ray
+         walking up through a compressed window passes close enough to
+         its silhouette in screen space to cross it. Every one of those
+         agreements-with-nothing was a false positive, and they were what
+         the torn shapes in the window actually were.
+
+         A fallback that is wrong precisely where the primary is right
+         is not a fallback. */
+      if (fromBelow && windowOut && uAboveOn > 0.5) {
         vec3 found;
-        if (findInMesh(ro2, rd2, found)) refl = found;
+        if (findAbove(ro2, rd2, found)) refl = found;
       }
       /* The 0.9 ceiling keeps a lit surface from disappearing into its
          own reflection. Total internal reflection is exempt, because
@@ -1656,6 +1723,13 @@ class MarchScene {
        so they sort against each other for free and resolve against the
        march as a single layer. The canvas still has no depth buffer. */
     this.meshRT = new Target(gl, { width: 2, height: 2, format: 'rgba16f', filter: gl.LINEAR, depth: true });
+    /* The world above the water, drawn from the water.
+       Only the Snell window reads it, and only while the eye is under
+       the surface, so it is allocated once and left idle the rest of
+       the time. Square and fixed: it is not a view of the scene, it is
+       a lookup table indexed by direction, and its resolution answers
+       to the solid angle it covers rather than to the canvas. */
+    this.aboveRT = new Target(gl, { width: ABOVE_SIZE, height: ABOVE_SIZE, format: 'rgba16f', filter: gl.LINEAR, depth: true });
     this.ground = new GroundCover(gl);
     this.trees = new Trees(gl);
     this.precip = new Precipitation(gl);
@@ -1712,6 +1786,12 @@ class MarchScene {
     this._hourShown = -1;
 
     /* ── the cluster, computed here and uploaded ── */
+    /** Where the upward pass was shot from: on the surface, directly
+        above the eye. The shader needs it to undo the parallax between
+        that one point and the many the window's rays actually enter
+        the water through. */
+    this._aboveEye = new Float32Array(3);
+
     this.ballPos = new Float32Array(BALL_N * 4);
     this.ballCount = 6;
     this.blend = 0.32;
@@ -2872,6 +2952,15 @@ class MarchScene {
     });
 
 
+    /* Whether the eye is in the lake. Both halves of the test matter:
+       below the surface, and over ground the surface actually covers —
+       otherwise a camera standing in a dry valley lower than the
+       waterline elsewhere in the world would fill with water. Settled
+       here because two things downstream ask: the pass that draws the
+       world above the surface, and the shader that fogs everything. */
+    const camUnder = waterY > this.basis.pos[1]
+      && terrainHeight(this.basis.pos[0], this.basis.pos[2], state.hills) < waterY;
+
     /* ── the rasterised half ──
        Its own target, its own depth buffer, the same camera basis. The
        alpha it clears to is the same 1e4 the march writes for sky, so an
@@ -3060,6 +3149,76 @@ class MarchScene {
         gl.disable(gl.CULL_FACE);
         empty.drawTriangles(birdVerts);
       }
+
+    /* ── the world above the water ──
+       Drawn only when the eye is under the surface, which is the only
+       time anything reads it. That condition is doing real work rather
+       than saving a rounding error: this submits the cover, the wood
+       and the cat a second time, and paying for that on every frame of
+       a scene whose camera is almost never in the lake would be a
+       permanent tax on a rare case.
+
+       The eye of this camera sits on the surface directly above the
+       real one, not at the real one. That is the whole point — from
+       below, an animal floating on the water hides its own back behind
+       its belly, and no search of a target drawn from down there can
+       recover what was never in it. Moved up through the surface, the
+       same geometry shows its top.
+
+       It is one point standing in for many, and the error that
+       introduces is parallax: the window's rays enter the water across
+       a disc of radius roughly the camera's depth, not through a single
+       spot. Distant things barely care. Near ones do, and the shader
+       corrects for it there, where the depth this pass also writes says
+       how far off the substitute was. */
+    if (camUnder) {
+      this.aboveRT.bind();
+      BLEND.none(gl);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LESS);
+      gl.depthMask(true);
+      gl.clearColor(0, 0, 0, 1e4);
+      gl.clearDepth(1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      /* Straight up, with a right-handed basis around it. Fixed rather
+         than derived from the view: the shader indexes this by world
+         direction, so a basis that turned with the camera would make
+         every lookup depend on where the eye happened to be pointing. */
+      this._aboveEye[0] = this.basis.pos[0];
+      this._aboveEye[1] = waterY + 0.02;
+      this._aboveEye[2] = this.basis.pos[2];
+      const aboveCam = {
+        pos: this._aboveEye,
+        right: ABOVE_RIGHT,
+        up: ABOVE_UP,
+        fwd: ABOVE_FWD,
+        focal: ABOVE_FOCAL,
+        aspect: 1,
+        width: ABOVE_SIZE,
+        height: ABOVE_SIZE,
+      };
+
+      if (showCat) this.cat.draw(aboveCam, env, frame);
+      this.ground.draw(aboveCam, env, {
+        style: state.ground,
+        density: state.cover,
+        flowers: Boolean(state.flowers),
+        flowerClumps: state.flowerClumps,
+        flowerDensity: state.flowerDensity,
+        flowerSpread: state.flowerSpread,
+        reeds: Boolean(state.reeds),
+        reedDensity: state.reedDensity,
+        radius: state.coverRadius,
+        wind: state.wind,
+        frame,
+      });
+      this.trees.draw(aboveCam, env, {
+        on: wooded,
+        wind: state.wind,
+        jitter: ZERO_JITTER,
+      });
+      }
     }
 
     /* The march runs after the raster half, not before it, so that the
@@ -3101,9 +3260,12 @@ class MarchScene {
          waterline elsewhere in the world would fill with water. It is
          the same pair of questions waterDepth asks, asked once here
          rather than once per pixel. */
-      uCamUnder: (waterY > this.basis.pos[1]
-        && terrainHeight(this.basis.pos[0], this.basis.pos[2], state.hills) < waterY)
-        ? 1 : 0,
+      uCamUnder: camUnder ? 1 : 0,
+      /* The world above the surface, drawn this frame only if the eye
+         is under it. Off is a float rather than an unbound sampler. */
+      uAbove: this.aboveRT.texture,
+      uAboveOn: (camUnder && raster) ? 1 : 0,
+      uAboveEye: this._aboveEye,
       /* The same number the grass, the trees and the falling rain are
          handed. The lake is this shader's only reader of it. */
       uWind: state.wind,
