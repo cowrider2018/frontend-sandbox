@@ -921,28 +921,55 @@ vec2 projectUV(vec3 q) {
  * crossing above the surface is — the bank across the lake is in this
  * target too, and it is not underwater and cannot be in this mirror.
  */
-bool findSunk(vec3 ro, vec3 rd, out vec3 hit) {
+bool findSunk(vec3 ro, vec3 rd, float tMax, out vec3 hit) {
   hit = vec3(0.0);
+
+  /* Projected incrementally rather than per step.
+
+     projectUV is three dot products and a divide, and the ray does not
+     need any of them repeated: the numerators and the denominator are
+     each linear in the world point, so the whole homogeneous triple is
+     linear in s. Build it once for the origin and once for the
+     direction, and a step becomes a multiply-add with the divide kept —
+     the divide is the perspective and cannot be interpolated away. */
+  float aspect = uResolution.x / uResolution.y;
+  vec3 o = ro - uCamPos;
+  vec3 h0 = vec3(dot(o, uRight) * uFocal / aspect, dot(o, uUp) * uFocal, dot(o, uFwd));
+  vec3 hd = vec3(dot(rd, uRight) * uFocal / aspect, dot(rd, uUp) * uFocal, dot(rd, uFwd));
+
   float s = 0.08, step = 0.09, prev = 0.0;
   bool inFront = true;
   for (int i = 0; i < SUNK_STEPS; i++) {
+    /* The bed is the end of this ray, and the bounce already found it.
+       Walking past it searches water that is behind the floor of the
+       lake — every step there is spent, and any crossing it reports is
+       something the bed is standing in front of. */
+    if (s > tMax) return false;
+
     vec3 q = ro + rd * s;
-    vec2 uv = projectUV(q);
+    vec3 h = h0 + hd * s;
+    if (h.z <= 1e-4) return false;
+    vec2 uv = h.xy / h.z * 0.5 + 0.5;
     if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return false;
 
     vec4 m = texture(uMesh, uv);
     float d = length(q - uCamPos);
     bool behind = m.a < 9000.0 && m.a < d;
-    vec3 seen = uCamPos + normalize(q - uCamPos) * m.a;
+    /* Only the height of that surface is wanted, and a whole normalize
+       to get one component of it is three divides too many: the y of a
+       unit vector is the y of the vector over its length, and the
+       length is the distance already in hand. */
+    float seenY = uCamPos.y + (q.y - uCamPos.y) * (m.a / d);
 
-    if (behind && inFront && seen.y < uWaterY && d - m.a < 0.22 + s * 0.20) {
+    if (behind && inFront && seenY < uWaterY && d - m.a < 0.22 + s * 0.20) {
       float lo = prev, hi = s;
       for (int j = 0; j < 4; j++) {
         float mid = (lo + hi) * 0.5;
         vec3 qm = ro + rd * mid;
         vec4 mm = texture(uMesh, projectUV(qm));
-        vec3 sm = uCamPos + normalize(qm - uCamPos) * mm.a;
-        if (mm.a < 9000.0 && sm.y < uWaterY && mm.a < length(qm - uCamPos)) hi = mid;
+        float dm = length(qm - uCamPos);
+        float smY = uCamPos.y + (qm.y - uCamPos.y) * (mm.a / dm);
+        if (mm.a < 9000.0 && smY < uWaterY && mm.a < dm) hi = mid;
         else lo = mid;
       }
       hit = texture(uMesh, projectUV(ro + rd * hi)).rgb;
@@ -965,7 +992,13 @@ bool findSunk(vec3 ro, vec3 rd, out vec3 hit) {
  * not recorded and no sample of this target can speak for it.
  */
 bool aboveUV(vec3 dir, out vec2 uv) {
-  if (dir.y <= 1e-3) return false;
+  /* Guards the divide and nothing else. It must not double as a horizon
+     test: callers pass this direction unnormalised, so a threshold
+     large enough to mean "too near the horizon" for a unit vector means
+     "shorter than a millimetre" for a world-space one, and the two
+     reject completely different sets of rays. The lens bound below is
+     the horizon test, and it is scale-free. */
+  if (!(dir.y > 1e-6)) return false;
   vec2 ndc = vec2(dir.x, -dir.z) * (ABOVE_FOCAL / dir.y);
   /* Square rather than round, because the target is square: a circular
      cutoff throws away the corners, and the corners are the widest
@@ -1013,7 +1046,11 @@ bool findAbove(vec3 ro, vec3 rd, out vec3 hit) {
        horizontal, outside any lens. Returning here instead of walking
        on ended the search before it had risen far enough to ask a real
        question, which read as the pass finding nothing anywhere. */
-    if (!aboveUV(normalize(q - uAboveEye), uv)) {
+    /* Unnormalised, deliberately. aboveUV divides one component by
+       another, so any positive scaling of the direction cancels — a
+       normalize here would be a length and three divides bought for
+       nothing, once per step. */
+    if (!aboveUV(q - uAboveEye, uv)) {
       inFront = true;
       prev = s;
       s += step;
@@ -1036,12 +1073,12 @@ bool findAbove(vec3 ro, vec3 rd, out vec3 hit) {
         float mid = (lo + hi) * 0.5;
         vec3 qm = ro + rd * mid;
         vec2 um;
-        if (!aboveUV(normalize(qm - uAboveEye), um)) { lo = mid; continue; }
+        if (!aboveUV(qm - uAboveEye, um)) { lo = mid; continue; }
         vec4 am = texture(uAbove, um);
         if (am.a < 9000.0 && am.a < length(qm - uAboveEye)) hi = mid; else lo = mid;
       }
       vec2 uf;
-      if (aboveUV(normalize(ro + rd * hi - uAboveEye), uf)) {
+      if (aboveUV(ro + rd * hi - uAboveEye, uf)) {
         hit = texture(uAbove, uf).rgb;
         return true;
       }
@@ -1322,7 +1359,10 @@ void main() {
          it further the further off vertical it is. */
       if (fromBelow && !windowOut && uMeshOn > 0.5) {
         vec3 found;
-        if (findSunk(ro2, rd2, found)) refl = found;
+        /* Bounded by whatever the bounce already hit, which for a ray
+           mirrored down into a lake is the bed. A miss means it left
+           the world entirely, and then there is nothing to bound. */
+        if (findSunk(ro2, rd2, matHit > 0.5 ? tHit : 1e4, found)) refl = found;
       }
       /* The 0.9 ceiling keeps a lit surface from disappearing into its
          own reflection. Total internal reflection is exempt, because
