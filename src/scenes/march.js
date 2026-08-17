@@ -216,6 +216,23 @@ ${WIND_GLSL}
    shadow needs it — so an animal in the water costs one float. */
 uniform float uCatWake;
 
+/* The rasterised half of the scene, already drawn, and whether there is
+   any of it this frame.
+
+   Read by the water and by nothing else. Everything standing in a lake
+   is a triangle — the cat's legs, the reeds' stems, the grass at the
+   edge — and none of it is in the field the marcher traces, so before
+   this the surface had no way to know it was there. The composite that
+   follows keeps whichever of the two halves is nearer, which for
+   anything under the surface means the water wins and the thing is
+   simply gone. It was never a refraction problem; the water was opaque.
+
+   The alpha is distance from the eye, on the same scale this shader
+   writes, which is what makes the comparison possible at all. Cleared
+   to 1e4, so an empty pixel is not a very distant object. */
+uniform sampler2D uMesh;
+uniform float uMeshOn;
+
 /* ═══ primitives and the shape ════════════════════════════════════ */
 ${CLUSTER_FIELD}
 
@@ -753,6 +770,33 @@ void main() {
 
   vec3 p, n; float rough;
   vec3 col = shadeDirect(uCamPos, rd, t, mat, true, p, n, rough);
+
+  /* And whatever is standing in the water.
+     The bed this shader draws is the ground, and the ground is the only
+     thing under a lake that the marcher can see. Everything else down
+     there is a triangle in the other half of the frame: legs, stems,
+     the last blades before the shoreline. The composite keeps the
+     nearer of the two halves, so all of it lost to the surface and the
+     water read as opaque — which is what it was.
+
+     The test is the same depth comparison the composite makes, run the
+     other way round. A mesh further from the eye than the surface is a
+     mesh under the surface, and 1e4 is the cleared value rather than a
+     very distant object.
+
+     How much of it survives is the extinction that was already here,
+     asked about the *object* rather than the bed: a paw ten centimetres
+     down is ten centimetres of water, whatever the lake does further
+     out. That is the whole reason this reads as depth — the same leg
+     fades along its length, and the waterline lands on it where the
+     water actually is rather than where the geometry was cut. */
+  if (mat > 2.5 && uMeshOn > 0.5) {
+    vec4 sunk = texture(uMesh, vUv);
+    if (sunk.a > t && sunk.a < 9000.0) {
+      float under = max(uWaterY - (uCamPos.y + rd.y * sunk.a), 0.0);
+      col = mix(sunk.rgb, col, 1.0 - exp(-under * WATER_EXTINCT));
+    }
+  }
 
   if (mat > 0.5 && uReflect > 0.0) {
     float fresnel = pow(1.0 - max(dot(n, -rd), 0.0), 5.0);
@@ -2682,6 +2726,12 @@ class MarchScene {
       uGround: covered ? 1 : 0,
       uHills: state.hills,
       uWaterY: waterY,
+      /* The raster half, drawn a few lines above and read here by the
+         water alone. Bound whether or not there is any, because a
+         sampler left unbound is a sampler reading unit 0 — and off is a
+         float rather than a missing texture. */
+      uMesh: this.meshRT.texture,
+      uMeshOn: raster ? 1 : 0,
       /* The same number the grass, the trees and the falling rain are
          handed. The lake is this shader's only reader of it. */
       uWind: state.wind,
