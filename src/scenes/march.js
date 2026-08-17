@@ -867,7 +867,20 @@ void main() {
      are right: refract needs the normal on the incident side, which
      from down here is the water, and reflect is symmetric in it. */
   bool fromBelow = mat > 2.5 && rd.y > 1e-3;
-  bool snellWindow = false;
+  /* Where the bounce goes when the eye is under the surface: out
+     through the window, or mirrored back down off it. Both are carried
+     by the same trace, which is the point — the window is not a special
+     case that needs its own ray, it is the ordinary bounce pointed
+     somewhere else.
+
+     Handing the window sky() directly instead was the first version and
+     it is wrong in a way that is easy to miss: the sky is only what is
+     up there when nothing else is. A bank rising out of the water, the
+     hills behind it, the cluster — all of it lives in the window too,
+     and a window that only ever draws sky is a window with the world
+     deleted from it. Tracing costs nothing extra here because the
+     bounce was already being fired for the mirror. */
+  vec3 belowDir = vec3(0.0);
 
   vec3 p, n; float rough;
   vec3 col;
@@ -876,9 +889,10 @@ void main() {
     n = waterNormal(p.xz, t);
     rough = 0.045;
     vec3 through = refract(rd, -n, 1.0 / WATER_IOR);
-    snellWindow = dot(through, through) > 0.5;
-    // Outside the window this is a placeholder the mirror overwrites.
-    col = snellWindow ? sky(through) : WATER_DEEP;
+    // Zero means the root went negative: total internal reflection.
+    belowDir = dot(through, through) > 0.5 ? through : reflect(rd, n);
+    // A placeholder; the bounce below replaces it outright.
+    col = WATER_DEEP;
   } else {
     col = shadeDirect(uCamPos, rd, t, mat, true, p, n, rough);
   }
@@ -976,12 +990,11 @@ void main() {
     }
   }
 
-  /* This is also the mirror for the view from below, which is why it
-     can run with uReflect at zero: total internal reflection is not a
-     reflection effect anyone chose to switch on, it is where the light
-     goes. Inside the window it is skipped entirely — there the surface
-     transmits and nothing comes back off it. */
-  if (mat > 0.5 && (uReflect > 0.0 || fromBelow) && !snellWindow) {
+  /* This is also the whole of the view from below — both the window and
+     the mirror — which is why it can run with uReflect at zero. Neither
+     is a reflection effect anyone chose to switch on; they are where
+     the light goes. */
+  if (mat > 0.5 && (uReflect > 0.0 || fromBelow)) {
     float fresnel = pow(1.0 - max(dot(n, -rd), 0.0), 5.0);
     /* Water reflects on its own curve, and it is the real one: Schlick
        from an F0 of 0.02, which is what water is.
@@ -1008,11 +1021,13 @@ void main() {
     // Below this the bounce cannot move an 8-bit channel; skip the
     // entire second trace.
     if (amount > 0.02) {
-      vec3 rd2 = reflect(rd, n);
-      /* Off the surface along the ray when the eye is under it: the
-         normal points up, so nudging along it from below would put the
-         start above the water and the downward ray would meet the
-         surface again immediately. */
+      vec3 rd2 = fromBelow ? belowDir : reflect(rd, n);
+      /* Off the surface along the ray when the eye is under it. The
+         normal points up, so nudging along it would be wrong for both
+         of the directions below can take: it would start the mirrored
+         ray above the water, where it meets the surface again at once,
+         and it would start the window's ray on the far side of the very
+         interface it just came through. */
       vec3 ro2 = fromBelow ? p + rd2 * 0.02 : p + n * 0.02;
       // Deliberately not named mat2 — that is a built-in type name, and
       // shadowing it is a syntax error rather than a warning.

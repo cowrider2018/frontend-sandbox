@@ -668,11 +668,26 @@ const SHOTS_PLAN = [
      rim brighter still: every near-horizontal direction in the world
      lands on that circle, so the horizon arrives compressed into it.
 
-     What is not here is the bank and the trees. Reading those would
-     mean sampling the raster half through a compression of tens to one,
-     where a screen-space tap misses far more often than it lands. Sky
-     and the horizon band carry the effect; the silhouettes were not
-     worth a frame full of holes. */
+     What is not here is the bank, and the reason is worth writing down
+     because it looks like a bug and is not. The window traces the world
+     rather than only calling sky(), so the hills are genuinely in it —
+     but from mid-lake the bank tops out around 8 degrees of elevation,
+     and 82 degrees on the air side maps to 48.0 on the water side
+     against a critical angle of 48.6. The entire shoreline arrives
+     inside six tenths of a degree, about eight pixels here. Moving the
+     camera to the closest submersible point to a bank was measured too
+     and only widens it to 1.4 degrees: these hills are gentle, and no
+     camera position rescues that.
+
+     So the shore being invisible from below is the compression working,
+     not the trace failing. What would show a difference is something
+     tall standing near the water.
+
+     The trees and grass are absent for a different reason and that one
+     is a decision: reading them means sampling the raster half through
+     a compression of tens to one, where a screen-space tap misses far
+     more often than it lands. Sky and the rim carry the effect; the
+     silhouettes were not worth a frame full of holes. */
   { name: '52-underwater',
     hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&trees=1&hills=4.5'
         + '&water=1&waterLevel=0.72&coverRadius=50&visibility=140&wind=0.4'
