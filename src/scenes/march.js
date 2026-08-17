@@ -176,6 +176,25 @@ ${WEATHER_GLSL}
    argument actually required. */
 #define WATER_BLUR_RATE 1.2
 
+/* How much of the true refraction to actually apply to what is standing
+   in the water, 0 = none, 1 = Snell exactly.
+
+   Snell exactly is correct and looks wrong, which is worth stating
+   plainly rather than hiding in a tuned number. The displacement is
+   tan(refracted) over tan(incident), and at a grazing angle — which is
+   most of how a lake is seen — that ratio falls to a few per cent: the
+   submerged part of anything collapses into a line against the surface.
+   A camera at eye height on a real lake sees the same thing, but it
+   sees it with stereo, motion parallax and a lifetime of knowing where
+   its own feet are; a still frame at 1600x900 just reads as a broken
+   sprite.
+
+   Half is enough to say "the leg is bent" and not so much that the leg
+   stops being a leg. It is applied to the sampling position rather than
+   to the ray, so the geometry stays honest and only the picture is
+   pulled back toward where the eye expects it. */
+#define WATER_BEND 0.5
+
 in vec2 vUv;
 out vec4 outColor;
 
@@ -809,37 +828,53 @@ void main() {
      fades along its length, and the waterline lands on it where the
      water actually is rather than where the geometry was cut. */
   if (mat > 2.5 && uMeshOn > 0.5) {
-    vec4 sunk = texture(uMesh, vUv);
-    if (sunk.a > t && sunk.a < 9000.0) {
+    /* Aim along the refracted ray, then sample once.
+
+       The first version of this sampled straight down as well and kept
+       whichever of the two came back — and that is a way to draw the
+       same leg twice. The silhouette came from the undisplaced tap, the
+       interior from the displaced one, and around the edge, where the
+       displaced tap walked off the object and was rejected, the
+       original showed through. Two overlapping images of one thing.
+
+       The question is not what is directly under this pixel. It is
+       where the refracted ray points, and those are different places
+       the moment the surface is not being looked at from overhead.
+
+       Aiming needs a depth and the depth needs the object, so the probe
+       reads straight down. That is safe here and it is worth being
+       precise about why: the second image came from using an
+       undisplaced sample as *colour*. Using one to estimate a depth is
+       a different thing, and it is the standard one step of the
+       iteration — the aim is wrong only by however far the object
+       slopes across the offset, which is second order.
+
+       Aiming the probe with the bed instead was tried and is what
+       emptied the water: the bed under a swimming cat is three metres
+       down, the probe displaced by three metres of refraction lands on
+       nothing, so the aim stayed at three metres and the real sample
+       missed as well. A depth that needs the object cannot be
+       bootstrapped from a depth the object is nowhere near.
+
+       The bed remains the fallback for pixels with nothing under them,
+       where there is no object to be wrong about. */
+    vec3 rr = refract(rd, n, WATER_IOR);
+    float down = max(-rr.y, 0.5);
+
+    vec4 probe = texture(uMesh, vUv);
+    float aim = (probe.a > t && probe.a < 9000.0)
+      ? max(uWaterY - (uCamPos.y + rd.y * probe.a), 0.0)
+      : max(waterDepth(p.xz), 0.0);
+
+    vec2 uv2 = mix(vUv, projectUV(p + rr * (aim / down)), WATER_BEND);
+    vec4 sunk = texture(uMesh, uv2);
+    /* Nothing to fall back to, deliberately. An undisplaced sample here
+       is the second image, so a rejected one draws no submerged object
+       at all — which is right, because the ray really is pointing at a
+       bank, or off the frame, or at open water. */
+    if (all(greaterThan(uv2, vec2(0.0))) && all(lessThan(uv2, vec2(1.0)))
+        && sunk.a > t && sunk.a < 9000.0) {
       float under = max(uWaterY - (uCamPos.y + rd.y * sunk.a), 0.0);
-
-      /* And now bend it, which is the half of refraction the bed cannot
-         show. The bed's offset is computed analytically because the bed
-         is a height field this shader owns; a leg is a triangle in a
-         texture, so the only way to bend it is to read that texture
-         somewhere else.
-
-         Where is one step of the obvious iteration: the straight-down
-         sample says how deep the thing is, the refracted ray is walked
-         to that depth, and the point it lands on is projected back to a
-         uv. One step is enough because the correction is small and its
-         error is second order — the depth used to aim is wrong only by
-         however far the object slopes across the offset.
-
-         It has to be checked before it is believed. A displaced sample
-         can walk off the object, past the shoreline, or outside the
-         frame entirely, and the sample sitting there is a bank or a sky
-         that was never under any water. Failing that test is not an
-         error worth handling twice: the undisplaced sample is right
-         where the offset is small, which is exactly where the shallow
-         water is that this is for. */
-      vec3 rr = refract(rd, n, WATER_IOR);
-      vec2 uv2 = projectUV(p + rr * (under / max(-rr.y, 0.5)));
-      if (all(greaterThan(uv2, vec2(0.0))) && all(lessThan(uv2, vec2(1.0)))) {
-        vec4 bent = texture(uMesh, uv2);
-        if (bent.a > t && bent.a < 9000.0) sunk = bent;
-      }
-
       col = mix(sunk.rgb, col, 1.0 - exp(-under * WATER_EXTINCT));
     }
   }
