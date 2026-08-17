@@ -283,6 +283,10 @@ ${WEATHER_GLSL}
    answer, so it only has to be fine enough near the surface, where the
    parallax is. */
 #define ABOVE_STEPS 20
+/* And steps for the mirror's own search, downward through the frame's
+   raster target. Fewer again: a mirrored ray meets the bed within a few
+   metres, and past that the fog has closed anyway. */
+#define SUNK_STEPS 18
 
 in vec2 vUv;
 out vec4 outColor;
@@ -894,6 +898,65 @@ vec2 projectUV(vec3 q) {
 }
 
 /**
+ * What is hanging in the water along a mirrored ray.
+ *
+ * Outside the Snell window the surface is a mirror, and what a mirror
+ * over a lake shows is the lake: the bed, and whatever is hanging in it.
+ * The bed is marched and arrives for free. Everything hanging in it is a
+ * triangle — a cat's submerged half, a reed's drowned stem — and the
+ * bounce cannot see triangles, so the reflection came back with the
+ * floor of the lake and nothing in it.
+ *
+ * This is where a screen-space search belongs, and it is worth being
+ * precise about why it belongs here and not where it was first tried.
+ * The frame's raster target was drawn from under the water looking out,
+ * so it holds submerged geometry from very nearly the angle a mirrored
+ * ray wants it from — the reflection of a belly and the direct view of
+ * that same belly are close together. Nothing is hiding behind itself.
+ * Pointed the other way, at things above the surface, the same search
+ * was asking a target that had never recorded them.
+ *
+ * The waterline test runs the opposite way for the same reason. Up
+ * there, a submerged crossing was the false positive; down here, a
+ * crossing above the surface is — the bank across the lake is in this
+ * target too, and it is not underwater and cannot be in this mirror.
+ */
+bool findSunk(vec3 ro, vec3 rd, out vec3 hit) {
+  hit = vec3(0.0);
+  float s = 0.08, step = 0.09, prev = 0.0;
+  bool inFront = true;
+  for (int i = 0; i < SUNK_STEPS; i++) {
+    vec3 q = ro + rd * s;
+    vec2 uv = projectUV(q);
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return false;
+
+    vec4 m = texture(uMesh, uv);
+    float d = length(q - uCamPos);
+    bool behind = m.a < 9000.0 && m.a < d;
+    vec3 seen = uCamPos + normalize(q - uCamPos) * m.a;
+
+    if (behind && inFront && seen.y < uWaterY && d - m.a < 0.22 + s * 0.20) {
+      float lo = prev, hi = s;
+      for (int j = 0; j < 4; j++) {
+        float mid = (lo + hi) * 0.5;
+        vec3 qm = ro + rd * mid;
+        vec4 mm = texture(uMesh, projectUV(qm));
+        vec3 sm = uCamPos + normalize(qm - uCamPos) * mm.a;
+        if (mm.a < 9000.0 && sm.y < uWaterY && mm.a < length(qm - uCamPos)) hi = mid;
+        else lo = mid;
+      }
+      hit = texture(uMesh, projectUV(ro + rd * hi)).rgb;
+      return true;
+    }
+    inFront = !behind;
+    prev = s;
+    s += step;
+    step *= 1.22;
+  }
+  return false;
+}
+
+/**
  * A world direction, into the upward pass.
  *
  * The inverse of the fixed basis that pass was shot with: forward is
@@ -1240,6 +1303,26 @@ void main() {
       if (fromBelow && windowOut && uAboveOn > 0.5) {
         vec3 found;
         if (findAbove(ro2, rd2, found)) refl = found;
+      }
+
+      /* And the mirror, which is the other half of the same omission.
+         What a mirror over a lake shows is the lake, and the bed alone
+         is not the lake: a cat's submerged half hangs in it, and the
+         bounce that draws the reflection marches a world with no cat in
+         it. The reflection came back with a floor and nothing standing
+         on it, which is why the surface read as empty at low angles —
+         the one angle where a reflection is nearly all of what the
+         surface is.
+
+         This is also the image that lands *against* the animal rather
+         than somewhere else in frame. A mirror's image is the subject
+         flipped about the mirror, so a submerged belly reappears
+         directly above itself, joined at the waterline. The window's
+         image cannot do that: refraction moves what it shows, and moves
+         it further the further off vertical it is. */
+      if (fromBelow && !windowOut && uMeshOn > 0.5) {
+        vec3 found;
+        if (findSunk(ro2, rd2, found)) refl = found;
       }
       /* The 0.9 ceiling keeps a lit surface from disappearing into its
          own reflection. Total internal reflection is exempt, because

@@ -647,7 +647,48 @@ const SHOTS_PLAN = [
            s.pitch = 0.03; s.targetDist = 6;
            return true;` },
 
-  /* The camera under the surface, looking up at it — the Snell window.
+  /* The camera under the surface at a low angle — the underside as a
+     mirror, which is what that view is mostly made of.
+
+     Steeply up, the surface is a window and refraction rules it. Along
+     it, which is where an eye in a lake usually is, the line of sight
+     passes 48.6 degrees off vertical and the surface stops transmitting
+     entirely. From there it is a mirror, and what a mirror over a lake
+     shows is the lake: the bed, and whatever is hanging in it.
+
+     What to look for is the cat's reflection sitting *on* the cat.
+     A mirror image is the subject flipped about the mirror, so a
+     submerged half reappears directly above itself, joined at the
+     waterline — unlike the window's image, which refraction displaces,
+     and displaces further the further from vertical it is. If the
+     reflection ever drifts away from the animal, something has broken
+     in which surface the bounce thinks it is leaving.
+
+     It is squashed almost flat, and that is the angle rather than a
+     sampling failure: near-grazing reflection compresses vertically,
+     and the same lake seen from the same height in life does it too.
+
+     The reflection carries triangles, which the marched bounce alone
+     cannot: the bed arrives for free, and the animal hanging in the
+     water has to be searched for in the raster target. Before that
+     search the mirror came back with a floor and nothing standing on
+     it, which read as an empty surface at the one angle where the
+     surface is nearly all reflection. */
+  { name: '52-underwater-mirror',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&trees=1&hills=4.5'
+        + '&water=1&waterLevel=0.72&coverRadius=50&visibility=140&wind=0.4'
+        + '&camera=follow&daylight=hour&hour=11&exposure=1.8',
+    settle: 3200,
+    pre: `const c = __aether.scene.cat;
+          c.x = -17.5; c.z = -14; c.yaw = 2.2; c.velocity = 0;
+          __aether.scene.laser.silence(); return true;`,
+    /* Shallow and far back: the rig adds 0.35 above its centre, so the
+       distance has to carry the eye under the surface on its own. */
+    poke: `const s = __aether.scene;
+           s.pitch = -0.16; s.targetDist = 7.5;
+           return true;` },
+
+  /* The camera under the surface, looking steeply up — the Snell window.
 
      Refraction runs the other way from down here and the result is not
      a variation on the view from above, it is a different picture with
@@ -688,7 +729,7 @@ const SHOTS_PLAN = [
      a compression of tens to one, where a screen-space tap misses far
      more often than it lands. Sky and the rim carry the effect; the
      silhouettes were not worth a frame full of holes. */
-  { name: '52-underwater',
+  { name: '53-underwater-window',
     hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&trees=1&hills=4.5'
         + '&water=1&waterLevel=0.72&coverRadius=50&visibility=140&wind=0.4'
         + '&camera=follow&daylight=hour&hour=11&exposure=1.8',
