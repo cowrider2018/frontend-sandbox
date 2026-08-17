@@ -647,6 +647,42 @@ const SHOTS_PLAN = [
            s.pitch = 0.03; s.targetDist = 6;
            return true;` },
 
+  /* The camera under the surface, looking up at it.
+
+     Not because the scene supports being down here — it does not, and
+     this shot is not a claim that it should. The water's normal always
+     points up, its clarity is measured downward, and its fresnel is
+     written for an eye in the air; none of that is true from below, and
+     making it true is a feature nobody has asked for.
+
+     What this exists for is the weaker promise: that the wrong picture
+     stays *still*. Everything drawn here that reads the water was
+     written assuming the eye is above it, so every one of them is one
+     unguarded expression away from a frame that crawls — a refract()
+     handed a normal on the wrong side, a depth that goes negative and
+     is clamped to zero, an aim that falls back to a distance the
+     subject is nowhere near. Those do not look like small errors. They
+     look like the scene coming apart.
+
+     So this is a regression shot, and what it is watching is stability
+     rather than correctness. If someone eventually renders the
+     underside properly, this is the frame to re-measure. Until then it
+     fails when a wrong picture starts moving. */
+  { name: '52-underwater',
+    hash: '#/march?spin=0&scale=1&taa=0.9&ground=grass&trees=1&hills=4.5'
+        + '&water=1&waterLevel=0.72&coverRadius=50&visibility=140&wind=0.4'
+        + '&camera=follow&daylight=hour&hour=11&exposure=1.8',
+    settle: 3200,
+    /* Mid-lake, where there is depth to be under, and the rig wound in
+       and pitched down so the eye sits below the surface the cat is
+       floating on. */
+    pre: `const c = __aether.scene.cat;
+          c.x = -17.5; c.z = -14; c.yaw = 2.2; c.velocity = 0;
+          __aether.scene.laser.silence(); return true;`,
+    poke: `const s = __aether.scene;
+           s.pitch = -0.34; s.targetDist = 5;
+           return true;` },
+
   /* The reeds, which is the same shore as 36 with something living on
      it. Two things to look at, and both are about the band rather than
      about the stalks: it has to follow the waterline round every bay

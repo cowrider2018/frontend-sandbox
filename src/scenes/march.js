@@ -827,7 +827,29 @@ void main() {
      out. That is the whole reason this reads as depth — the same leg
      fades along its length, and the waterline lands on it where the
      water actually is rather than where the geometry was cut. */
-  if (mat > 2.5 && uMeshOn > 0.5) {
+  /* Descending rays only, which is the same guard the bed's offset
+     carries and for the same reason: every expression below assumes the
+     eye is in the air and the water is beneath it.
+
+     From under the surface all three of them fail at once, and none of
+     them fails quietly. refract() is handed a normal on the wrong side
+     of the interface — the surface normal always points up — and
+     returns a direction pointing back down, so the displacement runs
+     the wrong way. The depth of anything above the water comes out
+     negative and is clamped to zero, which switches the extinction off
+     and paints the bank at full brightness over the surface. And the
+     aim falls back to the bed, so neighbouring pixels reach for the
+     same object with wildly different offsets and smear copies of it
+     across the frame.
+
+     Rendering the underside properly is a real feature and not this
+     one: it needs the normal flipped, the ratio inverted to 1.33, and
+     total internal reflection outside the Snell window. Until someone
+     wants that, the honest thing is to leave the view from below as
+     wrong as it has always been rather than newly unstable — a still
+     wrong picture reads as a stylisation, a crawling one reads as the
+     scene breaking. See 52-underwater. */
+  if (mat > 2.5 && uMeshOn > 0.5 && rd.y < -1e-3) {
     /* Aim along the refracted ray, then sample once.
 
        The first version of this sampled straight down as well and kept
