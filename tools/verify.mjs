@@ -707,7 +707,7 @@ const SHOTS_PLAN = [
        inside it. The distance comes down to match, or the eye ends up
        below a bed that is only 3.4 m under the surface here. */
     poke: `const s = __aether.scene;
-           s.pitch = -0.9; s.targetDist = 3;
+           s.pitch = -0.8; s.targetDist = 3.35;
            return true;` },
 
   /* The reeds, which is the same shore as 36 with something living on

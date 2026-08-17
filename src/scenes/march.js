@@ -220,6 +220,23 @@ ${WEATHER_GLSL}
    the swimming pool a literal reading would give. */
 #define WATER_FOG vec3(0.62, 0.38, 0.32)
 
+/* How many steps the window spends searching the rasterised half.
+
+   Not a quality control, because it is not on the quality curve: it is
+   paid only while the camera is under water, which no preset knows how
+   to predict and no shot but one ever does.
+
+   The count is set by both ends of the search having to work at once. A
+   cat wading a metre away is thirty centimetres of subject, and a
+   search that spends four steps crossing it walks straight through the
+   middle — which is what the first version did, and it looked like
+   torn geometry rather than like too few samples. A tree ten metres up
+   the bank needs the same search to still be going. Sixteen steps could
+   have one or the other. Twenty-eight, starting at five centimetres and
+   growing a fifth each time, reach about fifty metres with six steps
+   inside the first half metre. */
+#define WINDOW_STEPS 28
+
 in vec2 vUv;
 out vec4 outColor;
 
@@ -823,6 +840,109 @@ vec2 projectUV(vec3 q) {
   return ndc * 0.5 + 0.5;
 }
 
+/**
+ * Search the rasterised half along a world ray, and return what it hit.
+ *
+ * The window above the water needs this and nothing else does. Grass,
+ * trees and the cat are triangles, so the marched world the bounce
+ * traces cannot see them — but they are already drawn, by this same
+ * camera, sitting at their straight-line positions in uMesh. Nothing
+ * has to be rendered again. What has to happen is that they are found
+ * somewhere other than where they were drawn, because refraction moved
+ * them.
+ *
+ * A single tap cannot do that. It would need the distance to the object
+ * in order to project it, and the distance is the thing being looked
+ * for; guess it and the compression of the window turns a small error
+ * into a large one. So this walks instead: points along the ray, each
+ * projected back to the uv it would have been drawn at, each compared
+ * against the depth actually recorded there. Where the recorded depth
+ * catches up with the distance walked, the ray has met the surface that
+ * was drawn.
+ *
+ * The steps grow. Near the surface a metre matters and far away it does
+ * not, and a fixed step spends its whole budget in the first few metres
+ * or steps straight over a cat.
+ *
+ * Returns false, rather than a colour, when the ray leaves the frame.
+ * That is the honest answer and it is a common one: uMesh holds 67
+ * degrees of the world and the window holds 180, so everything toward
+ * the rim was simply never drawn. No amount of searching finds it, and
+ * pretending otherwise by clamping to the edge would smear the border
+ * pixels across the entire horizon.
+ */
+bool findInMesh(vec3 ro, vec3 rd, out vec3 hit) {
+  hit = vec3(0.0);
+  float s = 0.06, step = 0.05, prev = 0.0;
+  /* The ray starts at the surface, in front of everything drawn above
+     it. What is being watched for is the moment that stops being true. */
+  bool inFront = true;
+  for (int i = 0; i < WINDOW_STEPS; i++) {
+    vec3 q = ro + rd * s;
+    vec2 uv = projectUV(q);
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return false;
+
+    vec4 m = texture(uMesh, uv);
+    float d = length(q - uCamPos);
+    /* Crossing, not proximity — and the difference is the whole
+       reliability of this search.
+
+       Asking whether the recorded depth lands inside a narrow band
+       around this point looks equivalent and is not: once a step
+       overshoots a surface, the recorded depth is *below* the band, and
+       every step after that only makes the gap wider. The ray is blind
+       from then on and walks its remaining budget for nothing. Those
+       blinded rays were the holes — the search was not too coarse so
+       much as unable to recover from being too coarse.
+
+       A sign change cannot miss that way. The ray begins in front of
+       everything above the surface; the step where it stops being in
+       front is the step that crossed something.
+
+       1e4 is the cleared value: empty sky rather than a far object. */
+    bool behind = m.a < 9000.0 && m.a < d;
+
+    /* Submerged geometry crosses too, and must not count. The raster
+       target holds the whole animal, the half under the surface
+       included, and that half sits nearer the eye than anything the
+       window is looking for — so a ray walking up past a floating cat
+       crosses its submerged belly first. Reconstructing where the
+       recorded surface actually is settles which world it belongs to:
+       along the direction this point was projected in, at the recorded
+       distance. Below the waterline it is the lake's, and the submerged
+       pass has already drawn it.
+
+       The thickness limit is what keeps a crossing from being a
+       coincidence. A ray passing metres behind a blade of grass has
+       crossed it in screen space and not in the world, and without a
+       limit the window fills with near objects smeared along their own
+       silhouettes. */
+    vec3 seen = uCamPos + normalize(q - uCamPos) * m.a;
+    if (behind && inFront && seen.y > uWaterY && d - m.a < 1.2 + s * 0.5) {
+      /* Halve back into the gap that was stepped over. The step here is
+         a large fraction of a cat, so the difference between the first
+         point behind the surface and the surface itself is the
+         difference between a shape and a streak. */
+      float lo = prev, hi = s;
+      for (int j = 0; j < 4; j++) {
+        float mid = (lo + hi) * 0.5;
+        vec3 qm = ro + rd * mid;
+        vec4 mm = texture(uMesh, projectUV(qm));
+        vec3 sm = uCamPos + normalize(qm - uCamPos) * mm.a;
+        if (mm.a < 9000.0 && sm.y > uWaterY && mm.a <= length(qm - uCamPos)) hi = mid;
+        else lo = mid;
+      }
+      hit = texture(uMesh, projectUV(ro + rd * hi)).rgb;
+      return true;
+    }
+    inFront = !behind;
+    prev = s;
+    s += step;
+    step *= 1.20;
+  }
+  return false;
+}
+
 void main() {
   vec2 ndc = vUv * 2.0 - 1.0;
   float aspect = uResolution.x / uResolution.y;
@@ -881,6 +1001,10 @@ void main() {
      deleted from it. Tracing costs nothing extra here because the
      bounce was already being fired for the mirror. */
   vec3 belowDir = vec3(0.0);
+  /* Out through the surface rather than mirrored off it. Kept because
+     only the transmitted direction leaves the water, and only what
+     leaves the water can meet the grass and the trees and the cat. */
+  bool windowOut = false;
 
   vec3 p, n; float rough;
   vec3 col;
@@ -890,7 +1014,8 @@ void main() {
     rough = 0.045;
     vec3 through = refract(rd, -n, 1.0 / WATER_IOR);
     // Zero means the root went negative: total internal reflection.
-    belowDir = dot(through, through) > 0.5 ? through : reflect(rd, n);
+    windowOut = dot(through, through) > 0.5;
+    belowDir = windowOut ? through : reflect(rd, n);
     // A placeholder; the bounce below replaces it outright.
     col = WATER_DEEP;
   } else {
@@ -1036,6 +1161,19 @@ void main() {
 
       vec3 p2, n2; float rough2;
       vec3 refl = shadeDirect(ro2, rd2, tHit, matHit, uReflectLit > 0.5, p2, n2, rough2);
+
+      /* And the living half of what is up there.
+         The trace above trades in the marched world — hills, cluster,
+         sky — and the bank it finds is bare ground. Everything standing
+         on that bank is a triangle, so the window has to go and look
+         for it in the target the raster pass already filled. Only the
+         transmitted ray does this: the mirrored one is pointing back
+         down into the lake, where the submerged pass has already had
+         its say. */
+      if (fromBelow && windowOut && uMeshOn > 0.5) {
+        vec3 found;
+        if (findInMesh(ro2, rd2, found)) refl = found;
+      }
       /* The 0.9 ceiling keeps a lit surface from disappearing into its
          own reflection. Total internal reflection is exempt, because
          there the surface genuinely returns everything. */
